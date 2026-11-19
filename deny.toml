@@ -1,0 +1,60 @@
+# cargo-deny policy (ADR-026 §6 + RFC-2026-09 §B).
+#
+# THE GATE SPLIT (RFC §B): a check belongs on the BLOCKING pre-push path iff
+# re-running it against an unchanged lockfile+config+toolchain always yields the
+# same verdict.
+#   - BLOCKING (`dev lint` -> pre-push):  bans + licenses + sources  (deterministic)
+#   - SCHEDULED (systemd.timer, not a hook): advisories  (a live RUSTSEC pull can
+#     turn a correct diff's gate red for a reason no local change can fix — the
+#     fastest route to a `--no-verify` habit). On failure: open an issue, never
+#     auto-merge. `dev lint` runs `cargo deny check bans licenses sources` only.
+
+[graph]
+all-features = true
+
+[advisories]
+# Scanned on a schedule, NOT on the blocking path. `version = 2` => unmaintained
+# is a warning, vulnerabilities error. Kept here so the SAME config drives the
+# scheduled scan.
+version = 2
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+# Permissive allow-list matching the fleet standard.
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Unicode-3.0",
+  "Unicode-DFS-2016", # Unicode data-file license (unicode_names2 via monty/ruff)
+  "Zlib",
+  "MPL-2.0",
+  "BSL-1.0", # Boost Software License (xxhash-rust via the loro CRDT kernel)
+  "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Internal path deps (template-core, template-core-test-support) carry no version
+# and read as wildcards; this exempts only path deps, registry wildcards stay denied.
+allow-wildcard-paths = true
+allow = []
+deny = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+
+allow-git = [
+  "https://github.com/truespar/siftx",
+  "https://github.com/truespar/scriptor",
+  "https://github.com/memorysafety/rav1d",
+]
