@@ -39,6 +39,13 @@ allow = [
 ]
 confidence-threshold = 0.9
 
+# rav1d uses this micro-crate; its published manifest and LICENSE both declare CC0.
+# Scope acceptance to the exact reviewed dependency, without broadening the fleet list.
+[[licenses.exceptions]]
+name = "to_method"
+version = "=1.1.0"
+allow = ["CC0-1.0"]
+
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"

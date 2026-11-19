@@ -12,7 +12,7 @@ in
   platform.toolchains.rust = {
     enable = true;
     toolchainFile = ./rust-toolchain.toml;
-    # TODO(adr-026): enable after gate is green — cargo deny rejects to_method 1.1.0 (CC0-1.0); full CI also pending.
+    # TODO(adr-026): enable after gate is green — upstream workspace CI needs a measured baseline.
     git-hooks.enable = false;
     # Preserve upstream formatting/lints; optional all-feature CUDA/Metal builds are separate gates.
     policy.enable = false;

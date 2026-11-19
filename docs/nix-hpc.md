@@ -37,9 +37,12 @@ central tasks also expose audit, nextest, coverage, mutation and profiling tools
 a task being available is not evidence that it passed.
 
 Rust hooks are explicitly deferred until the first actual CI baseline is green;
-the TODO records the current blocker: the copied license policy rejects
-`CC0-1.0` on `to_method 1.1.0` through rav1d. Bans and sources passed. Full
-workspace CI is still pending. Do not enable a permanently failing hook
+the TODO names that missing evidence. Dependency policy initially rejected
+`CC0-1.0` on `to_method 1.1.0` through rav1d. Its published manifest and LICENSE
+both declare CC0; acceptance is scoped to that exact crate/version in
+`deny.toml`, leaving the shared license list unchanged. See cargo-deny's
+[per-crate exceptions](https://embarkstudios.github.io/cargo-deny/checks/licenses/cfg.html#the-exceptions-field-optional).
+Full workspace CI is still pending. Do not enable a permanently failing hook
 or describe this as full CI acceptance. After it is green, enable hooks and run
 the standard adoption workflow's rejection probes. Do not change upstream code
 or weaken dependency policy simply to make the first gate green.
