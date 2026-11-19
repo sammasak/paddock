@@ -11,7 +11,6 @@ in
     nasm
   ];
   pdfium = pkgs.fetchurl {
-    inherit (asset) url;
-    sha256 = asset.sha256;
+    inherit (asset) url sha256;
   };
 }

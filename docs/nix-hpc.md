@@ -20,13 +20,15 @@ the manifest-selected PDFium archive between development and packaging.
 devenv shell
 # Stage the upstream archive from its manifest URL and SHA256 via Nix.
 devenv tasks run paddock:prepare
+devenv tasks run paddock:nix-check
 devenv tasks run rust:fmt-check
 devenv tasks run rust:ci
 # Packaging-only shell with the same compiler and native build tools:
 nix develop
 ```
 
-The CI task checks format, workspace types, Clippy with warnings denied, dependency
+The CI task checks Nix formatting/static lint/unused bindings/input parity, Rust
+format, workspace types, Clippy with warnings denied, dependency
 policy, rustdoc with warnings denied, and workspace tests including doctests.
 It uses upstream's default features: `--all-features` enables optional CUDA
 forensics compilation and Metal integration, which need separate validation.

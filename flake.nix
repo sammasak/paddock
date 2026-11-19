@@ -70,6 +70,23 @@
       };
       checks.${system} = {
         inherit runner;
+        nix-lint =
+          pkgs.runCommand "paddock-nix-lint"
+            {
+              nativeBuildInputs = [
+                pkgs.nixfmt
+                pkgs.statix
+                pkgs.deadnix
+              ];
+            }
+            ''
+              cp ${self}/flake.nix ${self}/devenv.nix .
+              cp -r ${self}/nix .
+              nixfmt --check *.nix nix/*.nix
+              statix check .
+              deadnix --fail .
+              touch $out
+            '';
         input-parity =
           assert nixpkgs.rev == devLock.nodes.nixpkgs.locked.rev;
           assert rust-overlay.rev == devLock.nodes.rust-overlay.locked.rev;

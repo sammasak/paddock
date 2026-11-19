@@ -16,7 +16,7 @@ rustPlatform.buildRustPackage {
       "truespar-siftx-0.1.0" = "sha256-ELVOece+gfmJ6R3Ug+mtM666Wy0YU99oih8KPCSu1iI=";
     };
   };
-  nativeBuildInputs = support.nativeBuildInputs;
+  inherit (support) nativeBuildInputs;
   postPatch = ''
     install -Dm644 ${support.pdfium} packs/pdfium/linux-x64/libpdfium.a
   '';
