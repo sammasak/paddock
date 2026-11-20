@@ -68,6 +68,21 @@ alias. Its install check reads the ELF and verifies sm_86 SASS with cuobjdump.
 Compiling the pack needs a toolkit, not a GPU or loaded display driver. Running it
 still needs the compatible NVIDIA driver and actual GPU validation.
 
+The pinned CUDA 13.3 CCCL release already contains the two corrections from
+Nixpkgs' `fix-invalid-cpp-syntax` patch, so applying that patch again fails.
+`nix/cuda-packages.nix` removes only that named patch, asserts CCCL version
+`13.3.3.4.1` and exactly one matching patch, and preserves all other patches and
+the original post-patch hook. A reverse dry-run checks the existing corrected
+hunks; its observed fuzz/offsets establish textual applicability, not CUDA
+correctness. Revisit the override when updating Nixpkgs rather than widening
+the guards. The narrowed CCCL derivation has built successfully; the complete
+sm_86 pack and its install checks still need to pass.
+
+The native runner package has built successfully, including its runner tests
+and `--help` install check; the realized executable reports version `0.1.21`.
+This is separate from full workspace CI and from CUDA compilation, service
+startup, model support or hardware performance acceptance.
+
 ## Existing measurements first
 
 Read the actual runner `/metrics`; add only a proven missing measurement:

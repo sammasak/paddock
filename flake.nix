@@ -44,6 +44,7 @@
           && !(pkgs.lib.hasPrefix "nix/" relative || pkgs.lib.hasPrefix "docs/" relative);
       };
       support = import ./nix/support.nix { inherit pkgs; };
+      cudaPackages = import ./nix/cuda-packages.nix { inherit pkgs; };
       rustPlatform = pkgs.makeRustPlatform {
         cargo = support.toolchain;
         rustc = support.toolchain;
@@ -61,7 +62,7 @@
         cargo-vendor = runner.cargoDeps;
         paddock-cuda-sm86 = pkgs.callPackage ./nix/cuda-sm86.nix {
           src = source;
-          cudaPackages = pkgs.cudaPackages_13_3;
+          inherit cudaPackages;
         };
       };
       formatter.${system} = pkgs.nixfmt-tree;
