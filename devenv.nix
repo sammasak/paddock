@@ -2,9 +2,10 @@
 let
   support = import ./nix/support.nix { inherit pkgs; };
   nativeTools = support.nativeBuildInputs ++ [ pkgs.gnumake ];
+  prepare = "install -CDm644 ${support.pdfium} packs/pdfium/linux-x64/libpdfium.a";
   check = "cargo check --workspace --all-targets --locked";
   clippy = "cargo clippy --workspace --all-targets --locked -- -D warnings";
-  test = "cargo test --workspace --locked";
+  test = "cargo test --workspace --locked --no-fail-fast";
   nixCheck = "nix build .#checks.x86_64-linux.nix-lint .#checks.x86_64-linux.input-parity --no-link";
 in
 {
@@ -25,6 +26,7 @@ in
         # The CI wrapper clears inherited PATH; shell packages alone are insufficient.
         extraInputs = [ pkgs.nix ] ++ nativeTools;
         exec = ''
+          ${prepare}
           ${nixCheck}
           cargo fmt --all -- --check
           ${check}
@@ -46,9 +48,8 @@ in
     "rust:test".exec = test;
     "paddock:prepare" = {
       description = "Stage the hash-verified upstream PDFium archive for native builds";
-      exec = "install -Dm644 ${support.pdfium} packs/pdfium/linux-x64/libpdfium.a";
+      exec = prepare;
       before = [
-        "rust:ci"
         "rust:check"
         "rust:clippy"
         "rust:test"

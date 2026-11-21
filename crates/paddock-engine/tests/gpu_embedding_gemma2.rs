@@ -494,6 +494,9 @@ fn embeddinggemma2_refuses_mismatched_media() {
     use paddock_engine::gpu_model::embedding_gemma2::media::{
         AUDIO_TOKEN, BOI_TOKEN, EOI_TOKEN, IMAGE_TOKEN,
     };
+    let Some(text_only) = load(1024) else {
+        return;
+    };
     let house = picture("house.jpg");
     let block = |n: usize| {
         let mut s = vec![2, BOI_TOKEN];
@@ -502,12 +505,11 @@ fn embeddinggemma2_refuses_mismatched_media() {
         s
     };
     // a text-only endpoint refuses pictures outright
-    if let Some(text_only) = load(1024) {
-        let err = text_only
-            .validate_media(&[block(266)], &[vec![house.clone()]])
-            .expect_err("no tower");
-        assert!(err.contains("no pictures"), "{err}");
-    }
+    let err = text_only
+        .validate_media(&[block(266)], &[vec![house.clone()]])
+        .expect_err("no tower");
+    assert!(err.contains("no pictures"), "{err}");
+    drop(text_only);
     let Some(m) = load_with_pictures(1024) else {
         return;
     };
