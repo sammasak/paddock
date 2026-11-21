@@ -8,7 +8,8 @@ let
 in
 {
   name = "paddock";
-  packages = support.nativeBuildInputs;
+  # stdenv supplies Make in derivations; interactive Cargo/CMake needs it explicitly.
+  packages = support.nativeBuildInputs ++ [ pkgs.gnumake ];
   platform.toolchains.rust = {
     enable = true;
     toolchainFile = ./rust-toolchain.toml;
