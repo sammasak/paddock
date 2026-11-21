@@ -2,7 +2,7 @@
 //! directory and NVIDIA's GGUF Q8_0 file - behind one reader that validates
 //! the whole architecture contract before anything is allocated. Tensors are
 //! addressed by their MLX names; the GGUF's own names, its quantized
-//! projections and its [out][c][t] convolution are translated here, so a
+//! projections and its \[out\]\[c\]\[t\] convolution are translated here, so a
 //! backend sees one inventory whatever the container.
 //!
 //! The older four-speaker Conformer Sortformer is rejected, not approximated.
@@ -30,7 +30,7 @@ pub enum Format {
     GgufQ8,
     /// Nemotron 3.5 Transcribe's perception module, which carries the model
     /// frozen: NeMo's names under [`PERCEPTION_PREFIX`], BF16 - the MLX
-    /// export's bytes exactly (the convolution in NeMo's [out][in][k] order) -
+    /// export's bytes exactly (the convolution in NeMo's \[out\]\[in\]\[k\] order) -
     /// and the speech LM's own preprocessor buffers, which are the diarizer's
     /// too.
     PerceptionBf16,
@@ -293,7 +293,7 @@ impl Checkpoint {
 
     /// The stored tensor behind an MLX name and shape. MLX weights are BF16
     /// (the preprocessor buffers F32); GGUF ones F32, F16 or Q8_0. A GGUF's
-    /// 3-D convolution is checked against its own [out][c][t] layout.
+    /// 3-D convolution is checked against its own \[out\]\[c\]\[t\] layout.
     pub fn raw(&self, name: &str, shape: &[usize]) -> Result<Raw<'_>, String> {
         match &self.source {
             Source::Mlx(s) => {
@@ -363,7 +363,7 @@ impl Checkpoint {
 
     /// F32 values of a tensor, MLX layout: BF16 and F16 widen exactly, Q8_0
     /// dequantizes exactly (an f16 scale times an int8 fits F32's mantissa),
-    /// and a GGUF convolution is reordered to [out][t][c].
+    /// and a GGUF convolution is reordered to \[out\]\[t\]\[c\].
     pub fn values(&self, name: &str, shape: &[usize]) -> Result<Vec<f32>, String> {
         let raw = self.raw(name, shape)?;
         let mut v = decode(&raw)?;
@@ -431,7 +431,7 @@ impl Checkpoint {
         }
     }
 
-    /// The mel filterbank, [128][257].
+    /// The mel filterbank, \[128\]\[257\].
     pub fn filterbank(&self) -> Result<Vec<f32>, String> {
         match self.format() {
             Format::MlxBf16 | Format::PerceptionBf16 => {

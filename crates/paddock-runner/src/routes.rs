@@ -367,7 +367,7 @@ pub struct AppState {
     /// max in-flight inference requests before refusal - queue depth, distinct
     /// from `max_batch`'s compute width. `None` = uncapped (the default).
     pub concurrency_limit: Option<usize>,
-    /// Forensic preprocessing runtime ([forensics] gate). `None` when disabled;
+    /// Forensic preprocessing runtime (`forensics` gate). `None` when disabled;
     /// when present, image attachments are run through paddock-forensics on their
     /// original bytes and the findings are injected into the model's context.
     pub forensics: Option<std::sync::Arc<crate::forensics::ForensicRuntime>>,

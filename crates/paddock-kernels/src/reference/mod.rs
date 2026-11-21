@@ -52,7 +52,7 @@ pub enum DequantError {
 }
 
 /// MXFP4 -> f32. Layout per block: 1 byte E8M0 scale + 16 bytes packed nibbles;
-/// low nibble of qs[j] is element j, high nibble is element j+16.
+/// low nibble of qs\[j\] is element j, high nibble is element j+16.
 pub fn dequant_mxfp4(data: &[u8], out: &mut [f32]) -> Result<(), DequantError> {
     if !data.len().is_multiple_of(MXFP4_BLOCK_BYTES) {
         return Err(DequantError::BadInputLen {

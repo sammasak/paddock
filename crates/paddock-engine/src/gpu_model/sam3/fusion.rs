@@ -38,7 +38,7 @@ impl GpuSam3Detector {
     /// Build the prompt for one picture: the text tower's valid tokens
     /// (`n_valid` rows of `text` starting at element `text_off`), then the
     /// geometry tokens of `boxes` and the CLS. `fpn2` is the picture's
-    /// detector 72x72 level, f32 raster [tokens][256].
+    /// detector 72x72 level, f32 raster \[tokens\]\[256\].
     pub fn encode_prompt(
         &mut self,
         text: &CudaSlice<f32>,
@@ -284,7 +284,7 @@ impl GpuSam3Detector {
     }
 
     /// The fusion encoder over one picture's 72x72 detector level `img` (f32
-    /// raster [tokens][256]) and the prompt [`Self::encode_prompt`] built.
+    /// raster \[tokens\]\[256\]) and the prompt [`Self::encode_prompt`] built.
     /// Leaves E in `ws.enc` (f32) and the decoder's memory planes f16(E) and
     /// f16(E + pos) in `ws.mem16` / `ws.memq16`.
     pub fn fuse(&mut self, img: &CudaSlice<f32>) -> Result<(), GpuModelError> {

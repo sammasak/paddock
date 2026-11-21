@@ -16,7 +16,7 @@
 //!
 //! # Two mechanisms, and both are needed
 //!
-//! 1. [`dev_var_os!`], [`dev_var!`] and [`dev_on!`] replace the raw `std::env`
+//! 1. [`crate::dev_var_os!`], [`crate::dev_var!`] and [`crate::dev_on!`] replace the raw `std::env`
 //!    reads. Under `hardened` the read AND its NAME leave the token stream -
 //!    a `#[cfg]` inside the macro, not a runtime `if`, so nothing survives for
 //!    `strings` to find and nothing rests on the optimiser having felt like

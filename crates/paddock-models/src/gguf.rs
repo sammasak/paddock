@@ -127,7 +127,7 @@ impl Value {
 #[derive(Debug, Clone)]
 pub struct TensorInfo {
     pub name: String,
-    /// ne[0] is the fastest-moving dimension, as stored.
+    /// ne\[0\] is the fastest-moving dimension, as stored.
     pub dims: Vec<u64>,
     pub ggml_type: GgmlType,
     pub raw_type: u32,

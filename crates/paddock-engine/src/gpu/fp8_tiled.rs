@@ -59,7 +59,7 @@ impl GpuExecutor {
 
     /// Slot 882 (887 with `xs_sw`: `xs` already swizzled, ceil(batch / 128) *
     /// 128 rows' worth): [`Self::f8d_gemm_mma_ks`]'s tcgen05 arm over a plane
-    /// whose scales [`Self::f8_tc5_tile`] pre-tiled (`tiled`) - both operands'
+    /// whose scales `Self::f8_tc5_tile` pre-tiled (`tiled`) - both operands'
     /// scale tiles by bulk copy, the same bits. `Ok(false)` where the slot is
     /// absent or declines (batch <= 64) - run the plain arm (never with `xs_sw`).
     #[allow(clippy::too_many_arguments)]
@@ -128,7 +128,7 @@ impl GpuExecutor {
 
     /// [`Self::f8d_gemm_mma_ks`] taking the plane with its slot-882 tiled
     /// scales where it has them: the bulk-copy arm first, the plain one on a
-    /// decline. `xs_sw`: a producer wrote `xs` swizzled ([`w8_swz_on`] held
+    /// decline. `xs_sw`: a producer wrote `xs` swizzled (`w8_swz_on` held
     /// there) - slot 887 or an error, the plain arm cannot read it. Kill:
     /// PADDOCK_NO_F8_TILED.
     #[allow(clippy::too_many_arguments)]
@@ -156,8 +156,8 @@ impl GpuExecutor {
         self.f8d_gemm_mma_ks(w, in_dim, out_dim, xq, xs, part, y, batch)
     }
 
-    /// The W8 vocab head: `x` ([batch][in_dim] f32) quantized - the scales
-    /// swizzled where [`w8_swz_on`] holds for the head's tiles - then the
+    /// The W8 vocab head: `x` (\[batch\]\[in_dim\] f32) quantized - the scales
+    /// swizzled where `w8_swz_on` holds for the head's tiles - then the
     /// logits GEMM over `(w, tiled)` ([`Self::f8d_gemm_t`]).
     #[allow(clippy::too_many_arguments)]
     pub fn f8_head_logits(
@@ -216,7 +216,7 @@ impl GpuExecutor {
 
 impl GpuExecutor {
     /// The W8 GEMM's activation quantize over `rows` rows of `n_row`: slot 886
-    /// (scales swizzled) where `sw` ([`w8_swz_on`]) and it takes the shape,
+    /// (scales swizzled) where `sw` (`w8_swz_on`) and it takes the shape,
     /// else [`Self::quantize_e4m3`]. True = the scales are swizzled.
     pub fn quantize_e4m3_w8(
         &self,

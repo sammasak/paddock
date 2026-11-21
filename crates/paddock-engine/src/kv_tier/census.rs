@@ -4,7 +4,7 @@
 //! and when each left RAM. Keys are content keys, so a second run on the same
 //! store joins against the first (restart persistence).
 //!
-//! PADDOCK_KV_CENSUS=<path>; nothing is written (or formatted) otherwise.
+//! `PADDOCK_KV_CENSUS=<path>`; nothing is written (or formatted) otherwise.
 //! Events: `s` stored in RAM, `w` written to disk, `wd` skipped (already on
 //! disk), `wx` disk write declined or failed, `wb` over the day's budget,
 //! `r1` / `r2` restore read from RAM / disk, `e` left RAM (`d` = 1 when a disk

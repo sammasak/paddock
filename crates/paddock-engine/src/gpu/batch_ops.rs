@@ -660,7 +660,7 @@ impl GpuExecutor {
 
     /// [`Self::matvec_f32_batch`] over an f16 weight plane and f16 activations,
     /// accumulating in f32 - the tensor-core class. Same layout convention
-    /// (dims[0] = in_dim), and the caller naming the precision keeps "which
+    /// (dims\[0\] = in_dim), and the caller naming the precision keeps "which
     /// precision am I running in" readable at the call site instead of hidden
     /// in a tensor field.
     pub fn matvec_batch_f16(

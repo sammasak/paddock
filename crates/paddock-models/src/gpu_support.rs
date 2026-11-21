@@ -16,7 +16,7 @@
 //! twin, and a B200 refused for three days after its campaign closed).
 //!
 //! Card names are NVIDIA's own, from
-//! (https://developer.nvidia.com/cuda/gpus). They are here so a person can
+//! (<https://developer.nvidia.com/cuda/gpus>). They are here so a person can
 //! find their card without knowing what a compute capability is: every
 //! user-facing surface says "NVIDIA RTX A6000", never "sm_86".
 

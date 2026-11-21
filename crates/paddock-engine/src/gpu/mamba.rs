@@ -1153,7 +1153,7 @@ impl GpuExecutor {
 
     /// Grouped gated RMSNorm (Mixer2RMSNormGated): gate first in f32
     /// (`x * silu(z)`), variance per group of `d / n_groups` channels,
-    /// per-channel `weight` [d]. `z` rides inside rows of stride `z_stride`
+    /// per-channel `weight` \[d\]. `z` rides inside rows of stride `z_stride`
     /// at element offset `z_off` (the in_proj output's z span).
     #[allow(clippy::too_many_arguments)]
     pub fn mamba_rmsnorm_gated_g(

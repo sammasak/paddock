@@ -41,7 +41,7 @@
 //!
 //! ## Scratch is RESIDENT, not per-encode
 //!
-//! Every plane below is allocated once in [`TowerScratch`] and reused. The
+//! Every plane below is allocated once in `TowerScratch` and reused. The
 //! bring-up version allocated them inside `encode` - 21 `alloc_zeros` +
 //! 17 memsets per call, group-capacity sized (~350 MB of alloc/free/zero
 //! churn regardless of clip length). At c32 that path runs ~79 times a

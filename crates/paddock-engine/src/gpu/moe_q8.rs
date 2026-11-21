@@ -99,7 +99,7 @@ impl GpuExecutor {
 
     /// f8 mma_ks twin (B <= 64): K-split block-scale MMA GEMM over the f8w
     /// planes for the spec-verify band where the 128-col TMA tile doesn't
-    /// amortize. Same e4m3 inputs as [`f8_gemm_w8`] (bit-equal to it per
+    /// amortize. Same e4m3 inputs as [`Self::f8_gemm_w8`] (bit-equal to it per
     /// element at nz==1); `part` is the same stream-k fixup scratch the q8
     /// ks family rides.
     #[allow(clippy::too_many_arguments)]
@@ -153,8 +153,8 @@ impl GpuExecutor {
         self.kernels.f8_gemm_mma_ks.is_some()
     }
 
-    /// sm_120a dense block-scale GEMM: y[b][o] = W_mxfp4[o] . x_e4m3[b] with
-    /// hardware ue8m0 scaling. Activations from [`quantize_e4m3`] (`xq` raw
+    /// sm_120a dense block-scale GEMM: y\[b\]\[o\] = W_mxfp4\[o\] . x_e4m3\[b\] with
+    /// hardware ue8m0 scaling. Activations from [`Self::quantize_e4m3`] (`xq` raw
     /// e4m3 bytes over an i8 plane, `xs` the ue8m0 plane). NUMERIC CLASS:
     /// fp4 weights + fp8 activations - retrieval-quality gated, not
     /// greedy-exact vs the Q8_0 paths.
@@ -473,7 +473,7 @@ impl GpuExecutor {
         })
     }
 
-    /// Fold per-expert scalars into routed top-k weights: w[i] *= scale[idx[i]]
+    /// Fold per-expert scalars into routed top-k weights: w\[i\] *= scale[idx\[i\]]
     /// (gemma4-A4B `ffn_down_exps.scale` before the down combine).
     pub fn moe_scale_w(
         &self,

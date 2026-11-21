@@ -459,3 +459,8 @@ Where code is inspired by someone else's work, they are credited in the comments
    memory-safe parsers.
 7. **Upstream citizenship.** Loud attribution, licence notices shipped with
    every artifact, fixes contributed back.
+
+### Nix development in this fork
+
+See [Nix development and HPC experiments](docs/nix-hpc.md) for the locked devenv,
+native Linux runner, separate sm_86 CUDA package and measurement gates.

@@ -347,7 +347,7 @@ impl EngineError {
     /// The PRIMARY OOM path is now typed, not sniffed: a device OOM is
     /// classified by the driver's numeric result code at `gpu::from_driver`,
     /// carried as `GpuError::OutOfMemory` -> `GenError::OutOfMemory`, and mapped
-    /// straight to the capacity error by [`from_gen`] - which every
+    /// straight to the capacity error by [`Self::from_gen`] - which every
     /// forward-pass call site now uses instead of `internal`. The `is_cuda_oom`
     /// TEXT match retained here is the FALLBACK for an OOM that still reaches
     /// this funnel untyped - e.g. a cuBLAS allocation whose error we do not yet
@@ -380,7 +380,7 @@ impl EngineError {
     /// - classified by the driver's numeric result code back at
     ///   `gpu::from_driver`, not by rendered text - becomes a retryable capacity
     ///   error directly, with no string matching in the path at all. Everything
-    ///   else defers to [`internal`], which still keeps the `is_cuda_oom` text
+    ///   else defers to [`Self::internal`], which still keeps the `is_cuda_oom` text
     ///   fallback for an OOM that reached it through an untyped `Backend(_)` (e.g.
     ///   a cuBLAS allocation whose error we do not yet type).
     pub fn from_gen(e: &crate::generator::GenError) -> Self {

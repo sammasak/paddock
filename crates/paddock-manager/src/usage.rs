@@ -82,7 +82,7 @@ pub struct Snapshot {
 }
 
 /// Non-cumulative additions for one bucket row. Histograms are per-bucket
-/// increments (h[i] = observations that landed in bucket i alone); the +Inf
+/// increments (`h[i]` = observations that landed in bucket i alone); the +Inf
 /// overflow is not stored - it is derivable (`requests - Σ e2e_h*`, and for
 /// TTFT `successes - Σ ttft_h*` where successes = requests - errors -
 /// disconnects, since TTFT is observed only on success).

@@ -28,15 +28,15 @@
 //! references).
 //!
 //! The same body serves Aleph Alpha's **Kolibri 1** (`kolibri1` GGUFs,
-//! [`Flavor::Kolibri`]); Aleph Alpha's vLLM plugin (`kolibri1.py`) is the
+//! `Flavor::Kolibri`); Aleph Alpha's vLLM plugin (`kolibri1.py`) is the
 //! study reference. Its deltas, each a per-layer or per-model field here:
 //! [SWA x4, full] with a 513-key window (the current token + 512), RoPE on
 //! the SWA layers only (the full layers are NoPE), no attention output gate,
 //! sandwich norms (`post_attention_norm` after the attention block,
 //! `post_ffw_norm` after routed + shared experts), MoE on every layer, and
-//! the `sigmoid_logit_add` router ([`Router::LogitSigmoid`]).
+//! the `sigmoid_logit_add` router (`Router::LogitSigmoid`).
 //!
-//! And Recursive's **Flint** (`flint` GGUFs, [`Flavor::Flint`];
+//! And Recursive's **Flint** (`flint` GGUFs, `Flavor::Flint`;
 //! llama.cpp `src/models/flint.cpp` and the SGLang plugin's `model.py` are
 //! the study references). Kolibri's attention plan - the file's sliding
 //! pattern, 513-key SWA with RoPE (θ 10k), NoPE full layers - plus a learned

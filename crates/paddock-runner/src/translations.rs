@@ -1,7 +1,7 @@
 //! `POST /v1/audio/translations` - speech in, text in another language out.
 //!
 //! The same multipart surface as `/v1/audio/transcriptions` (it is the same
-//! handler, run with [`Plan`] armed): `file`, `model`, `response_format`
+//! handler, run with `Plan` armed): `file`, `model`, `response_format`
 //! (json | text | verbose_json) and `temperature` from OpenAI's spec, plus
 //! vLLM's extensions `language` (the speech's language), `to_language` (the
 //! text's, default English) and `stream`. OpenAI's own endpoint only ever

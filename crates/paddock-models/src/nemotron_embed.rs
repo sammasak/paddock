@@ -27,7 +27,7 @@
 //!   takes the TEXT config's `rms_norm_eps`;
 //! - Pixtral's 2D rope: the 32 frequencies of a 64-wide head split even /
 //!   odd, the even ones turned by the patch row and the odd ones by its
-//!   column, rotate-half over the whole head ([`Self::vision_rope_angles`]);
+//!   column, rotate-half over the whole head ([`NemotronEmbedConfig::vision_rope_angles`]);
 //! - the projector's patch merger is `F.unfold` over 2 x 2 blocks, so its
 //!   input column is `c * 4 + (dy * 2 + dx)` ([`MERGE_COL`]).
 

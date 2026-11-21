@@ -22,7 +22,7 @@
 //! ## Coverage audit
 //!
 //! Every signal analyzer in the reference implementation is ported (40 registered in
-//! [`analyzer::default_analyzers`] + `pdf_render_compare`, wired by the runner
+//! `analyzer::default_analyzers` + `pdf_render_compare`, wired by the runner
 //! via a [`PageRenderer`]): all of `pixel/`, `ai_detect/`, `metadata/`, `pdf/`,
 //! plus `risk/` (scoring + report dedup + template `explanation`) and
 //! `annotation/` (overlay generation, [`annotate`]). HEIC/HEIF input decodes

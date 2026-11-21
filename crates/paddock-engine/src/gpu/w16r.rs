@@ -123,7 +123,7 @@ impl GpuExecutor {
 
     /// The matching down into `part [rows][k + 1][embd]` f32, each slot's
     /// top-k weight and expert factor folded in (slot k = the shared expert)
-    /// - `moe_slot_combine`'s fixed slot order. `topk_w` [rows][k].
+    /// - `moe_slot_combine`'s fixed slot order. `topk_w` \[rows\]\[k\].
     #[allow(clippy::too_many_arguments)]
     pub fn nvf4_moe_down_part_w16r(
         &self,

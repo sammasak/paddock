@@ -133,7 +133,7 @@ pub struct RunnerInfo {
     pub max_ctx: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_batch: Option<usize>,
-    /// Speculation policy ("off" | "auto" | "ladder" | "<k>").
+    /// Speculation policy (`"off"` | `"auto"` | `"ladder"` | `"<k>"`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spec: Option<String>,
 }

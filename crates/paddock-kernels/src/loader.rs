@@ -253,7 +253,7 @@ impl KernelPack {
 
     /// Resolve the v1 kernel table. Append-only growth contract: we copy
     /// min(pack's size, our size) bytes into a zeroed table, so entries the
-    /// pack predates read as None (Option<fn> null niche) - the engine reports
+    /// pack predates read as None (`Option<fn>` null niche) - the engine reports
     /// "kernel X not in pack Y", never a null-pointer jump.
     pub fn kernels_v1(&self) -> Result<KernelTableV1, PackError> {
         let ptr = self.table_ptr()?;

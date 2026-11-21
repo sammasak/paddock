@@ -1,4 +1,4 @@
-//! PaddleOCR-VL prefix cache: a [`PagedRadix`] over the full-attention block
+//! PaddleOCR-VL prefix cache: a [`crate::paged_radix::PagedRadix`] over the full-attention block
 //! pool - the deepseek-ocr shape minus the R-SWA argument (this decoder is
 //! plain causal, so the whole prompt is an ordinary shareable prefix and
 //! decode rows append past it without ever rewriting a prefill row).

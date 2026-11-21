@@ -1,7 +1,7 @@
 //! Embedding + rerank wire types.
 //!
-//! `/v1/embeddings` is the OpenAI shape (input: string | [string] | [int] |
-//! [[int]]; output: a list of {embedding, index}). `/v1/rerank` follows the
+//! `/v1/embeddings` is the OpenAI shape (input: `string | [string] | [int] |`
+//! `[[int]]`; output: a list of {embedding, index}). `/v1/rerank` follows the
 //! de-facto Cohere/Jina shape (query + documents -> scored, sorted results),
 //! which has no OpenAI equivalent but is what RAG clients speak.
 

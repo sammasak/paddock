@@ -1,4 +1,4 @@
-//! DeepSeek-OCR prefix cache: a [`PagedRadix`] over the one full-attention
+//! DeepSeek-OCR prefix cache: a [`crate::paged_radix::PagedRadix`] over the one full-attention
 //! block pool - granite's easy case (no recurrent state, no checkpoints, no
 //! copy-on-write), plus the R-SWA argument that lets it stay on at all:
 //!

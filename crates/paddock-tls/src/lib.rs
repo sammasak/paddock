@@ -44,7 +44,7 @@
 //!
 //! # One port
 //!
-//! [`serve`] sniffs the first byte of each connection: `0x16` is a TLS
+//! [`serve()`] sniffs the first byte of each connection: `0x16` is a TLS
 //! handshake record, anything else is plain HTTP. So the same port keeps
 //! answering `http://127.0.0.1:11500` for the CLI, the health check and the
 //! Studio's own artifacts callback, while a browser on the LAN gets TLS - and

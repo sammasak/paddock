@@ -24,7 +24,7 @@
 //!   accepted, so rejected drafts count as the waste they are - build a latency
 //!   model over (batch x K), and combine it online with the measured acceptance
 //!   rate to re-pick K continuously. That removes the tuning step and, more to
-//!   the point, "prevent[s] performance regressions under high load or low
+//!   the point, "prevent\[s\] performance regressions under high load or low
 //!   acceptance regimes".
 //!
 //! Our variant. TurboSpec profiles latency offline; we do it online instead -
@@ -62,14 +62,14 @@
 //!      other work on it. That case is not measured yet either - say so until it is.
 //!
 //! The model. The expected tokens per slot per round at draft length K is
-//!     E[tokens](K) = 1 + sum_{i=1..K} S(i)
+//!     `E[tokens](K)` = 1 + sum_{i=1..K} S(i)
 //! where S(i) = P(the first i drafts are all accepted) - the prefix
 //! survival curve, learned per POSITION from every round (a round at depth
 //! k observes S(1..k): position i survived iff accepted >= i). K=0 gives
 //! exactly 1 (a plain decode tick), so the ladder is compared against not
 //! speculating on equal terms; positions deeper than any round has reached
 //! extrapolate geometrically from the last observed ratio. Then
-//!     goodput(K) = live * E[tokens](K) / t(live, K)
+//!     goodput(K) = live * `E[tokens](K)` / t(live, K)
 //! and we take the argmax over the K the row budget allows. K*=0 is the "spec
 //! off for this tick" answer - it falls out of the same maximization rather
 //! than being a separate switch, which is the whole point.

@@ -68,7 +68,7 @@ enum Command {
         /// Catalog model id (see the Studio's models page for the list)
         id: String,
     },
-    /// Start a new model endpoint: writes ~/paddock/servers/<port>.toml,
+    /// Start a new model endpoint: writes `~/paddock/servers/<port>.toml`,
     /// downloads the model if it is missing, launches
     /// `paddock-runner --config <file>`, waits until it answers, and prints
     /// the endpoint. The file is yours to keep, edit by hand, or run with no
@@ -122,7 +122,7 @@ enum Command {
         #[arg(long)]
         off: bool,
     },
-    /// Start an already-configured endpoint from its servers/<port>.toml,
+    /// Start an already-configured endpoint from its `servers/<port>.toml`,
     /// verbatim - hand-edits included. Takes a port, or a model name when
     /// exactly one configured endpoint matches it.
     Start {
@@ -153,7 +153,7 @@ enum Command {
     /// Stream logs: one model's, the manager's own, or all of them together
     /// (each line prefixed with where it came from). Default: all of them.
     Logs {
-        /// Port of one running model (shorthand for --runner <PORT>)
+        /// Port of one running model (shorthand for `--runner <PORT>`)
         port: Option<u16>,
         /// The manager's own log
         #[arg(long, conflicts_with_all = ["port", "runner", "all"])]

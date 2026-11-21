@@ -48,7 +48,7 @@ pub enum DiarWeights<'a> {
 }
 
 /// The frontend's constant planes: the 512-tap padded window, the
-/// [128][257] filterbank, each band's nonzero span `[first, end)` as u32
+/// \[128\]\[257\] filterbank, each band's nonzero span `[first, end)` as u32
 /// pairs, and the 256 FFT twiddles as (cos, sin) pairs.
 pub struct DiarFrontendPlanes<'a> {
     pub window: &'a CudaSlice<f32>,
