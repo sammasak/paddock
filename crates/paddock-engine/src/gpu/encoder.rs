@@ -392,7 +392,7 @@ impl GpuExecutor {
         })
     }
 
-    /// The Laya act/escalate head: one block a question, off its [CLS] row
+    /// The Laya act/escalate head: one block a question, off its \[CLS\] row
     /// (`xcls[x_row0 + q]`) and the softmax of its own option logits
     /// (`logits[qoff[q]..qoff[q + 1]]`); `out` is `[nq][n_act]` probabilities.
     #[allow(clippy::too_many_arguments)]

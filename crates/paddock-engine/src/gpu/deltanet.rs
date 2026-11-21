@@ -511,7 +511,7 @@ impl GpuExecutor {
     }
 
     /// DeltaNet gate math: `beta = sigmoid(b)`, `g = ssm_a·softplus(a+dt_bias)`.
-    /// `a`/`b` are [n_tokens, n_heads]; `ssm_a`/`dt_bias` are [n_heads].
+    /// `a`/`b` are [n_tokens, n_heads]; `ssm_a`/`dt_bias` are \[n_heads\].
     #[allow(clippy::too_many_arguments)]
     /// Fused-layout decay gate (x2-v3): `ab` = [n_tokens, 2*n_heads]
     /// (alpha||beta per row) from the one-call f32-plane GEMM.
@@ -734,7 +734,7 @@ impl GpuExecutor {
     }
 
     /// Gated RMSNorm over `d` per row: `out = (x·rsqrt(mean(x²)+eps))·weight·silu(z)`.
-    /// `x`/`z`/`out` are [n_rows, d]; `weight` is [d].
+    /// `x`/`z`/`out` are [n_rows, d]; `weight` is \[d\].
     #[allow(clippy::too_many_arguments)]
     pub fn gated_rmsnorm(
         &self,
@@ -2079,7 +2079,7 @@ impl GpuExecutor {
 
     /// `gated_delta_recurrent` with per-token state snapshots (`snap` [n_tokens,
     /// n_heads, D, D]) - the speculative-decode verify recurrence; rollback to
-    /// position t = one memcpy of snap[t] into `state`.
+    /// position t = one memcpy of snap\[t\] into `state`.
     #[allow(clippy::too_many_arguments)]
     pub fn gated_delta_recurrent_snap(
         &self,
@@ -2790,8 +2790,8 @@ impl GpuExecutor {
     }
 
     /// Single-token DeltaNet causal conv+silu with a persistent window (decode).
-    /// `win` [(k-1)*conv_dim] is read-modify-write; `x_new` [conv_dim] this token;
-    /// `out` [conv_dim] the conv+silu output.
+    /// `win` [(k-1)*conv_dim] is read-modify-write; `x_new` \[conv_dim\] this token;
+    /// `out` \[conv_dim\] the conv+silu output.
     pub fn conv_step(
         &self,
         win: &mut CudaSlice<f32>,

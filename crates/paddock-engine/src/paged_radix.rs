@@ -281,7 +281,7 @@ impl PagedRadix {
         self.insert_as(tokens, blocks, pool, low);
     }
 
-    /// Enable checkpoints that live in pool pages (see [`PagedState`]): up to
+    /// Enable checkpoints that live in pool pages (see `PagedState`): up to
     /// `max_ckpts` indices, each drawing `pages_per_ckpt` blocks from the pool
     /// when it is written. `max_ckpts` only bounds the bookkeeping - how many
     /// exist at once is whatever the pool can spare.

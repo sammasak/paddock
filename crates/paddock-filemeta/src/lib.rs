@@ -136,7 +136,7 @@ pub struct Group {
 pub struct Tag {
     pub name: String,
     pub value: String,
-    /// Set when the value hit [`MAX_VALUE_CHARS`] - so a UI can say the value
+    /// Set when the value hit `MAX_VALUE_CHARS` - so a UI can say the value
     /// continues rather than presenting a cut string as the whole truth.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub truncated: bool,

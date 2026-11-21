@@ -717,15 +717,15 @@ impl SpeechTower {
     }
 
     /// Resident bytes: weights plus the scratch planes allocated so far. The
-    /// scratch grows with the longest clip served, up to [`SEGMENT_CAP`]
+    /// scratch grows with the longest clip served, up to `SEGMENT_CAP`
     /// frames, so this rises once and settles - it is read for the ledger
-    /// after load, when it is just the initial [`ROWS_STEP`] step.
+    /// after load, when it is just the initial `ROWS_STEP` step.
     pub fn resident_bytes(&self) -> usize {
         self.weight_bytes + self.scratch_bytes(self.sc.cap)
     }
 
     /// What the scratch may still grow by: the plan reserves it, since the
-    /// growth is on demand and bounded at [`SEGMENT_CAP`] frames.
+    /// growth is on demand and bounded at `SEGMENT_CAP` frames.
     pub fn scratch_growth_bytes(&self) -> usize {
         self.scratch_bytes(SEGMENT_CAP)
             .saturating_sub(self.scratch_bytes(self.sc.cap))

@@ -483,8 +483,8 @@ impl GpuExecutor {
     }
 
     /// slot 459: DFlash2's grouped dynamic convolution over `[r, embd]` f32
-    /// rows - `out[row][c] = sum_t (base[side][t][c] + delta[row][side][t][g])
-    /// * h[row-t][c]`, masked to `row % rows_per_block >= t`, with
+    /// rows - `out[row][c] = sum_t (base[side][t][c] + delta[row][side][t][g])`
+    /// `* h[row-t][c]`, masked to `row % rows_per_block >= t`, with
     /// `g = c / group_size`.
     ///
     /// `rows_per_block` is the RUNTIME block length (k+1), not the trained
@@ -965,7 +965,7 @@ impl GpuExecutor {
         })
     }
 
-    /// Gather one embedding row selected by a device token id into `out` [embd]
+    /// Gather one embedding row selected by a device token id into `out` \[embd\]
     /// (graph-capturable: the token id is read from device, not a host address).
     pub fn embed_gather(
         &self,

@@ -999,7 +999,7 @@ impl GpuQwen3 {
         })
     }
 
-    /// Reranker twin of [`calibrate_bs`]: the metric is the yes/no judge's
+    /// Reranker twin of [`Self::calibrate_bs`]: the metric is the yes/no judge's
     /// RANKING quality, not embedding recall (a reranker's embedding space
     /// is not a retrieval space - measured recall@1 0/64 there, pure
     /// noise). `seqs` holds `rel.len()` groups of `group` scored prompts;
@@ -2994,7 +2994,7 @@ impl GpuQwen3 {
 
     /// Reranker scores: the lm_head logit gap between the `yes` and `no` tokens
     /// at each sequence's last position, as sigmoid(logit_yes - logit_no) in
-    /// [0,1]. (Qwen3-Reranker is a generative yes/no relevance judge.)
+    /// \[0,1\]. (Qwen3-Reranker is a generative yes/no relevance judge.)
     pub fn rerank(
         &mut self,
         seqs: &[Vec<u32>],

@@ -512,7 +512,7 @@ impl VisionModel {
         out
     }
 
-    /// Encode a normalized planar image ([3][h][w] f32, already (v-mean)/std) into
+    /// Encode a normalized planar image (\[3\]\[h\]\[w\] f32, already (v-mean)/std) into
     /// LLM-space embeddings. `w`/`h` must be multiples of 2·patch (32).
     pub fn encode(&self, img: &[f32], w: usize, h: usize) -> Result<VisionOutput, GpuModelError> {
         let mut out = self.encode_batch(&[(img, w, h)])?;
@@ -965,7 +965,7 @@ impl VisionModel {
     }
 
     /// Normalize interleaved RGB u8 pixels into the planar f32 layout `encode`
-    /// takes: out[c][y][x] = (px/255 - mean[c]) / std[c].
+    /// takes: out\[c\]\[y\]\[x\] = (px/255 - mean\[c\]) / std\[c\].
     pub fn normalize_rgb(&self, rgb: &[u8], w: usize, h: usize) -> Vec<f32> {
         assert_eq!(rgb.len(), 3 * w * h);
         let mut out = vec![0f32; 3 * w * h];

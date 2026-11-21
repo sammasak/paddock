@@ -8,11 +8,11 @@
 //!
 //! One message shape carries four things, and they land in two places:
 //!
-//! - TEXT is transcript: rendered where it sits (see [`place_system_text`]),
+//! - TEXT is transcript: rendered where it sits (see `place_system_text`),
 //!   and dropped once cleared when it is turn-scoped (`clear_at`).
 //! - `output_config.effort` and `tool_addition` / `tool_removal` blocks are
 //!   REQUEST controls: they change the effort rung and the rendered tool set
-//!   for the generation, so every render path applies [`system_controls`].
+//!   for the generation, so every render path applies `system_controls`.
 //!
 //! Placement follows Anthropic's rule (a system message with text or a tool
 //! change follows a user turn and is last or followed by an assistant turn;

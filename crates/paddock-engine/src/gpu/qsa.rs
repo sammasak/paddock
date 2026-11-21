@@ -82,7 +82,7 @@ impl GpuExecutor {
     /// The indexer query, normalized: row `r`'s `heads` query heads of `hd`
     /// sit at `src[r*ld + h*hd ..]` (the fused q|k projection row); `dst`
     /// gets `[rows, heads, hd]` contiguous - per-head f32 RMS with the (1+w)
-    /// weight `w` [hd], rounded to bf16 - ready for the rotary.
+    /// weight `w` \[hd\], rounded to bf16 - ready for the rotary.
     #[allow(clippy::too_many_arguments)]
     pub fn q4x_idx_q(
         &self,
@@ -122,7 +122,7 @@ impl GpuExecutor {
     /// raw keys - from this launch's rows (`raw[r*ld + koff ..]`, the run's
     /// own earlier rows: same slot, consecutive positions) or else the slot's
     /// `ring` ([slots, ring_len, hd] f32) - meaned in f32, rounded to bf16,
-    /// (1+w)-normalized with `w` [hd], rounded to bf16, into `stage[r]`
+    /// (1+w)-normalized with `w` \[hd\], rounded to bf16, into `stage[r]`
     /// ([rows, hd]) with the block's first position in `spos` ([4, rows],
     /// the rotary's axis-major layout). Other rows are left untouched.
     #[allow(clippy::too_many_arguments)]

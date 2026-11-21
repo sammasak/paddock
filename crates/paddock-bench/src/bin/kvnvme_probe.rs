@@ -23,7 +23,7 @@
 //! IORing / io_uring) is a separate Phase-3 election measured against these
 //! same ceilings.
 //!
-//! Usage: kvnvme-probe <dir-on-target-drive> [--file-gb N] [--keep]
+//! Usage: `kvnvme-probe <dir-on-target-drive> [--file-gb N] [--keep]`
 // A development probe: it runs on a box its author is looking at, and a
 // failure should stop it where it happened rather than be reported.
 #![allow(clippy::unwrap_used)]

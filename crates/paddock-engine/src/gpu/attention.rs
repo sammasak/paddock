@@ -2524,7 +2524,7 @@ impl GpuExecutor {
     #[allow(clippy::too_many_arguments)]
     /// [`Self::attn_prefill`] over a row sub-range [row_off, row_off+rows):
     /// pointer-offset dispatch for mixed-slot prefill chunks - the scalar
-    /// tiled kernel reads slots[0], so each launch must cover one slot's run.
+    /// tiled kernel reads slots\[0\], so each launch must cover one slot's run.
     #[allow(clippy::too_many_arguments)]
     pub fn attn_prefill_rows(
         &self,

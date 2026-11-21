@@ -219,7 +219,7 @@ pub struct RunnerConfig {
     /// ordinal string.
     pub gpu: Option<String>,
     pub kv_cache_dtype: Option<String>,
-    /// Speculation policy as deployed ("off" | "auto" | "ladder" | "<k>");
+    /// Speculation policy as deployed (`"off"` | `"auto"` | `"ladder"` | `"<k>"`);
     /// None = the key is absent and the runner's default applies.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spec: Option<String>,
@@ -840,7 +840,7 @@ pub struct SpawnDefaults {
     pub device: String,
     pub kernel_pack: Option<PathBuf>,
     pub models_dirs: Vec<PathBuf>,
-    /// Where runner-<port>.log files land.
+    /// Where `runner-<port>.log` files land.
     pub logs_dir: PathBuf,
     /// Working directory for spawned runners - deliberately not the manager's
     /// cwd, so a repo-local paddock.toml can never leak into an election.
@@ -3676,7 +3676,7 @@ impl Supervisor {
         self.spawn_overwrite(spec).await.map_err(|e| e.to_string())
     }
 
-    /// Remove a STOPPED endpoint's configuration: delete servers/<port>.toml
+    /// Remove a STOPPED endpoint's configuration: delete `servers/<port>.toml`
     /// and any election. Refused while the port serves - stopping is how a
     /// running model ends; removal is for configuration you no longer want.
     pub async fn remove_config(&self, port: u16) -> Result<(), String> {

@@ -700,7 +700,7 @@ impl GpuSam3Detector {
         self.joint
     }
 
-    /// The 72x72 position table on the device, f32 raster [tokens][d].
+    /// The 72x72 position table on the device, f32 raster \[tokens\]\[d\].
     pub fn pos_table(&self) -> &CudaSlice<f32> {
         &self.pos
     }
@@ -868,7 +868,7 @@ pub struct Sam3Detections {
 
 impl GpuSam3Detector {
     /// Copy a decoder-side result out (the gate's view): `hs` the last layer's
-    /// normed queries [queries][d], the boxes, the logits, the presence logit.
+    /// normed queries \[queries\]\[d\], the boxes, the logits, the presence logit.
     pub fn read_detections(&self) -> Result<Sam3Detections, GpuModelError> {
         let nq = self.g.queries;
         let probs = self.exec.to_host_len(&self.ws.probs, nq)?;
@@ -883,21 +883,21 @@ impl GpuSam3Detector {
         })
     }
 
-    /// The last decoder layer's normed queries, [queries][d] f32 (the decoder
+    /// The last decoder layer's normed queries, \[queries\]\[d\] f32 (the decoder
     /// keeps the presence token as its LAST row, so these are rows 0..).
     pub fn read_queries(&self) -> Result<Vec<f32>, GpuModelError> {
         let (d, nq) = (self.g.d, self.g.queries);
         Ok(self.exec.to_host_len(&self.ws.hs, nq * d)?)
     }
 
-    /// The fusion encoder's output E, [tokens][d] f32 raster.
+    /// The fusion encoder's output E, \[tokens\]\[d\] f32 raster.
     pub fn read_memory(&self) -> Result<Vec<f32>, GpuModelError> {
         Ok(self
             .exec
             .to_host_len(&self.ws.enc, self.g.tokens() * self.g.d)?)
     }
 
-    /// The compacted prompt, [n_prompt][d] f32 (text rows, then geometry rows).
+    /// The compacted prompt, \[n_prompt\]\[d\] f32 (text rows, then geometry rows).
     pub fn read_prompt(&self) -> Result<Vec<f32>, GpuModelError> {
         Ok(self
             .exec
@@ -910,7 +910,7 @@ impl GpuSam3Detector {
         &self.ws.masks
     }
 
-    /// All queries' mask logits at 288^2, pixel-major [288^2][queries] f32.
+    /// All queries' mask logits at 288^2, pixel-major [288^2]\[queries\] f32.
     pub fn read_masks(&self) -> Result<Vec<f32>, GpuModelError> {
         Ok(self
             .exec

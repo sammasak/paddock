@@ -14,7 +14,7 @@ impl HostTensor {
         Self { data, dims }
     }
 
-    /// Row `r` of a 2-D tensor (contiguous dims[0] floats).
+    /// Row `r` of a 2-D tensor (contiguous dims\[0\] floats).
     pub fn row(&self, r: usize) -> &[f32] {
         let w = self.dims[0];
         &self.data[r * w..(r + 1) * w]
@@ -35,7 +35,7 @@ impl HostTensor {
         }
     }
 
-    /// y = W·x for a [in, out] weight: out[o] = dot(row o, x). Reference-grade
+    /// y = W·x for a [in, out] weight: out\[o\] = dot(row o, x). Reference-grade
     /// loop; the GPU path owns performance.
     pub fn matvec(&self, x: &[f32], out: &mut [f32]) {
         let in_dim = self.dims[0];

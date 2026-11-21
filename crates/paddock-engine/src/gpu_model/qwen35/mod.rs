@@ -13,7 +13,7 @@
 //! bf16/quant noise; see tests/qwen35_vs_llamacpp.rs).
 //!
 //! Multimodal is in scope: the full-attn M-RoPE already consumes the full 4-axis
-//! [t,h,w,e] position layout (see `gpu.rs::mrope`), so the vision tower (P4) slots
+//! \[t,h,w,e\] position layout (see `gpu.rs::mrope`), so the vision tower (P4) slots
 //! in without reworking the text path.
 //!
 //! Split into gemma4-shaped submodules.

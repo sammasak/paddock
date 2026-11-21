@@ -264,8 +264,8 @@ impl Sampler {
     }
 
     /// Commit a drawn pick (host or device) and its row's pressure: a leave
-    /// token ends the block; [`STOP_RUN`] pressure picks within the window,
-    /// or a loop ([`degenerate`]), force the exit from the next pick on.
+    /// token ends the block; `STOP_RUN` pressure picks within the window,
+    /// or a loop (`degenerate`), force the exit from the next pick on.
     pub fn note_drawn(&mut self, t: u32, pressure: bool) {
         self.note_pick(t, pressure);
         self.start_loop_exit();
@@ -450,7 +450,7 @@ fn degenerate(tail: &[u32]) -> Option<String> {
     None
 }
 
-/// One host pick: [`draw`], then the machine advanced on what was picked.
+/// One host pick: `draw`, then the machine advanced on what was picked.
 /// Err = the constraint has no legal continuation.
 pub fn pick_next(
     sampler: &mut Sampler,

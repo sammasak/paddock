@@ -2,7 +2,7 @@
 //! the existing manager relay; this module has no URLs, credentials or UI code.
 //! EOF is never success. Full terminal output is authoritative, including text
 //! a provider delivered only in its terminal event. See OpenAI's semantic-event
-//! contract: https://developers.openai.com/api/docs/guides/streaming-responses
+//! contract: <https://developers.openai.com/api/docs/guides/streaming-responses>
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 

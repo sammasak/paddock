@@ -21,7 +21,7 @@
 //! pairs 0..17 rotate by the patch ROW at exponent p, pairs 18..35 by the
 //! COLUMN at p-18, NeoX pair (p, p+36) - exactly `SigLIPRotaryEmbedding(36)`
 //! + `rope_emb.repeat(1,2)` + `rotate_half`, and exactly what llama.cpp's
-//!   `clip_graph_paddleocr` builds with sections [18,18].
+//!   `clip_graph_paddleocr` builds with sections \[18,18\].
 //!
 //! f32 activations over f16 weight planes (the mmproj tower class); the
 //! oracle gate runs class tolerance against the reference's f32.
@@ -531,7 +531,7 @@ impl VisionModel {
         (w / self.patch) * (h / self.patch)
     }
 
-    /// Encode one normalized planar image ([3][h][w] f32) - see
+    /// Encode one normalized planar image (\[3\]\[h\]\[w\] f32) - see
     /// [`super::preprocess::preprocess_rgb`]. `w`/`h` must be multiples of 28.
     pub fn encode(
         &mut self,

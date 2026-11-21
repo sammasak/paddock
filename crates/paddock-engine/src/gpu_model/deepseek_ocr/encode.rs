@@ -14,7 +14,7 @@
 //!   -> CLIP: +CLS row, +pos (resampled, CLS held out), pre-LN(1e-5)
 //!   -> 24 × block: LN -> QKV GEMM -> row_slice -> `vision_attn_x` -> out + res
 //!                 -> LN -> up -> QUICK-gelu -> down + res
-//!   -> projector: clip[1:]·fc_clip + sam·fc_sam + bias      [B·t², 1280]
+//!   -> projector: clip\[1:\]·fc_clip + sam·fc_sam + bias      [B·t², 1280]
 //!
 //! Faithfulness notes, each one a silent-wrong if missed:
 //!  * the two halves run different activations (SAM erf-GELU, CLIP quick-GELU)
@@ -35,7 +35,7 @@
 //! have different grids, tables and window counts, so the caller runs two
 //! encodes for a gundam-mode image. Crops batch together (B = tiles).
 //!
-//! ## Workspace ([`TowerWs`])
+//! ## Workspace (`TowerWs`)
 //!
 //! This graph runs MID-SERVE, where one cudaMalloc is a device-wide sync
 //! under CUDA's default allocator - and the transient-alloc version of it
@@ -657,7 +657,7 @@ pub(super) fn im2row(rgb: &[f32], views: usize, px: usize, p: usize) -> Vec<f32>
 /// path: raw interleaved-RGB views, normalized + im2row'd + f16-converted on
 /// device (`pd_ocr_patches_u8`) - a quarter of the f32 plane's upload bytes
 /// and none of its host preprocessing. `F32` is the reference arm: prebuilt
-/// [`im2row`] rows, kept for the oracle gate and the stem bit-cmp test.
+/// `im2row` rows, kept for the oracle gate and the stem bit-cmp test.
 #[derive(Clone, Copy)]
 pub enum PatchSrc<'a> {
     F32(&'a [f32]),
@@ -665,7 +665,7 @@ pub enum PatchSrc<'a> {
 }
 
 impl DeepEncoder {
-    /// [`im2row`] at this tower's patch size.
+    /// `im2row` at this tower's patch size.
     pub fn patch_rows(&self, rgb: &[f32], views: usize, px: usize) -> Vec<f32> {
         im2row(rgb, views, px, self.hp.sam_patch)
     }

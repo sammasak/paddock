@@ -281,7 +281,7 @@ impl Demand {
 
     /// Solve. This is the only way a family may size KV.
     ///
-    /// `grant` is [`crate::gpu::Exec::vram_headroom`] - the budget minus this
+    /// `grant` is [`crate::gpu::GpuExecutor::vram_headroom`] - the budget minus this
     /// runner's own ledger, clamped to device free. Callers must treat a
     /// missing reading as an error rather than as permission: "the driver did
     /// not answer" is not "take what you like", and reading it that way is

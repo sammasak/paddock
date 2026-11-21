@@ -1,13 +1,13 @@
 //! Stall-free chunked prefill + the ENCODER BUDGET for PaddleOCR-VL
 //! - deepseek-ocr's shape with this family's deltas:
 //!
-//! - A persistent [`ChunkedPrefill`] queue whose entries carry the mm ROW
-//!   PLAN (image rows as [`Row::Image`]), the request's 3-axis position plan
+//! - A persistent `ChunkedPrefill` queue whose entries carry the mm ROW
+//!   PLAN (image rows as `Row::Image`), the request's 3-axis position plan
 //!   (a chunk cut anywhere slices its M-RoPE stream from it), and the
 //!   assembled per-image projector planes. Mixed ticks advance a row budget
 //!   per tick (`forward_mixed`); `rows_pass_body` splices image rows from the
 //!   planes by (slot, position).
-//! - An encode queue ([`PoEnc`]) spending one tower call per tick. This
+//! - An encode queue (`PoEnc`) spending one tower call per tick. This
 //!   family's encode ladder is trivially flat - one NaViT pass per image, no
 //!   crops/global split - so the budget unit is simply "one image".
 //!   Host preprocess (the bit-exact PIL-parity resize) runs on worker

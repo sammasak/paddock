@@ -344,7 +344,7 @@ impl GpuExecutor {
 
     /// Whether the mxf4 (fp4 x fp4, m16n8k64) dense route is fully available:
     /// requant, e2m1 activation quantizers and the k64 GEMM. Same cc-12
-    /// caller obligation as [`has_mxfp4_gemm_bs`].
+    /// caller obligation as [`Self::has_mxfp4_gemm_bs`].
     pub fn has_mxfp4_gemm_f4(&self) -> bool {
         self.kernels.mxfp4_gemm_f4.is_some()
             && self.kernels.q8_0_to_fp4p.is_some()

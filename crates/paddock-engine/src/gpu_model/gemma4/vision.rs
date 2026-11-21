@@ -4,7 +4,7 @@
 //! limits 40..280) + `mtmd-image.cpp` (dyn-size smart_resize, align 48).
 //!
 //!   pixels (bilinear smart-resize, ×2-1) -> 16×16 conv (no bias, as GEMM
-//!   over im2row [c][ky][kx]-ordered patches) -> +tbl_x[pos_x] +tbl_y[pos_y]
+//!   over im2row \[c\]\[ky\]\[kx\]-ordered patches) -> +tbl_x\[pos_x\] +tbl_y\[pos_y\]
 //!   (factorized learned pos tables) -> 27 × [ RMS ln1 -> QKV -> per-head RMS
 //!   q/k norms -> 2D NEOX rope (x half by pos_x, y half by pos_y, θ=100) ->
 //!   weightless V RMS -> bidirectional attn (scale 1.0) -> out-proj ->
@@ -287,7 +287,7 @@ fn host_f32(map: &MappedGguf, name: &str) -> Result<(Vec<f32>, Vec<usize>), GpuE
 
 impl VisionModel {
     /// `max_image_tokens` is the endpoint's config value (None = the
-    /// checkpoint's published 280) - see [`resolved_max_tokens`].
+    /// checkpoint's published 280) - see `resolved_max_tokens`.
     pub fn load(
         exec: Arc<GpuExecutor>,
         map: &MappedGguf,

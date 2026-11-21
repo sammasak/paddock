@@ -123,7 +123,7 @@ impl Drop for HostMirror {
 /// A repacked k-quant plane whose bytes live in host-mapped memory. Derefs
 /// to the same `RepackedKQ` the kernels take, so every launch wrapper is
 /// unchanged; the two `CudaSlice`s inside are non-owning views (see
-/// [`HostMirror::device_view`]) and the mirrors own the pages.
+/// `HostMirror::device_view`) and the mirrors own the pages.
 pub struct HostMappedKq {
     plane: ManuallyDrop<RepackedKQ>,
     // Declared after `plane` so the views are forgotten before the pages

@@ -3,7 +3,7 @@
 //! Builds a [`ForensicRuntime`] from the `[forensics]` config and runs
 //! `paddock-forensics` over image attachments on their ORIGINAL bytes, feeding
 //! the findings into the model's context (the sift injection lane in
-//! [`crate::doc::inject_forensics`]). GPU-first with a parity-verified CPU
+//! `crate::doc::inject_forensics`). GPU-first with a parity-verified CPU
 //! fallback; the GPU path exists only in a `forensics-cuda` build.
 
 use std::sync::Arc;
@@ -495,7 +495,7 @@ pub fn report_value(
 }
 
 /// One analyzed attachment's structured result, produced by the always-on
-/// preprocessing pass ([`crate::doc::inject_forensics`]) and surfaced as a
+/// preprocessing pass (`crate::doc::inject_forensics`) and surfaced as a
 /// `/v1/responses` output item. `image_index` is the 0-based order of the
 /// analyzed part among the turn's image/PDF attachments - matching the on-demand
 /// tool's `image_index` - so a downstream persister can map it back to the

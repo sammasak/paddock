@@ -3,7 +3,7 @@
 use cudarc::driver::CudaSlice;
 use paddock_models::ggml_type::GgmlType;
 
-/// An f32 tensor resident on the device. dims follow GGUF order (dims[0] =
+/// An f32 tensor resident on the device. dims follow GGUF order (dims\[0\] =
 /// row length / input dim).
 pub struct DeviceTensor {
     pub buf: CudaSlice<f32>,
@@ -17,7 +17,7 @@ impl DeviceTensor {
 }
 
 /// An f16 tensor resident on the device, same dims convention as
-/// [`DeviceTensor`] (dims[0] = row length / input dim).
+/// [`DeviceTensor`] (dims\[0\] = row length / input dim).
 ///
 /// For weight planes that ship F16 on disk and are only ever consumed by a
 /// tensor-core GEMM, this is the storage class the file already has: no widen
@@ -268,7 +268,7 @@ pub struct F8TilePlane {
 pub struct RepackedKQ {
     pub data: CudaSlice<u8>,
     pub scales: CudaSlice<u8>,
-    /// GGUF order: dims[0] = in_dim, dims[1] = out_dim.
+    /// GGUF order: dims\[0\] = in_dim, dims\[1\] = out_dim.
     pub dims: Vec<usize>,
     pub ty: GgmlType,
     /// The plane's int8 activation class is ONE scale per 128 (the ternary
@@ -440,7 +440,7 @@ impl QuantW {
         }
     }
 
-    /// GGUF order: dims[0] = in_dim, dims[1] = out_dim.
+    /// GGUF order: dims\[0\] = in_dim, dims\[1\] = out_dim.
     pub fn dims(&self) -> &[usize] {
         match self {
             QuantW::Q8(w) => &w.dims,
@@ -482,7 +482,7 @@ impl QuantW {
 pub struct RepackedQ8 {
     pub data: CudaSlice<u8>,
     pub scale: CudaSlice<u8>,
-    /// GGUF order: dims[0] = in_dim, dims[1] = out_dim.
+    /// GGUF order: dims\[0\] = in_dim, dims\[1\] = out_dim.
     pub dims: Vec<usize>,
 }
 

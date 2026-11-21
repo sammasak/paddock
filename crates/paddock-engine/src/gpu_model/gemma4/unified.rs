@@ -9,7 +9,7 @@
 //!   uint8 antialiased bicubic - EmbeddingGemma 2's resize, on the Clef
 //!   resampler), cut into 48 px patches (raster order, 6912 values each in
 //!   the file's CHW order), then LayerNorm -> Linear 6912 -> 3840 (+bias) ->
-//!   LayerNorm -> + pos_x[col] + pos_y[row] -> LayerNorm -> weightless RMS
+//!   LayerNorm -> + pos_x\[col\] + pos_y\[row\] -> LayerNorm -> weightless RMS
 //!   norm -> Linear 3840 -> 3840
 //! - a clip is cut into 640-sample (40 ms) frames, one token each, no
 //!   downsampling: weightless RMS norm -> Linear 640 -> 3840

@@ -4,7 +4,7 @@
 //! hidden 1152, full attention, native-resolution patching driven by the
 //! image grid) + 2-layer MLP projector with 2×2 spatial merge, feeding an
 //! ERNIE-4.5-0.3B decoder (18 layers, hd128 decoupled GQA, 3D M-RoPE
-//! [16,24,24]). Reference: the checkpoint's own `modeling_paddleocr_vl.py`;
+//! \[16,24,24\]). Reference: the checkpoint's own `modeling_paddleocr_vl.py`;
 //! vLLM's implementation and llama.cpp's
 //! (`tools/mtmd/models/paddleocr.cpp`) are the cross-references.
 //!

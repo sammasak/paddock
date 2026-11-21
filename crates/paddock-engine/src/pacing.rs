@@ -79,8 +79,8 @@
 //! stream dominates and the prompt pays for the streams' latency several
 //! times over. So with 1..=[`KNEE_STREAMS`] streams waiting, a tick takes the
 //! smallest aligned share whose cost per prompt token stays within
-//! [`knee::KNEE_COST`] of the full share's - MEASURED by this process on
-//! its own ticks ([`knee`]), so the same rule lands where each machine's
+//! `knee::KNEE_COST` of the full share's - MEASURED by this process on
+//! its own ticks (`knee`), so the same rule lands where each machine's
 //! knee is (GB10: 512 rows, +12% ingest for 1.75x the stream's tokens; a
 //! die with a cheap weight stream lands at a fraction of its ~1 s tick).
 //! Wider batches keep the elected spans: their throughput elections were

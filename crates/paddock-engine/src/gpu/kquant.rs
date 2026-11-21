@@ -413,7 +413,7 @@ impl GpuExecutor {
     }
 
     /// Repack SEVERAL same-type k-quant tensors into one resident weight,
-    /// concatenated along the out dimension (dims[1]) - the merged-projection
+    /// concatenated along the out dimension (dims\[1\]) - the merged-projection
     /// GEMV lane: one launch reads [t0 | t1 | ...] output rows where separate
     /// small GEMVs each paid their own fixed cost. Valid because k-quant
     /// superblocks are position-independent and rows are whole superblocks
@@ -495,7 +495,7 @@ impl GpuExecutor {
         })
     }
 
-    /// Exact fused decode GEMV over a repacked k-quant weight: y[out] = W·x.
+    /// Exact fused decode GEMV over a repacked k-quant weight: y\[out\] = W·x.
     pub fn kquant_gemv(
         &self,
         w: &RepackedKQ,
@@ -527,7 +527,7 @@ impl GpuExecutor {
         })
     }
 
-    /// Embedding row-gather from a repacked k-quant table (rows = dims[1]).
+    /// Embedding row-gather from a repacked k-quant table (rows = dims\[1\]).
     pub fn kquant_gather(
         &self,
         w: &RepackedKQ,
@@ -596,8 +596,8 @@ impl GpuExecutor {
         })
     }
 
-    /// Per-32-block activation sums off the mmq int8 layout: sums[chunk]
-    /// [col_pad][b] = scl_b * sum(block b). The W4A8 min-term operand for
+    /// Per-32-block activation sums off the mmq int8 layout: sums\[chunk\]
+    /// \[col_pad\]\[b\] = scl_b * sum(block b). The W4A8 min-term operand for
     /// Q4_K/Q5_K; computed from the already-quantized `yq` so every existing
     /// quantize kernel (incl. the fused variants) stays untouched. `sums`
     /// must hold ceil(in_dim/128) * batch_pad * 4 f32.
@@ -885,7 +885,7 @@ impl GpuExecutor {
     }
 
     /// Per-16 activation sums off the STRIDED int8 layout (`quantize_q8`):
-    /// sums[col][w16] = raw int sum as f32. The dp4a decode ladder's Q4/Q5
+    /// sums\[col\]\[w16\] = raw int sum as f32. The dp4a decode ladder's Q4/Q5
     /// min-term operand. `sums` must hold batch * in_dim/16 f32.
     pub fn q8_sums_strided(
         &self,
