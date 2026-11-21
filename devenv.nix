@@ -1,6 +1,7 @@
 { pkgs, ... }:
 let
   support = import ./nix/support.nix { inherit pkgs; };
+  nativeTools = support.nativeBuildInputs ++ [ pkgs.gnumake ];
   check = "cargo check --workspace --all-targets --locked";
   clippy = "cargo clippy --workspace --all-targets --locked -- -D warnings";
   test = "cargo test --workspace --locked";
@@ -9,7 +10,7 @@ in
 {
   name = "paddock";
   # stdenv supplies Make in derivations; interactive Cargo/CMake needs it explicitly.
-  packages = support.nativeBuildInputs ++ [ pkgs.gnumake ];
+  packages = nativeTools;
   platform.toolchains.rust = {
     enable = true;
     toolchainFile = ./rust-toolchain.toml;
@@ -21,7 +22,8 @@ in
     tasks = {
       enable = true;
       ci = {
-        extraInputs = [ pkgs.nix ];
+        # The CI wrapper clears inherited PATH; shell packages alone are insufficient.
+        extraInputs = [ pkgs.nix ] ++ nativeTools;
         exec = ''
           ${nixCheck}
           cargo fmt --all -- --check
