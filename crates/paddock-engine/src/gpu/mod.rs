@@ -51,6 +51,10 @@ mod spec_ops;
 pub use attention::PfQ;
 pub use canvas::CanvasStatus;
 pub use hadamard::HadamardGdnHeads;
+// Read by the disk expert backing, which the qwen4exp seat wires in a later
+// step of the patch stack; until then only its tests use it.
+#[allow(dead_code)]
+mod expert_store;
 mod host_plane;
 pub use host_plane::{HostMappedKq, HostMirror};
 mod moe_cache;
