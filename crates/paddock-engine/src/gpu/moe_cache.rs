@@ -82,8 +82,8 @@ impl ExpertPlaneLayout {
         };
         if data_bytes == 0
             || scales_bytes == 0
-            || data_bytes % n_expert != 0
-            || scales_bytes % n_expert != 0
+            || !data_bytes.is_multiple_of(n_expert)
+            || !scales_bytes.is_multiple_of(n_expert)
         {
             return Err(GpuError::Driver(
                 "expert cache: plane bytes are not a whole number of experts".into(),
@@ -510,7 +510,7 @@ mod layout_tests {
 
     #[test]
     fn expert_plane_layout_does_not_depend_on_a_device_pointer() {
-        let layout = ExpertPlaneLayout::new(&[256, 640, 8], GgmlType::Q4_K, 4096, 768)
+        let layout = ExpertPlaneLayout::new(&[256, 640, 8], GgmlType::Q4K, 4096, 768)
             .expect("valid expert plane");
         assert_eq!(layout.dims, vec![256, 640, 8]);
         assert_eq!(layout.data_per_expert, 512);
@@ -526,7 +526,7 @@ mod layout_tests {
             (&[256, 640, 8][..], 4096, 769),
             (&[256, 640, 8][..], 0, 768),
         ] {
-            assert!(ExpertPlaneLayout::new(dims, GgmlType::Q4_K, data, scales).is_err());
+            assert!(ExpertPlaneLayout::new(dims, GgmlType::Q4K, data, scales).is_err());
         }
     }
 }
