@@ -155,7 +155,7 @@ fn pwrite(f: &File, buf: &[u8], off: u64) -> io::Result<usize> {
 /// Positioned read that fills `buf` or fails - short reads are retried at the
 /// advanced offset, EOF is an error (the caller only ever asks for extents a
 /// commit record says are there).
-pub fn pread_exact(f: &File, buf: &mut [u8], off: u64) -> io::Result<()> {
+pub(crate) fn pread_exact(f: &File, buf: &mut [u8], off: u64) -> io::Result<()> {
     let mut done = 0usize;
     while done < buf.len() {
         match pread(f, &mut buf[done..], off + done as u64) {
@@ -173,7 +173,7 @@ pub fn pread_exact(f: &File, buf: &mut [u8], off: u64) -> io::Result<()> {
     Ok(())
 }
 
-pub fn pwrite_all(f: &File, buf: &[u8], off: u64) -> io::Result<()> {
+pub(crate) fn pwrite_all(f: &File, buf: &[u8], off: u64) -> io::Result<()> {
     let mut done = 0usize;
     while done < buf.len() {
         match pwrite(f, &buf[done..], off + done as u64) {

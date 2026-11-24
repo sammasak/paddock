@@ -8,6 +8,8 @@
 //! staging buffer and then a copy into the slot (`moe_cache.rs`). Both
 //! backings describe themselves with the same `ExpertLayerLayout`; a disk
 //! artifact whose layout differs from the model's is refused at open.
+//! Opening, not writing, is the gate: nothing is trusted from a file that has
+//! not passed `DiskExpertStore::open`.
 //!
 //! One file per model, little-endian:
 //!
@@ -15,6 +17,8 @@
 //!   (what the artifact was produced from: model digest and repack format),
 //!   layer count, expert count, then per layer the three plane geometries
 //!   (ggml type, dims, data and scale bytes per expert);
+//! - a BLAKE3 digest of the header above, so a flipped geometry field that
+//!   leaves every size unchanged is still caught;
 //! - a BLAKE3 digest per `(layer, expert)` record;
 //! - the records, layer-major, expert-major within a layer. A record is one
 //!   expert's six streams back to back in fill-descriptor order, so a miss
@@ -67,6 +71,8 @@ fn to_usize(v: u64) -> io::Result<usize> {
 struct Extents {
     /// `(first record offset, record bytes)` per layer.
     layers: Vec<(u64, u64)>,
+    /// End of the header proper; its digest follows.
+    header_len: u64,
     digests_at: u64,
     len: u64,
 }
@@ -75,10 +81,11 @@ impl Extents {
     fn new(layouts: &[ExpertLayerLayout], n_expert: usize) -> io::Result<Self> {
         let n_layers = to_u64(layouts.len())?;
         let n_expert = to_u64(n_expert)?;
-        let digests_at = n_layers
+        let header_len = n_layers
             .checked_mul(3 * PLANE_HEADER)
             .and_then(|v| v.checked_add(FIXED_HEADER))
             .ok_or_else(overflow)?;
+        let digests_at = header_len.checked_add(DIGEST).ok_or_else(overflow)?;
         let mut at = n_layers
             .checked_mul(n_expert)
             .and_then(|v| v.checked_mul(DIGEST))
@@ -98,15 +105,21 @@ impl Extents {
         }
         Ok(Self {
             layers,
+            header_len,
             digests_at,
             len: at,
         })
     }
 }
 
-fn encode_header(identity: &Identity, layouts: &[ExpertLayerLayout]) -> io::Result<Vec<u8>> {
+/// The header proper followed by its digest.
+fn encode_header(
+    identity: &Identity,
+    layouts: &[ExpertLayerLayout],
+    n_expert: usize,
+) -> io::Result<Vec<u8>> {
     let n_layers = u32::try_from(layouts.len()).map_err(|_| overflow())?;
-    let n_expert = u32::try_from(layouts[0].n_expert()).map_err(|_| overflow())?;
+    let n_expert = u32::try_from(n_expert).map_err(|_| overflow())?;
     let mut h = Vec::new();
     h.extend_from_slice(&MAGIC);
     h.extend_from_slice(&VERSION.to_le_bytes());
@@ -123,6 +136,8 @@ fn encode_header(identity: &Identity, layouts: &[ExpertLayerLayout]) -> io::Resu
             h.extend_from_slice(&to_u64(p.scales_per_expert)?.to_le_bytes());
         }
     }
+    let digest = *blake3::hash(&h).as_bytes();
+    h.extend_from_slice(&digest);
     Ok(h)
 }
 
@@ -165,8 +180,10 @@ pub(super) struct ExpertArtifactWriter {
 }
 
 impl ExpertArtifactWriter {
-    /// Start `path`. The temporary sibling is created exclusively: a second
-    /// writer for the same artifact fails instead of interleaving.
+    /// Start `path`. The temporary sibling `<path>.partial` is created
+    /// exclusively: a second writer for the same artifact fails instead of
+    /// interleaving. A writer killed before `finish` leaves that file behind;
+    /// whoever owns the artifact directory removes it before retrying.
     pub(super) fn create(
         path: &Path,
         identity: &Identity,
@@ -181,8 +198,14 @@ impl ExpertArtifactWriter {
                 "expert artifact: layers disagree on the expert count".into(),
             ));
         }
+        if layouts.len() > MAX_LAYERS as usize || n_expert > MAX_EXPERTS as usize {
+            return Err(invalid(format!(
+                "expert artifact: {} layers, {n_expert} experts is over what a reader accepts",
+                layouts.len()
+            )));
+        }
         let extents = Extents::new(layouts, n_expert)?;
-        let header = encode_header(identity, layouts)?;
+        let header = encode_header(identity, layouts, n_expert)?;
         let mut tmp = path.as_os_str().to_owned();
         tmp.push(".partial");
         let tmp = PathBuf::from(tmp);
@@ -265,8 +288,13 @@ pub(super) struct DiskExpertStore {
 
 impl DiskExpertStore {
     /// Open `path` and check it was produced from `identity`, that its header
-    /// is self-consistent and that the file is exactly as long as it says.
-    pub(super) fn open(path: &Path, identity: &Identity) -> io::Result<Self> {
+    /// is intact and describes exactly `expected` (the model's layouts, layer
+    /// by layer), and that the file is exactly as long as it says.
+    pub(super) fn open(
+        path: &Path,
+        identity: &Identity,
+        expected: &[ExpertLayerLayout],
+    ) -> io::Result<Self> {
         let file = File::open(path)?;
         let file_len = file.metadata()?.len();
         let mut fixed = [0u8; FIXED_HEADER as usize];
@@ -294,9 +322,16 @@ impl DiskExpertStore {
             )));
         }
         let (n_layers, n_expert) = (n_layers as usize, n_expert as usize);
-        let mut planes = vec![0u8; n_layers * 3 * PLANE_HEADER as usize];
+        let mut planes = vec![0u8; n_layers * 3 * PLANE_HEADER as usize + DIGEST as usize];
         pread_exact(&file, &mut planes, FIXED_HEADER)?;
-        let mut f = Fields(&planes);
+        let (planes, stored) = planes.split_at(planes.len() - DIGEST as usize);
+        let mut h = blake3::Hasher::new();
+        h.update(&fixed);
+        h.update(planes);
+        if h.finalize().as_bytes()[..] != stored[..] {
+            return Err(invalid("expert artifact: header fails its digest".into()));
+        }
+        let mut f = Fields(planes);
         let mut layouts = Vec::with_capacity(n_layers);
         for _ in 0..n_layers {
             let mut plane = || -> io::Result<ExpertPlaneLayout> {
@@ -317,6 +352,11 @@ impl DiskExpertStore {
                 )));
             }
             layouts.push(l);
+        }
+        if layouts != expected {
+            return Err(invalid(
+                "expert artifact: plane geometry differs from the model's; regenerate it".into(),
+            ));
         }
         let extents = Extents::new(&layouts, n_expert)?;
         if file_len != extents.len {
@@ -393,8 +433,10 @@ impl DiskExpertStore {
 }
 
 /// Proof of holding one staging buffer. Not `Clone`: a buffer is released
-/// exactly once, by giving the lease back.
+/// exactly once, by giving the lease back to the pool that issued it (a disk
+/// backing owns exactly one pool).
 #[derive(Debug)]
+#[must_use = "a dropped lease never returns its buffer to the pool"]
 pub(super) struct StagingLease(usize);
 
 /// A fixed set of equally sized staging buffers, allocated up front. The pool
@@ -524,7 +566,7 @@ mod tests {
         let ls = layouts();
         write(&path, &ls);
         assert!(!path.with_extension("pdxa.partial").exists());
-        let s = DiskExpertStore::open(&path, &ID).expect("open");
+        let s = DiskExpertStore::open(&path, &ID, &ls).expect("open");
         assert_eq!(s.n_layers(), 2);
         for (l, want) in ls.iter().enumerate() {
             assert_eq!(s.layout(l), Some(want));
@@ -543,9 +585,10 @@ mod tests {
     fn open_rejects_foreign_or_malformed_files() {
         let d = dir("open");
         let path = d.join("experts.pdxa");
-        write(&path, &layouts());
+        let ls = layouts();
+        write(&path, &ls);
         assert_eq!(
-            kind(DiskExpertStore::open(&path, &[8u8; 32])),
+            kind(DiskExpertStore::open(&path, &[8u8; 32], &ls)),
             io::ErrorKind::InvalidData
         );
 
@@ -553,7 +596,7 @@ mod tests {
         let probe = |bytes: &[u8]| {
             let p = d.join("probe.pdxa");
             std::fs::write(&p, bytes).expect("write probe");
-            kind(DiskExpertStore::open(&p, &ID))
+            kind(DiskExpertStore::open(&p, &ID, &ls))
         };
         let mut b = good.clone();
         b[0] = b'X';
@@ -569,11 +612,32 @@ mod tests {
         let mut b = good.clone();
         b.push(0);
         assert_eq!(probe(&b), io::ErrorKind::InvalidData, "trailing bytes");
+        // Header edits below are resealed (digest recomputed) where the test
+        // is about the check behind the digest, not the digest itself.
+        let header_len = Extents::new(&ls, N_EXPERT).expect("extents").header_len as usize;
+        let reseal = |b: &mut Vec<u8>| {
+            let d = *blake3::hash(&b[..header_len]).as_bytes();
+            b[header_len..header_len + DIGEST as usize].copy_from_slice(&d);
+        };
+        let dims0 = (FIXED_HEADER + 4) as usize;
+        let mut b = good.clone();
+        b[dims0] ^= 1;
+        assert_eq!(probe(&b), io::ErrorKind::InvalidData, "header digest");
+        reseal(&mut b);
+        assert_eq!(probe(&b), io::ErrorKind::InvalidData, "geometry vs model");
         // first plane's expert count (dims[2]) no longer matches the header
         let mut b = good.clone();
-        let dims2 = (FIXED_HEADER + 4 + 2 * 8) as usize;
-        b[dims2] = 5;
+        b[dims0 + 2 * 8] = 5;
+        reseal(&mut b);
         assert_eq!(probe(&b), io::ErrorKind::InvalidData, "plane geometry");
+        let mut b = good.clone();
+        b[40..44].copy_from_slice(&0u32.to_le_bytes());
+        reseal(&mut b);
+        assert_eq!(probe(&b), io::ErrorKind::InvalidData, "no layers");
+        let mut b = good.clone();
+        b[44..48].copy_from_slice(&u32::MAX.to_le_bytes());
+        reseal(&mut b);
+        assert_eq!(probe(&b), io::ErrorKind::InvalidData, "implausible experts");
         assert_eq!(
             probe(&good[..10]),
             io::ErrorKind::UnexpectedEof,
@@ -593,7 +657,7 @@ mod tests {
         bytes[(first + 2 * len0 + 5) as usize] ^= 1;
         std::fs::write(&path, &bytes).expect("rewrite");
 
-        let s = DiskExpertStore::open(&path, &ID).expect("length is unchanged");
+        let s = DiskExpertStore::open(&path, &ID, &ls).expect("length is unchanged");
         let mut buf = vec![0u8; len0 as usize];
         assert_eq!(
             kind(s.read_expert(0, 2, &mut buf)),
@@ -709,8 +773,16 @@ mod tests {
         let path = dir("same").join("experts.pdxa");
         let ls = layouts();
         write(&path, &ls);
-        let s = DiskExpertStore::open(&path, &ID).expect("open");
+        let s = DiskExpertStore::open(&path, &ID, &ls).expect("open");
         assert_eq!(s.layout(1), Some(&ls[1]));
-        assert_ne!(s.layout(0), Some(&ls[1]));
+        let swapped = [ls[1].clone(), ls[0].clone()];
+        assert_eq!(
+            kind(DiskExpertStore::open(&path, &ID, &swapped)),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            kind(DiskExpertStore::open(&path, &ID, &ls[..1])),
+            io::ErrorKind::InvalidData
+        );
     }
 }
