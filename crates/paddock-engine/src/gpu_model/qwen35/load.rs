@@ -344,7 +344,7 @@ impl GpuQwen35 {
         } else {
             0
         };
-        if host_bytes > 0 {
+        if host_bytes > 0 && crate::gpu::moe_disk_artifact().is_none() {
             tracing::info!(
                 host_gib = host_bytes as f64 / (1u64 << 30) as f64,
                 "qwen35 MoE expert offload: routed-expert planes will be host-mapped (PADDOCK_MOE_HOST)"

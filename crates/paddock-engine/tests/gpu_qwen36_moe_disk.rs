@@ -265,17 +265,17 @@ fn moe_disk_parity_and_measure() {
         tokens == ref_tokens
     );
 
+    assert_eq!(tokens, ref_tokens, "disk greedy tokens must equal pinned");
+    assert_eq!(
+        mismatched, 0,
+        "disk prefill logits must equal pinned bit for bit"
+    );
     measure(&mut m, Some(&artifact));
     let refused = m.enable_batch(1).err().map(|e| e.to_string());
     eprintln!("enable_batch on disk experts: {refused:?}");
     assert!(
         refused.is_some_and(|e| e.contains("batched serving")),
         "batched serving must refuse disk-backed experts"
-    );
-    assert_eq!(tokens, ref_tokens, "disk greedy tokens must equal pinned");
-    assert_eq!(
-        mismatched, 0,
-        "disk prefill logits must equal pinned bit for bit"
     );
 }
 

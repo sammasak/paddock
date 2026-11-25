@@ -54,8 +54,9 @@ pub fn moe_offload() -> MoeOffloadCfg {
 
 /// `PADDOCK_MOE_DISK=<artifact>`: development switch for the disk backing -
 /// the routed experts are read on a miss from this artifact (`moe_disk.rs`)
-/// instead of being held in page-locked RAM. Families that do not support
-/// it refuse at load.
+/// instead of being held in page-locked RAM. qwen35 serves it, qwen4exp
+/// refuses it at load, and families without `[moe_offload]` ignore it as
+/// they ignore `PADDOCK_MOE_HOST`.
 pub fn moe_disk_artifact() -> Option<std::path::PathBuf> {
     paddock_models::dev_var_os!("PADDOCK_MOE_DISK")
         .filter(|v| !v.is_empty())
@@ -74,7 +75,7 @@ pub fn moe_cache_slots_pin() -> Option<usize> {
 /// Geometry of a repacked expert plane, independent of its backing address.
 /// Cache slots need this layout, not ownership of the original weight bytes.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ExpertPlaneLayout {
+pub(crate) struct ExpertPlaneLayout {
     pub(super) dims: Vec<usize>,
     pub(super) ty: GgmlType,
     pub(super) data_per_expert: usize,
@@ -121,12 +122,12 @@ impl ExpertPlaneLayout {
 /// One MoE layer's gate/up/down plane geometry: what a slot holds and what
 /// every backing (pinned mirror or disk artifact) must agree on.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ExpertLayerLayout {
+pub(crate) struct ExpertLayerLayout {
     pub(super) planes: [ExpertPlaneLayout; 3],
 }
 
 impl ExpertLayerLayout {
-    pub fn new(planes: [ExpertPlaneLayout; 3]) -> Result<Self, GpuError> {
+    pub(crate) fn new(planes: [ExpertPlaneLayout; 3]) -> Result<Self, GpuError> {
         let n_expert = planes[0].dims[2];
         if planes[1].dims[2] != n_expert || planes[2].dims[2] != n_expert {
             return Err(GpuError::Driver(format!(

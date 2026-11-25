@@ -1371,9 +1371,9 @@ impl GpuQwen35 {
             dims.n_expert,
         )
         .map_err(|r| GpuModelError::Unsupported(r.to_string()))?;
-        // a whole-prompt prefill routes max_ctx tokens in one launch
+        // prompts are served in ranges of at most DISK_CHUNK_ROWS rows
         let mut caches = b
-            .seat(&self.exec, slots, self.max_ctx * dims.n_active)?
+            .seat(&self.exec, slots, crate::gpu::DISK_CHUNK_ROWS)?
             .into_iter();
         for l in &mut self.layers {
             if let Ffn::Moe(m) = &mut l.ffn
@@ -1393,9 +1393,11 @@ impl GpuQwen35 {
     }
 
     /// Refuse `what` when the experts are disk-backed (see `MoeDiskRefusal`).
+    /// A config error, so serving startup fails with the reason instead of
+    /// falling back to a lane that cannot serve either.
     pub(super) fn refuse_on_disk(&self, what: &'static str) -> Result<(), GpuModelError> {
         match self.moe_disk {
-            Some(_) => Err(GpuModelError::Unsupported(
+            Some(_) => Err(GpuModelError::Config(
                 MoeDiskRefusal::Mode(what).to_string(),
             )),
             None => Ok(()),

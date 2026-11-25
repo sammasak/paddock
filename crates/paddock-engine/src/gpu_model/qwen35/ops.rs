@@ -1653,7 +1653,7 @@ pub(super) fn moe_ffn(
     if let Some((backing, layer)) = &w.disk {
         moe_routed_disk(
             exec, w, backing, *layer, dims, embd, batch, xq, xs, ssums, idx, topk_w, fused, fq, fs,
-            part, proj,
+            proj,
         )?;
     } else if sorted {
         // b2: fp4 W4A8 grouped MoE (mmq, BM=32) - routed-expert weights at ~half
@@ -3186,11 +3186,11 @@ pub(super) fn prefill_ffn_f8w(
 
 /// The routed experts of a disk-backed layer (`PADDOCK_MOE_DISK`): the
 /// token-batched k-quant pair over the slot cache, once per token range
-/// whose experts fit the slots. Per pair the kernels and their inputs are
-/// the cached token-batched path's, so a range's rows are bit-identical to
-/// it. A launch in several ranges routes the other ranges' pairs absent and
-/// keeps only its own rows of the down output (`part` as staging), because
-/// the down kernel writes every row.
+/// whose experts fit the slots, each launched over just that range's rows.
+/// The pair computes every row on its own, so a range's rows are
+/// bit-identical to the same rows of one token-batched launch. Activation
+/// inputs and `proj` are viewed at the range's rows; the pair's scratch
+/// (`fused`, `fq`, `fs`, `ssums`) is reused from its head.
 #[allow(clippy::too_many_arguments)]
 fn moe_routed_disk(
     exec: &GpuExecutor,
@@ -3208,64 +3208,55 @@ fn moe_routed_disk(
     fused: &mut CudaSlice<f32>,
     fq: &mut CudaSlice<i8>,
     fs: &mut CudaSlice<f32>,
-    part: &mut CudaSlice<f32>,
     proj: &mut CudaSlice<f32>,
 ) -> Result<(), GpuModelError> {
+    use crate::gpu::{RowsView, RowsViewMut};
     let c = w.cache.as_ref().ok_or_else(|| {
         GpuModelError::Unsupported(crate::gpu::MoeDiskRefusal::NoCache.to_string())
     })?;
+    let na = dims.n_active;
     let mut chunks = Vec::new();
-    backing.plan(
-        exec,
-        c,
-        idx,
-        batch * dims.n_active,
-        dims.n_active,
-        &mut chunks,
-    )?;
-    let single = chunks.len() == 1;
+    backing.plan(exec, c, idx, batch * na, na, &mut chunks)?;
     let (g, u, d) = (&c.gate, &c.up, &c.down);
     let gu_sums = crate::gpu::kq_needs_sums(g.ty) || crate::gpu::kq_needs_sums(u.ty);
     let d_sums = crate::gpu::kq_needs_sums(d.ty);
     for tokens in chunks {
-        backing.fill_chunk(exec, c, layer, dims.n_active, tokens.clone())?;
+        let (t0, nt) = (tokens.start, tokens.len());
+        backing.fill_chunk(exec, c, layer, na, tokens)?;
         let routing = c.idx_slot();
-        // the down stage overwrites ssums, so every range recomputes the
-        // activation sums its gate_up reads
+        let xq_r = RowsView::new(exec, xq, t0 * embd, nt * embd)?;
+        let xs_r = RowsView::new(exec, xs, t0 * embd / 32, nt * embd / 32)?;
+        let tw_r = RowsView::new(exec, topk_w, t0 * na, nt * na)?;
         if gu_sums {
-            exec.q8_sums_strided(xq, ssums, embd, batch)?;
+            exec.q8_sums_strided(&xq_r, ssums, embd, nt)?;
         }
         exec.kquant_moe_gate_up(
             g,
             u,
             routing,
-            xq,
-            xs,
+            &xq_r,
+            &xs_r,
             gu_sums.then_some(&*ssums),
             fused,
-            dims.n_active,
-            batch,
+            na,
+            nt,
         )?;
-        exec.quantize_q8(fused, fq, fs, batch * dims.n_active * dims.moe_ff)?;
+        exec.quantize_q8(fused, fq, fs, nt * na * dims.moe_ff)?;
         if d_sums {
-            exec.q8_sums_strided(fq, ssums, dims.moe_ff, batch * dims.n_active)?;
+            exec.q8_sums_strided(fq, ssums, dims.moe_ff, nt * na)?;
         }
-        let out: &mut CudaSlice<f32> = if single { proj } else { part };
+        let mut out = RowsViewMut::new(exec, proj, t0 * embd, nt * embd)?;
         exec.kquant_moe_down(
             d,
             routing,
-            topk_w,
+            &tw_r,
             fq,
             fs,
             d_sums.then_some(&*ssums),
-            out,
-            dims.n_active,
-            batch,
+            &mut out,
+            na,
+            nt,
         )?;
-        if !single {
-            let (r0, n) = (tokens.start * embd, tokens.len() * embd);
-            exec.copy_region(part, r0, proj, r0, n)?;
-        }
     }
     Ok(())
 }
