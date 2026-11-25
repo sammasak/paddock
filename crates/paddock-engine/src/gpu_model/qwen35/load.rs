@@ -3223,7 +3223,7 @@ fn open_moe_disk(
             layouts.push(ExpertLayerLayout::new([g.clone(), u.clone(), d.clone()])?);
         }
     }
-    let id = crate::gpu::expert_identity(map, &expert_tensor_names(layers), exec.pack_version())?;
+    let id = crate::gpu::expert_identity(map, &expert_tensor_names(map)?, exec.pack_version())?;
     let backing = Arc::new(MoeDiskBacking::open(path, &id, layouts)?);
     let mut next = 0;
     for l in layers.iter_mut() {

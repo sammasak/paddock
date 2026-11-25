@@ -106,12 +106,6 @@ impl HostMirror {
         self.len
     }
 
-    fn as_slice(&self) -> &[u8] {
-        // SAFETY: `host` spans `len` bytes, written once at load and
-        // read-only afterwards (the device only reads it too).
-        unsafe { core::slice::from_raw_parts(self.host.cast::<u8>(), self.len) }
-    }
-
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -201,12 +195,6 @@ impl HostMappedKq {
     /// Bytes held in host memory (data + scale streams).
     pub fn host_bytes(&self) -> u64 {
         (self._data.len() + self._scales.len()) as u64
-    }
-
-    /// The data and scale streams as host bytes - what a disk artifact is
-    /// written from.
-    pub(super) fn host_streams(&self) -> (&[u8], &[u8]) {
-        (self._data.as_slice(), self._scales.as_slice())
     }
 }
 

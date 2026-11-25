@@ -1409,35 +1409,29 @@ impl GpuQwen35 {
         self.moe_disk.as_ref().map(|b| b.stats())
     }
 
-    /// Write the disk artifact for this model's routed experts to `path`,
-    /// from the pinned planes of a `PADDOCK_MOE_HOST` load of `map` (the
-    /// same file). The disk backing then opens it in place of those planes.
+    /// Write the disk artifact for the routed experts of `map` to `path`,
+    /// without loading the model: one layer's experts are repacked in VRAM
+    /// at a time and written one expert at a time, so neither page-locked
+    /// nor ordinary host memory has to hold the experts. A
+    /// `PADDOCK_MOE_DISK` load of the same file then opens it.
     pub fn write_expert_artifact(
-        &self,
+        exec: &GpuExecutor,
         map: &paddock_models::mapped::MappedGguf,
         path: &std::path::Path,
     ) -> Result<(), GpuModelError> {
-        let mut planes = Vec::new();
-        for l in &self.layers {
-            if let Ffn::Moe(m) = &l.ffn {
-                match (&m.gate_exps, &m.up_exps, &m.down_exps) {
-                    (ExpW::KqHost(g), ExpW::KqHost(u), ExpW::KqHost(d)) => planes.push([g, u, d]),
-                    _ => {
-                        return Err(GpuModelError::Unsupported(
-                            "write_expert_artifact needs every MoE layer's experts pinned \
-                             (PADDOCK_MOE_HOST, k-quant experts)"
-                                .into(),
-                        ));
-                    }
-                }
-            }
+        if !exec.has_kquant_moe() {
+            return Err(GpuModelError::Unsupported(
+                MoeDiskRefusal::Mode("serving MoE experts without the pack's k-quant pair")
+                    .to_string(),
+            ));
         }
-        let id = crate::gpu::expert_identity(
-            map,
-            &expert_tensor_names(&self.layers),
-            self.exec.pack_version(),
-        )?;
-        crate::gpu::write_expert_artifact(path, &id, &planes)?;
+        let names = expert_tensor_names(map)?;
+        if names.is_empty() {
+            return Err(GpuModelError::Unsupported(
+                "write_expert_artifact: the file has no routed experts".into(),
+            ));
+        }
+        crate::gpu::write_expert_artifact(exec, map, &names, path)?;
         Ok(())
     }
 
@@ -1571,14 +1565,23 @@ struct MoeFfnWeights {
 }
 
 /// The routed-expert tensor names of the backbone's MoE layers, in artifact
-/// order - what the disk artifact's identity is taken over.
-fn expert_tensor_names(layers: &[Qwen35Layer]) -> Vec<String> {
-    layers
-        .iter()
-        .enumerate()
-        .filter(|(_, l)| matches!(l.ffn, Ffn::Moe(_)))
-        .flat_map(|(i, _)| ["gate", "up", "down"].map(|p| format!("blk.{i}.ffn_{p}_exps.weight")))
-        .collect()
+/// order - what the disk artifact's identity is taken over. A MoE file's
+/// backbone is MoE in every layer; the trailing nextn blocks are not part of
+/// it. Read from the file, so the writer and the loader name the same set.
+fn expert_tensor_names(
+    map: &paddock_models::mapped::MappedGguf,
+) -> Result<Vec<String>, GpuModelError> {
+    use paddock_models::gguf::Value;
+    let field = |k: &str| map.gguf().arch_field(k).and_then(Value::as_u64);
+    if field("expert_count").is_none() {
+        return Ok(Vec::new());
+    }
+    let blocks =
+        field("block_count").ok_or_else(|| GpuModelError::MissingMeta("block_count".into()))?;
+    let n_layers = blocks.saturating_sub(field("nextn_predict_layers").unwrap_or(0));
+    Ok((0..n_layers)
+        .flat_map(|i| ["gate", "up", "down"].map(|p| format!("blk.{i}.ffn_{p}_exps.weight")))
+        .collect())
 }
 
 /// Dense SwiGLU or routed-expert MoE - per-layer FFN. MoE expert weights stay
