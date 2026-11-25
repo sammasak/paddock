@@ -167,6 +167,11 @@ pub struct Config {
     /// overrides only the small `graph pools + headroom` residual (768 MiB).
     /// None = each family's default.
     pub graph_scratch_mib: Option<u64>,
+    /// The prefill chunk (rows) qwen35's serving lane asks for; it still
+    /// steps down when the chunk's scratch does not fit. Smaller prefills
+    /// slower but leaves VRAM for KV and the `[moe_offload]` slot cache (an
+    /// 8 GB card serving a 35B with offload: 1024). None = 8192.
+    pub prefill_chunk_rows: Option<usize>,
     /// Default max output tokens per reply when a request doesn't specify.
     /// None = the context window (what an omitted cap means on every other
     /// engine; the engine clamps to the room the prompt leaves regardless).
@@ -410,6 +415,7 @@ impl Default for Config {
             residency: crate::residency::Config::default(),
             moe_offload: MoeOffload::default(),
             graph_scratch_mib: None,
+            prefill_chunk_rows: None,
             max_tokens: None,
             api_key: None,
             no_auth: false,

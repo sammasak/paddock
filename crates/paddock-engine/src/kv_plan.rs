@@ -90,6 +90,19 @@ static GRAPH_SCRATCH_MIB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 pub fn set_graph_scratch_mib(mib: u64) {
     let _ = GRAPH_SCRATCH_MIB.set(mib);
 }
+
+static PREFILL_CHUNK_ROWS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+/// `prefill_chunk_rows`: the prefill chunk the operator asks for (qwen35's
+/// batched lane; it still steps down when the chunk's scratch does not fit).
+/// A smaller chunk prefills slower but leaves VRAM for KV and the
+/// `[moe_offload]` slot cache.
+pub fn set_prefill_chunk_rows(rows: usize) {
+    let _ = PREFILL_CHUNK_ROWS.set(rows);
+}
+/// The armed prefill chunk, if any.
+pub fn prefill_chunk_rows_override() -> Option<usize> {
+    PREFILL_CHUNK_ROWS.get().copied()
+}
 /// The armed override, if any, in MiB.
 pub fn graph_scratch_override_mib() -> Option<u64> {
     GRAPH_SCRATCH_MIB.get().copied()

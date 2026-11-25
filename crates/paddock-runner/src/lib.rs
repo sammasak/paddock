@@ -374,6 +374,9 @@ pub async fn run(
             "[moe_offload] MoE expert offload armed (slot cache auto-sized from the KV plan's leftover unless vram_gb caps it)"
         );
     }
+    if let Some(rows) = cfg.prefill_chunk_rows {
+        paddock_engine::kv_plan::set_prefill_chunk_rows(rows);
+    }
     if let Some(mib) = cfg.graph_scratch_mib {
         paddock_engine::kv_plan::set_graph_scratch_mib(mib);
         tracing::info!(

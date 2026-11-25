@@ -236,6 +236,7 @@ fn chunk_tick_rows() -> usize {
         paddock_models::dev_var!("PADDOCK_CHUNK_TICK_ROWS")
             .ok()
             .and_then(|v| v.parse().ok())
+            .or_else(crate::kv_plan::prefill_chunk_rows_override)
             .filter(|&n: &usize| (32..=16384).contains(&n))
             .unwrap_or(CHUNK_TICK_ROWS_DEFAULT)
     })
