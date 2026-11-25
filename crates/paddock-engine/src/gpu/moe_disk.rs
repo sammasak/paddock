@@ -453,8 +453,7 @@ fn read_records(
             .collect();
         threads
             .into_iter()
-            .map(|t| t.join().expect("a reader thread panicked"))
-            .collect()
+            .try_for_each(|t| t.join().expect("a reader thread panicked"))
     })
 }
 
