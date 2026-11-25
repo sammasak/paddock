@@ -2,7 +2,7 @@
 
 ## Problem
 
-The existing CUDA MoE offload stores the complete repacked gate/up/down planes in device-mapped, page-locked host memory. This is a good fast path but cannot serve a model whose expert planes exceed the host's lockable RAM. KV tiering is not expert-weight tiering. The target is a 32 GiB Linux host with an RTX 3070 (8 GiB, sm_86), starting with a supported 35B MoE and attempting a supported low-bit 180B Flash Next pack only after a measured fit check.
+The existing CUDA MoE offload stores the complete repacked gate/up/down planes in device-mapped, page-locked host memory. This is a good fast path but cannot serve a model whose expert planes exceed the host's lockable RAM. KV tiering is not expert-weight tiering. The target is a consumer box (32 GiB RAM, an 8 GiB sm_86 card), starting with a supported 35B MoE and attempting a supported low-bit 180B Flash Next pack only after a measured fit check.
 
 Related upstream: [#8](https://github.com/truespar/paddock/issues/8), [#16](https://github.com/truespar/paddock/issues/16), [#20](https://github.com/truespar/paddock/issues/20). This is a proposed extension, not a bug in the current design.
 
@@ -55,8 +55,25 @@ Version manifest with model identity/hash, quantization, repack ABI/geometry, te
 - GPU: byte equality of all six repacked streams; greedy/logit parity for identical weights and forced token sequences against current pinned path, including cache hit, miss, eviction, duplicate routed IDs, prefill waves and repeated decode. Use tolerances consistent with existing upstream parity tests; don't silently relax. Fault injection for I/O failure before/during fill, no stale cache output.
 - Existing mode: run upstream relevant engine tests and compare graph-on baseline, same model/fixture, hit rates and decode/TTFT. No regression attributable to the seam; publish measured spread/sample counts, not an arbitrary speed claim.
 - Disk mode: first 35B-A3B with deliberately constrained RAM; then supported 180B if estimator passes. Real SSD reads (not just file mapping), 4K context, one request, 5 cold/20 distinct warm and 30-minute stability, bounded RAM/VRAM, cache hit/miss and I/O counters, no OOM or GPU reset. Record PCIe link under load. Measure decode, prefill, TTFT and I/O stalls; compare same weights pinned when host can fit. No new defaults or performance promises.
-- Host-specific Nix service, 130 W power cap, heavy-work lock and activation approval live in sammasak/nixos-config#508/#776/#493; agent quality in #494. Do not put homelab policy into upstream code.
 
 ## Fork maintenance
 
-Keep a dedicated feature branch based on upstream main, separate from Nix/devenv PR #1. Rebase the small commits in order, and keep the baseline upstream test matrix plus disk-mode fixtures. Avoid formatting churn, dependency upgrades, model-specific duplicated loops, and unrelated manager/UI changes. If upstream wants a different abstraction, adapt the private seam; if rejected, carry the isolated patch stack in the fork and pin the verified commit in nixos-config. Do not submit upstream until compilation, parity, measurements and independent review pass. No claim of a working SSD implementation in this draft.
+Keep a dedicated feature branch based on upstream main, separate from packaging work. Rebase the small commits in order, and keep the baseline upstream test matrix plus disk-mode fixtures. Avoid formatting churn, dependency upgrades, model-specific duplicated loops, and unrelated manager/UI changes. If upstream wants a different abstraction, adapt the private seam; if rejected, carry the isolated patch stack in the fork and pin the verified commit downstream. Do not submit upstream until compilation, parity, measurements and independent review pass.
+
+## Implementation status
+
+Steps 1 to 4 exist for qwen35; nothing has run on a GPU yet.
+
+- `gpu/expert_store.rs`: the artifact (sealed header, per-record BLAKE3, exact positioned reads, exclusive temp-then-rename writer) and the fixed staging pool. CPU tests.
+- `gpu/moe_disk.rs`: the host miss path (the resolve kernel's LRU walk on the host, token ranges whose experts fit the slots, invalidation of every slot a failed fill assigned, a broken state after a failed wait) behind a two-call device seam; CPU tests drive it with a fake device that applies copies at wait time. The CUDA side (`CacheCopier`, `PinnedBuf`, routing upload, row views) is compile-checked only.
+- qwen35: `PADDOCK_MOE_DISK=<artifact>` seats layout-only experts, requires a slot cache of at least top-k slots, runs prefill and decode eagerly, launches each token range over its own rows, and refuses CUDA graph capture, batched serving (a startup config error), DFlash and MTP speculation. qwen4exp refuses the switch.
+- `tests/gpu_qwen36_moe_disk.rs`: writes the artifact and a pinned reference, then checks bit-exact parity (prefill logits and greedy tokens, token-batched class on both sides) and reports TTFT, decode, misses, read rate, staging waits, device reads and peak RSS, plus the same runs pinned.
+
+Known gaps, in order of what blocks the 180B target:
+
+- The artifact is written from a pinned load, so it needs the experts to fit page-locked RAM once. A bounded per-expert repack writer is the next step for models that never fit.
+- Only the single-sequence eager path serves; the runner's batched lane refuses at startup.
+- Prefill syncs the host once per token range and layer; reads are buffered and synchronous (no prefetch, no direct I/O) until measured.
+- The identity hashes the kernel pack version and each expert tensor's name, type, shape, length and first and last 64 KiB, not every byte.
+- No parent directory fsync after publishing the artifact.
+
