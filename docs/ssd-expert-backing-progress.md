@@ -202,6 +202,20 @@ All 10 processes: one-token, text and synthetic prompts bit for bit equal to pin
 
 Decode ceiling: about 90 slot misses a token at 32 slots (71.5% hit), about 2 MB each, so decode is bound by the device (1.3-1.4 GB/s) plus page cache; without speculative prefetch (out of scope per the RFC) only more host memory (page cache or the host tier) or more VRAM slots raise it. The sorted prefill now uses the `part` scratch, so reclaiming it for slots is no longer possible.
 
+### Slot sweep on the head's code (R25, a061286, 8G cap, run 0 cold / runs 1-2 warm)
+
+| slots | cold / warm TTFT | decode warm | decode slot hit | GPU peak |
+|---|---|---|---|---|
+| 16 | 15.03 / 13.73 / 13.66 s | 7.76 / 7.81 tok/s | 46.0% | 6055 MiB |
+| 24 | 14.74 / 13.18 / 13.16 s | 9.50 / 9.50 | 63.4% | 6663 MiB |
+| 32 (R21-disk2) | 14.40 / 13.30 / 13.25 s | 9.73 / 9.75 | 71.5% | 7271 MiB |
+| 36 | 14.30 / 13.28 / 13.23 s | 10.02 / 10.01 | 74.6% | 7591 MiB |
+| 40 | `prefill: Gpu(OutOfMemory)` in the parity prompts (a dev pin skips the VRAM budget) | | | |
+
+Prefill stays bit for bit equal to pinned at every slot count (the wave grouping changes, the per-pair partials do not). Prefill time barely depends on slots; decode gains about 3% from 32 to 36.
+
+Step 5 (config) waits on a serving lane: the runner serves through `enable_batch`, which the disk backing refuses at startup, so a `[moe_offload]` disk option would only move that refusal into config. The LIST waves stay because i-quant seats have no tensor-core lane (the 180B target is likely i-quant).
+
 ## Next
 
 1. Owner decisions: keep or drop the host tier (e6f4d75, af00dbb) in the upstream stack; file the upstream K-split capture report (draft below); fold `asus/devshell-driver-lib` into PR 1.
