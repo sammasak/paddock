@@ -982,4 +982,143 @@ mod tests {
             "staging too small"
         );
     }
+
+    /// A GGUF v3 file of Q4_K tensors `[256, 2, 4]` (8 superblocks, 1152
+    /// bytes each), tensor `i` filled with byte `fill[i]`.
+    fn gguf(dir: &Path, names: &[&str], fill: &[u8]) -> PathBuf {
+        const BYTES: usize = 8 * 144;
+        let mut h = Vec::new();
+        h.extend_from_slice(&0x4655_4747u32.to_le_bytes());
+        h.extend_from_slice(&3u32.to_le_bytes());
+        h.extend_from_slice(&(names.len() as u64).to_le_bytes());
+        h.extend_from_slice(&0u64.to_le_bytes());
+        for (i, n) in names.iter().enumerate() {
+            h.extend_from_slice(&(n.len() as u64).to_le_bytes());
+            h.extend_from_slice(n.as_bytes());
+            h.extend_from_slice(&3u32.to_le_bytes());
+            for d in [256u64, 2, 4] {
+                h.extend_from_slice(&d.to_le_bytes());
+            }
+            h.extend_from_slice(&GgmlType::Q4K.raw().to_le_bytes());
+            h.extend_from_slice(&((i * BYTES) as u64).to_le_bytes());
+        }
+        h.resize(h.len().next_multiple_of(32), 0);
+        for &f in fill {
+            h.extend(std::iter::repeat_n(f, BYTES));
+        }
+        let path = dir.join(format!(
+            "m{}.gguf",
+            fill.iter().map(|f| f.to_string()).collect::<String>()
+        ));
+        std::fs::write(&path, h).expect("write gguf");
+        path
+    }
+
+    #[test]
+    fn identity_follows_weights_pack_and_tensor_set() {
+        let d = std::env::temp_dir().join(format!("pdk-md-{}-id", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).expect("temp dir");
+        let names = ["blk.0.ffn_gate_exps.weight", "blk.0.ffn_up_exps.weight"];
+        let owned: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+        let id = |fill: &[u8], names: &[String], pack: [u32; 3]| {
+            let map = MappedGguf::open(&gguf(
+                &d,
+                &["blk.0.ffn_gate_exps.weight", "blk.0.ffn_up_exps.weight"],
+                fill,
+            ))
+            .expect("open gguf");
+            expert_identity(&map, names, pack).expect("identity")
+        };
+        let base = id(&[1, 2], &owned, [0, 25, 0]);
+        assert_eq!(base, id(&[1, 2], &owned, [0, 25, 0]), "stable");
+        assert_ne!(base, id(&[1, 3], &owned, [0, 25, 0]), "weights");
+        assert_ne!(
+            base,
+            id(&[1, 2], &owned, [0, 26, 0]),
+            "pack (repack format)"
+        );
+        assert_ne!(base, id(&[1, 2], &owned[..1], [0, 25, 0]), "tensor set");
+        let map = MappedGguf::open(&gguf(&d, &names, &[1, 2])).expect("open gguf");
+        assert!(expert_identity(&map, &["blk.9.ffn_gate_exps.weight".into()], [0, 25, 0]).is_err());
+    }
+
+    #[test]
+    fn repacked_sizes_follow_the_repack_rules() {
+        use super::super::kquant::{kq_n_super, kq_repacked_bytes};
+        let (_, _, data_b) = super::super::kq_params(GgmlType::Q4K).expect("Q4_K is k-quant");
+        assert_eq!(
+            kq_n_super(&[256, 640, 8], GgmlType::Q4K, "t").expect("aligned"),
+            5120
+        );
+        assert_eq!(
+            kq_repacked_bytes(&[256, 640, 8], GgmlType::Q4K, "t").expect("aligned"),
+            (5120 * data_b, 5120 * 24)
+        );
+        // a 640-wide row is 2.5 superblocks: only the flat 32-block types
+        assert!(kq_n_super(&[640, 2048, 8], GgmlType::Q4K, "t").is_err());
+        assert_eq!(
+            kq_n_super(&[640, 2048, 8], GgmlType::Iq4Nl, "t").expect("flat"),
+            640 * 2048 * 8 / 256
+        );
+        assert!(
+            kq_n_super(&[640, 3, 8], GgmlType::Iq4Nl, "t").is_err(),
+            "partial superblock"
+        );
+        assert!(
+            kq_repacked_bytes(&[256, 2, 4], GgmlType::F16, "t").is_err(),
+            "not k-quant"
+        );
+    }
+
+    #[test]
+    fn slot_budget_refuses_what_cannot_serve_a_token() {
+        assert_eq!(disk_slots(100 << 20, 2 << 20, None, 8, 256), Ok(50));
+        assert_eq!(
+            disk_slots(u64::MAX, 2 << 20, None, 8, 256),
+            Ok(256),
+            "capped at n_expert"
+        );
+        assert_eq!(disk_slots(0, 2 << 20, Some(16), 8, 256), Ok(16), "pin wins");
+        assert_eq!(
+            disk_slots(10 << 20, 2 << 20, None, 8, 256),
+            Err(MoeDiskRefusal::Slots {
+                slots: 5,
+                n_active: 8
+            })
+        );
+        assert_eq!(
+            disk_slots(1 << 30, 0, None, 8, 256),
+            Err(MoeDiskRefusal::Slots {
+                slots: 0,
+                n_active: 8
+            }),
+            "no price is no cache"
+        );
+        assert!(
+            disk_slots(0, 2 << 20, Some(4), 8, 256).is_err(),
+            "a pin is checked too"
+        );
+    }
+
+    #[test]
+    fn every_refusal_names_its_cause() {
+        let msg = |r: MoeDiskRefusal| GpuError::from(r).to_string();
+        assert!(msg(MoeDiskRefusal::Quant(GgmlType::Q8_0)).contains("Q8_0"));
+        let m = msg(MoeDiskRefusal::Slots {
+            slots: 5,
+            n_active: 8,
+        });
+        assert!(m.contains("at least 8") && m.contains("buys 5"), "{m}");
+        let m = msg(MoeDiskRefusal::Mode("CUDA graph capture"));
+        assert!(
+            m.contains("CUDA graph capture") && m.contains("pinned backing"),
+            "{m}"
+        );
+        assert!(msg(MoeDiskRefusal::NoCache).contains("enable_moe_cache"));
+        assert!(matches!(
+            GpuError::from(MoeDiskRefusal::NoCache),
+            GpuError::Unsupported(_)
+        ));
+    }
 }
