@@ -321,25 +321,7 @@ impl GpuExecutor {
         // stride rows by in_dim/32 blocks (`pd_kq_row_datab`). The stream is
         // required to be a whole number of superblocks per expert so the
         // slot cache's per-expert byte ranges stay exact.
-        let in_dim = dims[0];
-        let n_super = if in_dim.is_multiple_of(256) {
-            dims.iter().product::<usize>() / 256
-        } else {
-            if !kq_flat32(ty) || !in_dim.is_multiple_of(32) {
-                return Err(GpuError::Driver(format!(
-                    "kquant repack {what}: in_dim {in_dim} is not superblock-aligned and {ty:?} has no flat 32-block row layout (IQ4_NL / Q5_1 / Q8_0 only)"
-                )));
-            }
-            let per_row = in_dim / 32;
-            let per_expert = per_row * dims.get(1).copied().unwrap_or(1);
-            if !per_expert.is_multiple_of(8) {
-                return Err(GpuError::Driver(format!(
-                    "kquant repack {what}: {per_expert} blocks per [{in_dim} x {}] plane is not a whole number of superblocks",
-                    dims.get(1).copied().unwrap_or(1)
-                )));
-            }
-            dims.iter().product::<usize>() / 32 / 8
-        };
+        let n_super = kq_n_super(&dims, ty, what)?;
         if bytes.len() != n_super * raw_b {
             return Err(GpuError::Driver(format!(
                 "kquant repack {what}: {} raw bytes for {n_super} superblocks (want {})",
@@ -2808,4 +2790,44 @@ impl GpuExecutor {
             )
         })
     }
+}
+
+/// Superblocks of a k-quant tensor of `dims` as the repack lays it out (see
+/// `repack_kquant_raw` for the flat 32-block rows). The repacked plane holds
+/// `n_super * data_b` data and `n_super * kq_scb(ty)` scale bytes.
+pub(super) fn kq_n_super(dims: &[usize], ty: GgmlType, what: &str) -> Result<usize, GpuError> {
+    let in_dim = dims[0];
+    Ok(if in_dim.is_multiple_of(256) {
+        dims.iter().product::<usize>() / 256
+    } else {
+        if !kq_flat32(ty) || !in_dim.is_multiple_of(32) {
+            return Err(GpuError::Driver(format!(
+                "kquant repack {what}: in_dim {in_dim} is not superblock-aligned and {ty:?} has no flat 32-block row layout (IQ4_NL / Q5_1 / Q8_0 only)"
+            )));
+        }
+        let per_row = in_dim / 32;
+        let per_expert = per_row * dims.get(1).copied().unwrap_or(1);
+        if !per_expert.is_multiple_of(8) {
+            return Err(GpuError::Driver(format!(
+                "kquant repack {what}: {per_expert} blocks per [{in_dim} x {}] plane is not a whole number of superblocks",
+                dims.get(1).copied().unwrap_or(1)
+            )));
+        }
+        dims.iter().product::<usize>() / 32 / 8
+    })
+}
+
+/// The byte sizes of the repacked data and scale streams of a k-quant
+/// tensor - what `repack_kquant` allocates, without running it.
+pub(super) fn kq_repacked_bytes(
+    dims: &[usize],
+    ty: GgmlType,
+    what: &str,
+) -> Result<(usize, usize), GpuError> {
+    let (_, _, data_b) = kq_layout(ty).ok_or(GpuError::NoKernel {
+        name: what.to_owned(),
+        ty,
+    })?;
+    let n_super = kq_n_super(dims, ty, what)?;
+    Ok((n_super * data_b, n_super * kq_scb(ty)))
 }

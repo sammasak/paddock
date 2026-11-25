@@ -106,6 +106,12 @@ impl HostMirror {
         self.len
     }
 
+    fn as_slice(&self) -> &[u8] {
+        // SAFETY: `host` spans `len` bytes, written once at load and
+        // read-only afterwards (the device only reads it too).
+        unsafe { core::slice::from_raw_parts(self.host.cast::<u8>(), self.len) }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -117,6 +123,65 @@ impl Drop for HostMirror {
         let _ = self.stream.synchronize();
         // SAFETY: `host` came from cuMemHostAlloc and is freed exactly once.
         let _ = unsafe { cu::cuMemFreeHost(self.host) };
+    }
+}
+
+/// Page-locked host bytes for the disk backing's staging pool
+/// (`moe_disk.rs`): a miss is read into one, then copied to its slot with an
+/// async copy, which only overlaps the host when the source is pinned.
+/// Not device-mapped - nothing on the device addresses it directly.
+pub struct PinnedBuf {
+    ptr: *mut u8,
+    len: usize,
+    /// The stream copies out of this buffer run on - drained before the
+    /// pages go away.
+    stream: Arc<CudaStream>,
+}
+
+// SAFETY: the pointer is a driver allocation this value alone owns; the
+// engine thread owns every use, as for HostMirror.
+unsafe impl Send for PinnedBuf {}
+
+impl PinnedBuf {
+    pub(super) fn new(stream: Arc<CudaStream>, len: usize) -> std::io::Result<Self> {
+        // SAFETY: plain driver call; the pointer is owned here until Drop.
+        let ptr = unsafe { cudarc::driver::result::malloc_host(len, cu::CU_MEMHOSTALLOC_PORTABLE) }
+            .map_err(|e| {
+                std::io::Error::other(format!(
+                    "cuMemHostAlloc({} MiB) for expert staging: {e}",
+                    len >> 20
+                ))
+            })?;
+        Ok(Self {
+            ptr: ptr.cast(),
+            len,
+            stream,
+        })
+    }
+}
+
+impl AsRef<[u8]> for PinnedBuf {
+    fn as_ref(&self) -> &[u8] {
+        // SAFETY: `ptr` spans `len` bytes for as long as `self` lives.
+        unsafe { core::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+impl AsMut<[u8]> for PinnedBuf {
+    fn as_mut(&mut self) -> &mut [u8] {
+        // SAFETY: as above; `&mut self` makes the host view exclusive. The
+        // staging pool hands out a buffer only after the copies reading it
+        // completed.
+        unsafe { core::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+}
+
+impl Drop for PinnedBuf {
+    fn drop(&mut self) {
+        // A copy may still be reading the pages.
+        let _ = self.stream.synchronize();
+        // SAFETY: ptr came from malloc_host and is freed exactly once.
+        let _ = unsafe { cudarc::driver::result::free_host(self.ptr.cast()) };
     }
 }
 
@@ -136,6 +201,12 @@ impl HostMappedKq {
     /// Bytes held in host memory (data + scale streams).
     pub fn host_bytes(&self) -> u64 {
         (self._data.len() + self._scales.len()) as u64
+    }
+
+    /// The data and scale streams as host bytes - what a disk artifact is
+    /// written from.
+    pub(super) fn host_streams(&self) -> (&[u8], &[u8]) {
+        (self._data.as_slice(), self._scales.as_slice())
     }
 }
 

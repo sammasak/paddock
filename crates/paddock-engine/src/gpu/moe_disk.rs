@@ -19,11 +19,24 @@
 //! every enqueued copy); the tests drive it with a recording fake.
 
 use std::ops::Range;
+use std::path::Path;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use super::GpuError;
-use super::expert_store::{DiskExpertStore, StagingLease, StagingPool};
-use super::moe_cache::MOE_CACHE_NONE;
+use paddock_models::ggml_type::GgmlType;
+use paddock_models::mapped::MappedGguf;
+
+use super::expert_store::{DiskExpertStore, Identity, StagingLease, StagingPool};
+use super::host_plane::PinnedBuf;
+use super::moe_cache::{
+    CacheCopier, ExpertCache, ExpertLayerLayout, ExpertPlaneLayout, MOE_CACHE_NONE,
+};
+use super::{GpuError, GpuExecutor, HostMappedKq};
+
+/// Staging buffers a disk backing pins: one expert record each, so this
+/// bounds the host memory the miss path holds (about 2 MB a record on the
+/// 35B-A3B UD file) and the reads in flight before a fill waits.
+const STAGING_RECORDS: usize = 8;
 
 /// The device half of a fill: copies from host staging memory into one
 /// layer's slot planes, on the stream the expert kernels run on.
@@ -229,7 +242,8 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>> DiskExperts<B> {
         })
     }
 
-    pub(super) fn store(&self) -> &DiskExpertStore {
+    #[cfg(test)]
+    fn store(&self) -> &DiskExpertStore {
         &self.store
     }
 
@@ -349,6 +363,283 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>> DiskExperts<B> {
         }
         Ok(())
     }
+}
+
+/// Why a qwen35-style family refuses to serve with disk-backed experts. One
+/// sentence each, naming the cause and the way out; returned at setup, never
+/// discovered mid-request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MoeDiskRefusal {
+    /// An expert seat is not a k-quant plane (the artifact holds only the
+    /// k-quant repack).
+    Quant(GgmlType),
+    /// The budget buys fewer slots than one token routes to: there is no
+    /// zero-copy fallback on disk.
+    Slots { slots: usize, n_active: usize },
+    /// A path that captures CUDA graphs or keeps several sequences in
+    /// flight; the miss path syncs the host between kernels.
+    Mode(&'static str),
+    /// A forward ran before `enable_moe_cache` seated the slot caches.
+    NoCache,
+}
+
+impl std::fmt::Display for MoeDiskRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Quant(ty) => write!(
+                f,
+                "disk-backed MoE experts need k-quant expert tensors; this file has {ty:?} \
+                 experts - serve it with pinned backing"
+            ),
+            Self::Slots { slots, n_active } => write!(
+                f,
+                "disk-backed MoE experts need a VRAM slot cache of at least {n_active} experts \
+                 a layer (top-{n_active} routing); the budget buys {slots} - lower max_ctx or \
+                 raise [moe_offload] vram_gb"
+            ),
+            Self::Mode(what) => write!(
+                f,
+                "disk-backed MoE experts serve one sequence on the eager path; {what} is not \
+                 supported with them yet - serve this model with pinned backing for it"
+            ),
+            Self::NoCache => write!(
+                f,
+                "disk-backed MoE experts need enable_moe_cache before the first forward"
+            ),
+        }
+    }
+}
+
+impl From<MoeDiskRefusal> for GpuError {
+    fn from(r: MoeDiskRefusal) -> Self {
+        GpuError::Unsupported(r.to_string())
+    }
+}
+
+/// Slots per layer for a disk backing: as many as `budget` bytes buy at
+/// `price` bytes a slot (or the development pin), at least `n_active` and at
+/// most `n_expert`.
+pub fn disk_slots(
+    budget: u64,
+    price: u64,
+    pin: Option<usize>,
+    n_active: usize,
+    n_expert: usize,
+) -> Result<usize, MoeDiskRefusal> {
+    let slots = pin
+        .unwrap_or_else(|| budget.checked_div(price).unwrap_or(0) as usize)
+        .min(n_expert);
+    if slots < n_active.max(1) {
+        return Err(MoeDiskRefusal::Slots { slots, n_active });
+    }
+    Ok(slots)
+}
+
+/// The repacked geometry of one k-quant expert tensor, from its GGUF shape
+/// and type alone - what the pinned load would produce, without the repack.
+pub fn expert_plane_layout(map: &MappedGguf, name: &str) -> Result<ExpertPlaneLayout, GpuError> {
+    let (info, _) = map.tensor_bytes(name)?;
+    if super::kq_params(info.ggml_type).is_none() {
+        return Err(MoeDiskRefusal::Quant(info.ggml_type).into());
+    }
+    let dims: Vec<usize> = info.dims.iter().map(|&d| d as usize).collect();
+    let (data, scales) = super::kquant::kq_repacked_bytes(&dims, info.ggml_type, name)?;
+    ExpertPlaneLayout::new(&dims, info.ggml_type, data, scales)
+}
+
+/// What an artifact must have been produced from: the kernel pack (it owns
+/// the repack format), and for every expert tensor its name, type, shape and
+/// a sample of its bytes (the head and tail 64 KiB), so a different file of
+/// the same architecture is refused without hashing all of it.
+pub fn expert_identity(
+    map: &MappedGguf,
+    names: &[String],
+    pack_version: [u32; 3],
+) -> Result<Identity, GpuError> {
+    const SAMPLE: usize = 64 << 10;
+    let mut h = blake3::Hasher::new();
+    h.update(b"paddock moe expert artifact v1");
+    for v in pack_version {
+        h.update(&v.to_le_bytes());
+    }
+    for name in names {
+        let (info, bytes) = map.tensor_bytes(name)?;
+        h.update(name.as_bytes());
+        h.update(&info.ggml_type.raw().to_le_bytes());
+        for d in &info.dims {
+            h.update(&d.to_le_bytes());
+        }
+        h.update(&(bytes.len() as u64).to_le_bytes());
+        h.update(&bytes[..bytes.len().min(SAMPLE)]);
+        h.update(&bytes[bytes.len().saturating_sub(SAMPLE)..]);
+    }
+    Ok(*h.finalize().as_bytes())
+}
+
+/// Write the artifact for `layers` (gate, up, down per MoE layer, in layer
+/// order) from pinned planes, one expert record at a time.
+pub fn write_expert_artifact(
+    path: &Path,
+    identity: &Identity,
+    layers: &[[&HostMappedKq; 3]],
+) -> Result<(), GpuError> {
+    let layouts = layers
+        .iter()
+        .map(|[g, u, d]| ExpertLayerLayout::from_pinned(g, u, d))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut w = super::expert_store::ExpertArtifactWriter::create(path, identity, &layouts)?;
+    let mut record = Vec::new();
+    for (planes, layout) in layers.iter().zip(&layouts) {
+        let per = layout.stream_bytes();
+        for e in 0..layout.n_expert() {
+            record.clear();
+            for (i, p) in planes.iter().enumerate() {
+                let (data, scales) = p.host_streams();
+                let (nd, ns) = (per[2 * i], per[2 * i + 1]);
+                record.extend_from_slice(&data[e * nd..(e + 1) * nd]);
+                record.extend_from_slice(&scales[e * ns..(e + 1) * ns]);
+            }
+            w.push_expert(&record)?;
+        }
+    }
+    w.finish()?;
+    Ok(())
+}
+
+/// One model's disk backing, shared by its MoE layers. Opened at load
+/// against the model's layouts; the slot LRUs are seated with the caches.
+pub struct MoeDiskBacking {
+    layouts: Vec<ExpertLayerLayout>,
+    /// `None` only if seating failed part-way; the model is then reloaded.
+    state: Mutex<Option<Seat>>,
+    /// Per-launch host scratch: the routing, then its slot form.
+    scratch: Mutex<(Vec<u32>, Vec<u32>)>,
+}
+
+impl MoeDiskBacking {
+    /// Open the artifact at `path` and check it against `identity` and the
+    /// model's per-layer `layouts`.
+    pub fn open(
+        path: &Path,
+        identity: &Identity,
+        layouts: Vec<ExpertLayerLayout>,
+    ) -> Result<Self, GpuError> {
+        let store = DiskExpertStore::open(path, identity, &layouts).map_err(|e| {
+            GpuError::Unsupported(format!("disk-backed MoE experts: {}: {e}", path.display()))
+        })?;
+        Ok(Self {
+            layouts,
+            state: Mutex::new(Some(Seat::Open(store))),
+            scratch: Mutex::new((Vec::new(), Vec::new())),
+        })
+    }
+
+    pub fn layout(&self, layer: usize) -> Option<&ExpertLayerLayout> {
+        self.layouts.get(layer)
+    }
+
+    /// Bytes one slot costs in every layer together.
+    pub fn slot_price(&self) -> u64 {
+        self.layouts
+            .iter()
+            .map(|l| l.stream_bytes().iter().sum::<usize>() as u64)
+            .sum()
+    }
+
+    /// Seat `slots` per layer: the caches' LRUs and the pinned staging pool.
+    /// Returns one slot cache per layer, in layer order.
+    pub fn seat(
+        &self,
+        exec: &GpuExecutor,
+        slots: usize,
+        max_rows: usize,
+    ) -> Result<Vec<ExpertCache>, GpuError> {
+        let mut caches = Vec::with_capacity(self.layouts.len());
+        for l in &self.layouts {
+            caches.push(exec.new_expert_cache_for_disk(l.clone(), slots, max_rows)?);
+        }
+        let mut state = lock(&self.state);
+        // a re-seat starts from empty slots
+        let store = match state.take() {
+            Some(Seat::Open(s)) => s,
+            Some(Seat::Seated(x)) => x.store,
+            None => return Err(broken()),
+        };
+        let len = (0..store.n_layers())
+            .filter_map(|l| store.record_bytes(l))
+            .max()
+            .expect("an artifact has at least one layer");
+        let stream = exec.stream.clone();
+        let pool = StagingPool::new(STAGING_RECORDS, len, |n| PinnedBuf::new(stream.clone(), n))?;
+        *state = Some(Seat::Seated(DiskExperts::new(store, pool, slots)?));
+        Ok(caches)
+    }
+
+    /// Counters since load; zero before `seat`.
+    pub fn stats(&self) -> MoeDiskStats {
+        match &*lock(&self.state) {
+            Some(Seat::Seated(x)) => x.stats(),
+            _ => MoeDiskStats::default(),
+        }
+    }
+
+    /// Plan one launch of `layer`: download its `rows` routed ids from `idx`
+    /// (a host sync) and split its tokens into ranges whose experts fit the
+    /// cache. Each range is then served by [`fill_chunk`] and the caller's
+    /// expert kernels over the cache's routing.
+    ///
+    /// [`fill_chunk`]: MoeDiskBacking::fill_chunk
+    pub fn plan(
+        &self,
+        exec: &GpuExecutor,
+        cache: &ExpertCache,
+        idx: &cudarc::driver::CudaSlice<u32>,
+        rows: usize,
+        n_active: usize,
+        chunks: &mut Vec<Range<usize>>,
+    ) -> Result<(), GpuError> {
+        let mut scratch = lock(&self.scratch);
+        scratch.0 = exec.to_host_u32_len(idx, rows)?;
+        plan_chunks(&scratch.0, n_active, cache.n_expert, cache.slots, chunks)
+    }
+
+    /// Fill the experts of `tokens` (a range from the last `plan`) of
+    /// `layer` into `cache` and upload the launch's routing: those tokens'
+    /// pairs to their slots, every other pair absent.
+    pub fn fill_chunk(
+        &self,
+        exec: &GpuExecutor,
+        cache: &ExpertCache,
+        layer: usize,
+        n_active: usize,
+        tokens: Range<usize>,
+    ) -> Result<(), GpuError> {
+        let mut scratch = lock(&self.scratch);
+        let (ids, routing) = &mut *scratch;
+        routing.clear();
+        routing.resize(ids.len(), MOE_CACHE_NONE);
+        let r = tokens.start * n_active..tokens.end * n_active;
+        let mut state = lock(&self.state);
+        let Some(Seat::Seated(x)) = &mut *state else {
+            return Err(MoeDiskRefusal::NoCache.into());
+        };
+        x.fill(
+            layer,
+            &ids[r.clone()],
+            &mut routing[r],
+            &mut CacheCopier { exec, cache },
+        )?;
+        cache.upload_routing(exec, routing)
+    }
+}
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+enum Seat {
+    Open(DiskExpertStore),
+    Seated(DiskExperts<PinnedBuf>),
 }
 
 fn broken() -> GpuError {

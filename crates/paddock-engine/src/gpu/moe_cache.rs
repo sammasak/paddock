@@ -63,7 +63,7 @@ pub fn moe_cache_slots_pin() -> Option<usize> {
 /// Geometry of a repacked expert plane, independent of its backing address.
 /// Cache slots need this layout, not ownership of the original weight bytes.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct ExpertPlaneLayout {
+pub struct ExpertPlaneLayout {
     pub(super) dims: Vec<usize>,
     pub(super) ty: GgmlType,
     pub(super) data_per_expert: usize,
@@ -110,12 +110,12 @@ impl ExpertPlaneLayout {
 /// One MoE layer's gate/up/down plane geometry: what a slot holds and what
 /// every backing (pinned mirror or disk artifact) must agree on.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct ExpertLayerLayout {
+pub struct ExpertLayerLayout {
     pub(super) planes: [ExpertPlaneLayout; 3],
 }
 
 impl ExpertLayerLayout {
-    pub(super) fn new(planes: [ExpertPlaneLayout; 3]) -> Result<Self, GpuError> {
+    pub fn new(planes: [ExpertPlaneLayout; 3]) -> Result<Self, GpuError> {
         let n_expert = planes[0].dims[2];
         if planes[1].dims[2] != n_expert || planes[2].dims[2] != n_expert {
             return Err(GpuError::Driver(format!(
@@ -126,7 +126,7 @@ impl ExpertLayerLayout {
         Ok(Self { planes })
     }
 
-    fn from_pinned(
+    pub(super) fn from_pinned(
         gate: &HostMappedKq,
         up: &HostMappedKq,
         down: &HostMappedKq,
@@ -194,7 +194,9 @@ pub struct ExpertCache {
     n_rows_w: CudaSlice<u32>,
     /// Fill descriptors: mirror sources, slot destinations, bytes per expert -
     /// gate data, gate scales, up data, up scales, down data, down scales.
-    src: [u64; 6],
+    /// No sources on a disk-backed cache: its misses arrive through
+    /// [`CacheCopier`], never the fill kernel.
+    src: Option<[u64; 6]>,
     dst: [u64; 6],
     bytes: [u64; 6],
 }
@@ -281,7 +283,19 @@ impl GpuExecutor {
             src[2 * i] = sp;
             src[2 * i + 1] = ssp;
         }
-        self.new_expert_cache_from_layout(layout, src, slots, max_rows)
+        self.new_expert_cache_from_layout(layout, Some(src), slots, max_rows)
+    }
+
+    /// A `slots`-expert cache whose misses the disk backing fills from the
+    /// host (`moe_disk.rs`): same slot planes, no device-side fill sources.
+    /// `max_rows` bounds the routing a launch uploads.
+    pub(super) fn new_expert_cache_for_disk(
+        &self,
+        layout: ExpertLayerLayout,
+        slots: usize,
+        max_rows: usize,
+    ) -> Result<ExpertCache, GpuError> {
+        self.new_expert_cache_from_layout(layout, None, slots, max_rows)
     }
 
     // Keep the existing pinned-host fill descriptors and kernel ABI intact.
@@ -289,7 +303,7 @@ impl GpuExecutor {
     fn new_expert_cache_from_layout(
         &self,
         layout: ExpertLayerLayout,
-        src: [u64; 6],
+        src: Option<[u64; 6]>,
         slots: usize,
         max_rows: usize,
     ) -> Result<ExpertCache, GpuError> {
@@ -529,6 +543,9 @@ impl GpuExecutor {
             .kernels
             .moe_cache_fill
             .ok_or(GpuError::MissingOp("moe_cache_fill"))?;
+        let src = c.src.as_ref().ok_or_else(|| {
+            GpuError::Driver("expert cache: a disk-backed cache has no device fill sources".into())
+        })?;
         let (jb, _g1) = c.jobs.device_ptr(&self.stream);
         let (nj, _g2) = c.n_jobs.device_ptr(&self.stream);
         // SAFETY: pack ABI v1 contract; src/dst/bytes are host arrays the
@@ -538,12 +555,65 @@ impl GpuExecutor {
                 jb as *const _,
                 nj as *const _,
                 rows as u32,
-                c.src.as_ptr() as *const _,
+                src.as_ptr() as *const _,
                 c.dst.as_ptr() as *const _,
                 c.bytes.as_ptr() as *const _,
                 self.stream_ptr(),
             )
         })
+    }
+}
+
+impl ExpertCache {
+    /// Upload one launch's slot routing (`rows` ids, `MOE_CACHE_NONE` for an
+    /// absent pair) into `idx_slot`, in stream order. From pageable memory
+    /// the driver stages `rows` before returning, so the caller may reuse it.
+    pub(super) fn upload_routing(&self, exec: &GpuExecutor, rows: &[u32]) -> Result<(), GpuError> {
+        if rows.len() > self.max_rows {
+            return Err(GpuError::Driver(format!(
+                "expert cache: {} routed rows over {} scratch rows",
+                rows.len(),
+                self.max_rows
+            )));
+        }
+        let (ip, _g) = self.idx_slot.device_ptr(&exec.stream);
+        // SAFETY: `idx_slot` holds max_rows >= rows.len() u32s, and the copy
+        // is ordered on the stream after every kernel already reading it.
+        unsafe { cudarc::driver::result::memcpy_htod_async(ip, rows, exec.stream.cu_stream()) }
+            .map_err(super::error::from_driver)
+    }
+}
+
+/// The disk backing's device half (`moe_disk::SlotCopier`) for one layer's
+/// cache: plain host-to-device copies into the slot planes on the engine
+/// stream, so the expert kernels launched after them see the bytes.
+pub(super) struct CacheCopier<'a> {
+    pub(super) exec: &'a GpuExecutor,
+    pub(super) cache: &'a ExpertCache,
+}
+
+impl super::moe_disk::SlotCopier for CacheCopier<'_> {
+    unsafe fn enqueue(&mut self, stream: usize, slot: u32, src: &[u8]) -> Result<(), GpuError> {
+        let c = self.cache;
+        if stream >= 6 || slot as usize >= c.slots || src.len() as u64 != c.bytes[stream] {
+            return Err(GpuError::Driver(format!(
+                "expert cache: copy of {} bytes into stream {stream} slot {slot} of {}",
+                src.len(),
+                c.slots
+            )));
+        }
+        let dst = c.dst[stream] + slot as u64 * c.bytes[stream];
+        // SAFETY: `dst..dst + len` lies inside the slot plane (checked
+        // above); the caller keeps `src` alive and unmodified until `wait`.
+        unsafe { cudarc::driver::result::memcpy_htod_async(dst, src, self.exec.stream.cu_stream()) }
+            .map_err(super::error::from_driver)
+    }
+
+    fn wait(&mut self) -> Result<(), GpuError> {
+        self.exec
+            .stream
+            .synchronize()
+            .map_err(super::error::from_driver)
     }
 }
 
