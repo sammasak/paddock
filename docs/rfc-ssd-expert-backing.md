@@ -62,19 +62,19 @@ Keep a dedicated feature branch based on upstream main, separate from packaging 
 
 ## Implementation status
 
-Steps 1 to 4 exist for qwen35. On an 8 GiB sm_86 card with the 35B-A3B UD file and 32 slots, the pinned path after the seam matched resident bit for bit and main's tokens and decode rate; disk-mode parity and measurements have not run yet.
+Steps 1 to 4 exist for qwen35 and have run on an RTX 3070 (8 GiB, sm_86, 46 SMs) with the 35B-A3B UD file (measurements and commands: `docs/ssd-expert-backing-progress.md`). The pinned path after the seam matches main's greedy tokens and decode rate. The disk path passes its parity gate down to a 2 GiB host memory cap.
 
 - `gpu/expert_store.rs`: the artifact (sealed header, per-record BLAKE3, exact positioned reads, exclusive temp-then-rename writer) and the fixed staging pool. CPU tests.
-- `gpu/moe_disk.rs`: the host miss path (the resolve kernel's LRU walk on the host, token ranges whose experts fit the slots, invalidation of every slot a failed fill assigned, a broken state after a failed wait) behind a two-call device seam; CPU tests drive it with a fake device that applies copies at wait time. The CUDA side (`CacheCopier`, `PinnedBuf`, routing upload, row views) is compile-checked only.
-- qwen35: `PADDOCK_MOE_DISK=<artifact>` seats layout-only experts, requires a slot cache of at least top-k slots, runs prefill and decode eagerly, launches each token range over its own rows, and refuses CUDA graph capture, batched serving (a startup config error), DFlash and MTP speculation. qwen4exp refuses the switch.
+- `gpu/moe_disk.rs`: the host miss path. The resolve kernel's LRU walk runs on the host; a launch whose experts fit the slots (decode) runs the token-batched pair over `idx_slot`-style routing, and a wider one (prefill) runs expert-major in waves of at most `slots` experts, in id order, over upstream's LIST pair kernels (qwen4exp's `kq_moe_routed_waves` class). A fill reads its misses on four threads into pinned staging, enqueues the copies, and marks them with an event; it waits only for the oldest marked batch when it needs a buffer, and routing goes up from pinned double buffers, so a wave's reads overlap the previous wave's kernels. A failed read or enqueue invalidates every slot the fill assigned; a failed wait or mark breaks the backing and strands its buffers. CPU tests drive it with a fake device that applies copies only at a wait on a later mark.
+- qwen35: `PADDOCK_MOE_DISK=<artifact>` seats layout-only experts, requires a slot cache of at least top-k slots and the LIST pair kernels, runs prefill and decode eagerly, and refuses CUDA graph capture, batched serving (a startup config error), DFlash and MTP speculation. qwen4exp refuses the switch.
 - The artifact is written straight from the GGUF, without loading the model: one layer's experts are repacked in VRAM at a time and copied down one expert record at a time, so host memory holds one record.
-- `tests/gpu_qwen36_moe_disk.rs`: writes the artifact, then a pinned reference, then checks bit-exact parity (prefill logits and greedy tokens, token-batched class on both sides) and reports TTFT, decode, misses, read rate, staging waits, device reads and peak RSS, plus the same runs pinned.
+- `tests/gpu_qwen36_moe_disk.rs`: writes the artifact, then a pinned reference (token-batched class, eager). Parity: a one-token prompt matches bit for bit; a text and a 600-token synthetic prompt prefill in waves and are gated teacher-forced (prefill mean |d|/rms < 0.10, top-1 at least 90%, upstream's regrouped-sum tolerance), with free-running greedy equality reported. Then reports TTFT, decode, misses, read rate, staging waits, device reads and RSS, plus the same runs pinned.
 
 Known gaps, in order of what blocks the 180B target:
 
 - The writer needs one layer's repacked experts (plus its raw upload) to fit in VRAM.
 - Only the single-sequence eager path serves; the runner's batched lane refuses at startup.
-- Prefill syncs the host once per token range and layer; reads are buffered and synchronous (no prefetch, no direct I/O) until measured.
+- Decode is bound by disk reads (about 170 MB of misses a token at 32 slots); there is no prefetch or speculative routing, and the page cache is the only host tier. Reads are buffered, not direct.
+- Wave prefill sums a token's experts in wave order, so its logits are not bitwise equal to the token-batched pinned prefill (the sorted prefill's class).
 - The identity hashes the kernel pack version and each expert tensor's name, type, shape, length and first and last 64 KiB, not every byte.
 - No parent directory fsync after publishing the artifact.
-
