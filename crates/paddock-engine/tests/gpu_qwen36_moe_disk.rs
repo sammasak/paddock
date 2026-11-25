@@ -239,8 +239,10 @@ fn measure(m: &mut GpuQwen35, artifact: Option<&Path>) {
     }
     eprintln!("disk totals: {:?}", m.moe_disk_stats());
     eprintln!(
-        "peak RSS (VmHWM): {:?} KiB, device read_bytes: {:?}",
+        "peak RSS (VmHWM): {:?} KiB, now anon {:?} KiB + file {:?} KiB, device read_bytes: {:?}",
         proc_field("/proc/self/status", "VmHWM:"),
+        proc_field("/proc/self/status", "RssAnon:"),
+        proc_field("/proc/self/status", "RssFile:"),
         proc_field("/proc/self/io", "read_bytes:")
     );
 }
