@@ -513,7 +513,10 @@ impl GpuQwen35 {
         // helpers pick by the same batch rule the quantize used.
         macro_rules! pmm_pre {
             ($w:expr, $y:expr) => {
-                match $w {
+                match {
+                    let w: &QuantW = $w;
+                    w
+                } {
                     QuantW::Kq(k) if kq_f32 => {
                         kq_gemm(&exec, k, &sc.d_xn, &mut sc.d_wdq, $y, t_len)?
                     }
@@ -534,7 +537,10 @@ impl GpuQwen35 {
         }
         macro_rules! pmm {
             ($w:expr, $x:expr, $y:expr) => {
-                match $w {
+                match {
+                    let w: &QuantW = $w;
+                    w
+                } {
                     QuantW::Kq(k) if kq_f32 => kq_gemm(&exec, k, $x, &mut sc.d_wdq, $y, t_len)?,
                     w => prefill_mm_any(
                         &exec,

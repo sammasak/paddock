@@ -60,11 +60,11 @@ pub(crate) use moe_disk::{
     MoeDiskBacking, MoeDiskRefusal, PD_MOE_BM, disk_slots, expert_identity, write_expert_artifact,
 };
 mod host_plane;
-pub use host_plane::{HostMappedKq, HostMirror};
+pub use host_plane::{HostMappedKq, HostMappedQuantW, HostMirror};
 mod moe_cache;
 pub use moe_cache::{
-    ExpertCache, MOE_CACHE_NONE, MoeDiskCfg, MoeOffloadCfg, moe_cache_slots_pin, moe_disk_artifact,
-    moe_offload, set_moe_disk, set_moe_offload,
+    DenseHost, ExpertCache, MOE_CACHE_NONE, MoeDiskCfg, MoeOffloadCfg, moe_cache_slots_pin,
+    moe_disk_artifact, moe_offload, set_moe_disk, set_moe_offload,
 };
 mod kquant;
 mod kumo;

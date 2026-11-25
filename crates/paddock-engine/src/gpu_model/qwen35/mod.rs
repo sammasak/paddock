@@ -301,7 +301,7 @@ fn mixed_prefill_cap(base: usize, b: usize) -> usize {
 /// Gated DeltaNet (linear-attention) mixer weights - the 3-of-4 layers.
 struct DeltaNetWeights {
     /// `attn_qkv` [embd, conv_dim] - in-proj to the pre-conv mixed q,k,v.
-    in_qkv: QuantW,
+    in_qkv: DenseW,
     /// `ssm_conv1d` [conv_dim, k] F32 - depthwise causal conv weight.
     conv_w: DeviceTensor,
     /// `ssm_alpha`/`ssm_beta` [embd, n_v_heads] - data-dependent decay/delta
@@ -1105,8 +1105,10 @@ fn build_w8_mixer(
             }
             Mixer::Linear(w) => {
                 // fused in_qkv|gate_w lives in the in_qkv slot
-                if w8.in_qkv.is_some() {
-                    drop_src(&mut w.in_qkv)?;
+                if w8.in_qkv.is_some()
+                    && let DenseW::Vram(in_qkv) = &mut w.in_qkv
+                {
+                    drop_src(in_qkv)?;
                     drop_src(&mut w.gate_w)?;
                 }
                 if w8.out_w.is_some() {
@@ -1566,9 +1568,9 @@ struct MoeFfnWeights {
     /// `ffn_{gate,up,down}_shexp` - a plain dense SwiGLU FFN of width
     /// shexp_ff. Per-tensor seat like the dense FFN: Q8_0 in the UD-Q4_K_XL
     /// exports, k-quant (Q5_K) in the UD-IQ2 ones.
-    shexp_gate: QuantW,
-    shexp_up: QuantW,
-    shexp_down: QuantW,
+    shexp_gate: DenseW,
+    shexp_up: DenseW,
+    shexp_down: DenseW,
     /// b2: fp4 (W4A8) plane variants of the routed experts, built at load under
     /// `PADDOCK_QWEN35_MOE_FP4`. fp4 weights are ~half the Q8_0 DRAM - the lever
     /// for the weight-bandwidth-bound MoE. Used only in the sorted prefill path
@@ -1833,7 +1835,7 @@ pub struct GpuQwen35 {
     out_norm: DeviceTensor,
     /// lm_head, quantized-resident (tied to `token_embd` when `output.weight`
     /// absent). UD k-quant exports ship it Q6_K.
-    output: QuantW,
+    output: DenseW,
     /// Rotated-basis checkpoint (PrismML Bonsai, `prism.hadamard.*`): every
     /// linear's input goes through a Walsh-Hadamard rotation first. None for
     /// an ordinary file. See `rotation.rs` for where the sites sit.
@@ -2691,6 +2693,12 @@ impl AuSum {
             QuantW::Kq(x) => self.kq(x),
         }
     }
+    /// A dense plane: VRAM only (a host-mapped one holds no device bytes).
+    fn dw(&mut self, w: &DenseW) {
+        if let DenseW::Vram(q) = w {
+            self.qw(q);
+        }
+    }
     fn expw(&mut self, w: &ExpW) {
         match w {
             ExpW::Q8(x) => self.q8(x),
@@ -2714,7 +2722,7 @@ impl AuSum {
         self.dt(&w.k_norm);
     }
     fn dn(&mut self, w: &DeltaNetWeights) {
-        self.qw(&w.in_qkv);
+        self.dw(&w.in_qkv);
         self.dt(&w.conv_w);
         if let Some(a) = &w.alpha_w {
             self.q8(a);
@@ -2756,9 +2764,9 @@ impl AuSum {
                 self.expw(&m.up_exps);
                 self.expw(&m.down_exps);
                 self.dt(&m.shexp_gate_inp);
-                self.qw(&m.shexp_gate);
-                self.qw(&m.shexp_up);
-                self.qw(&m.shexp_down);
+                self.dw(&m.shexp_gate);
+                self.dw(&m.shexp_up);
+                self.dw(&m.shexp_down);
                 if let Some(p) = &m.gate_exps_fp4 {
                     self.fp4(p);
                 }
@@ -3419,12 +3427,57 @@ struct Scratch {
 enum TokEmbd {
     Q8(QuantTensor),
     Kq(RepackedKQ),
+    /// `[moe_offload] dense_host` token_embd: the k-quant table in
+    /// device-mapped host memory; a gather reads its rows over PCIe.
+    KqHost(crate::gpu::HostMappedKq),
     /// A tied file (no `output.weight`): the LM head IS this matrix, so rows
     /// are gathered from the head's own repacked plane and nothing else is
     /// resident - one copy where there used to be two (675 MB of Q8_0 on
     /// LightOnOCR-3-4B, 270 MB on the 0.8B). Both repacks are exact, so the
     /// rows are the values the raw table held.
     Tied,
+}
+
+/// A dense plane in VRAM, or (`[moe_offload] dense_host`) in device-mapped
+/// host memory read over PCIe; both deref to the `QuantW` the launch
+/// wrappers take.
+pub(super) enum DenseW {
+    Vram(QuantW),
+    Host(crate::gpu::HostMappedQuantW),
+}
+
+impl std::ops::Deref for DenseW {
+    type Target = QuantW;
+    fn deref(&self) -> &QuantW {
+        match self {
+            DenseW::Vram(w) => w,
+            DenseW::Host(w) => w,
+        }
+    }
+}
+
+impl DenseW {
+    /// `name` as a dense plane, host-mapped when `host` and the tensor is a
+    /// k-quant (anything else stays in VRAM).
+    pub(super) fn load(
+        exec: &crate::gpu::GpuExecutor,
+        map: &paddock_models::mapped::MappedGguf,
+        name: &str,
+        host: bool,
+    ) -> Result<Self, crate::gpu::GpuError> {
+        if host && let Some(h) = exec.try_repack_kquant_host_mapped(map, name)? {
+            return Ok(DenseW::Host(h.into_quantw()));
+        }
+        exec.load_quantw(map, name).map(DenseW::Vram)
+    }
+
+    /// The plane when it is in VRAM (a host-mapped one is never rewritten).
+    pub(super) fn vram_mut(&mut self) -> Option<&mut QuantW> {
+        match self {
+            DenseW::Vram(w) => Some(w),
+            DenseW::Host(_) => None,
+        }
+    }
 }
 
 /// What one token gather reads - see [`TokEmbd::src`].
@@ -3443,6 +3496,7 @@ impl TokEmbd {
         match (self, head) {
             (TokEmbd::Q8(t), _) => EmbedSrc::Q8(t),
             (TokEmbd::Kq(t), _) => EmbedSrc::Kq(t),
+            (TokEmbd::KqHost(t), _) => EmbedSrc::Kq(t),
             (TokEmbd::Tied, QuantW::Q8(q)) => EmbedSrc::Q8r(q),
             (TokEmbd::Tied, QuantW::Kq(k)) => EmbedSrc::Kq(k),
         }
@@ -3454,7 +3508,7 @@ impl TokEmbd {
         match self {
             TokEmbd::Q8(t) => t.bytes.len(),
             TokEmbd::Kq(t) => t.data.len() + t.scales.len(),
-            TokEmbd::Tied => 0,
+            TokEmbd::KqHost(_) | TokEmbd::Tied => 0,
         }
     }
     fn label(&self) -> &'static str {
@@ -3466,6 +3520,7 @@ impl TokEmbd {
                 paddock_models::ggml_type::GgmlType::Q6K => "Q6_K",
                 _ => "IQ4_XS",
             },
+            TokEmbd::KqHost(_) => "k-quant, host-mapped",
             TokEmbd::Tied => "tied - the lm_head plane",
         }
     }

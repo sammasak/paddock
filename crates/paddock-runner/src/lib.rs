@@ -346,7 +346,10 @@ pub async fn run(
              and a model that does not fit will be refused. Set enabled = true."
         );
     }
+    let dense_host =
+        paddock_engine::gpu::DenseHost::parse(mo.dense_host.iter().map(String::as_str))?;
     paddock_engine::gpu::set_moe_offload(paddock_engine::gpu::MoeOffloadCfg {
+        dense_host,
         enabled: mo.enabled,
         vram_bytes: mo
             .vram_gb

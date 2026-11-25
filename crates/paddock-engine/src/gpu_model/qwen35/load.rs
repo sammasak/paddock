@@ -332,6 +332,28 @@ impl GpuQwen35 {
         let moe_host = crate::gpu::moe_offload().enabled
             && paddock_models::dev_var_os!("PADDOCK_NO_MOE_KQ").is_none()
             && exec.has_kquant_moe();
+        // `[moe_offload] dense_host`: dense k-quant planes in host memory
+        let dense_host = crate::gpu::moe_offload().dense_host;
+        let dense_host_bytes: u64 = map
+            .tensor_infos()
+            .filter(|t| crate::gpu::kq_params(t.ggml_type).is_some())
+            .filter(|t| {
+                (dense_host.token_embd && t.name == "token_embd.weight")
+                    || (dense_host.output && t.name == "output.weight")
+                    || (dense_host.shexp
+                        && t.name.starts_with("blk.")
+                        && t.name.contains("_shexp."))
+                    || (dense_host.in_qkv && t.name.ends_with(".attn_qkv.weight"))
+            })
+            .filter_map(|t| t.byte_size())
+            .sum();
+        if dense_host_bytes > 0 {
+            tracing::info!(
+                host_gib = dense_host_bytes as f64 / (1u64 << 30) as f64,
+                ?dense_host,
+                "qwen35 dense planes will be host-mapped ([moe_offload] dense_host)"
+            );
+        }
         let host_bytes: u64 = if moe_host {
             map.tensor_infos()
                 .filter(|t| {
@@ -352,8 +374,13 @@ impl GpuQwen35 {
         }
         // The slot cache is sized after the KV plan (enable_batch), from
         // what the plan leaves - it is not charged here.
-        exec.vram_load_gate(map.total_len().saturating_sub(host_bytes), "qwen3.5/3.6")
-            .map_err(GpuModelError::WontFit)?;
+        exec.vram_load_gate(
+            map.total_len()
+                .saturating_sub(host_bytes)
+                .saturating_sub(dense_host_bytes),
+            "qwen3.5/3.6",
+        )
+        .map_err(GpuModelError::WontFit)?;
         // Single-stream engine: drop cudarc's cross-stream event tracking (pure
         // overhead here, and it blocks CUDA-graph capture). Must precede all allocs.
         exec.disable_event_tracking();
@@ -552,6 +579,12 @@ impl GpuQwen35 {
                 .tensor_info("token_embd.weight")
                 .ok_or_else(|| GpuModelError::MissingMeta("token_embd.weight".into()))?;
             (TokEmbd::Tied, info.dims[1] as usize)
+        } else if te_kq && dense_host.token_embd {
+            let t = exec
+                .try_repack_kquant_host_mapped(map, "token_embd.weight")?
+                .ok_or_else(|| GpuModelError::MissingMeta("token_embd.weight".into()))?;
+            let vocab = t.dims[1];
+            (TokEmbd::KqHost(t), vocab)
         } else if te_kq {
             let t = exec.repack_kquant(map, "token_embd.weight")?;
             let vocab = t.dims[1];
@@ -809,6 +842,8 @@ impl GpuQwen35 {
             // repacks into its own streams. Memory-neutral at rest (the
             // interleaved upload is freed either way).
             let qt = |name: &str| exec.load_quantw(map, &format!("blk.{i}.{name}"));
+            let shexp =
+                |name: &str| DenseW::load(&exec, map, &format!("blk.{i}.{name}"), dense_host.shexp);
             // Q8_0-only seats (MoE experts - the stage-3 k-quant arm).
             let qt8 = |name: &str| exec.repack_q8(map, &format!("blk.{i}.{name}"));
 
@@ -875,7 +910,11 @@ impl GpuQwen35 {
                     ));
                 }
                 Mixer::Linear(DeltaNetWeights {
-                    in_qkv: seatp("attn_qkv.weight")?,
+                    in_qkv: if dense_host.in_qkv && !proj_covered {
+                        DenseW::load(&exec, map, &format!("blk.{i}.attn_qkv.weight"), true)?
+                    } else {
+                        DenseW::Vram(seatp("attn_qkv.weight")?)
+                    },
                     conv_w: dt("ssm_conv1d.weight")?,
                     alpha_w: if ab_q8 {
                         Some(qt8("ssm_alpha.weight")?)
@@ -1033,9 +1072,9 @@ impl GpuQwen35 {
                     up_exps,
                     down_exps,
                     shexp_gate_inp: dt("ffn_gate_inp_shexp.weight")?,
-                    shexp_gate: qt("ffn_gate_shexp.weight")?,
-                    shexp_up: qt("ffn_up_shexp.weight")?,
-                    shexp_down: qt("ffn_down_shexp.weight")?,
+                    shexp_gate: shexp("ffn_gate_shexp.weight")?,
+                    shexp_up: shexp("ffn_up_shexp.weight")?,
+                    shexp_down: shexp("ffn_down_shexp.weight")?,
                     gate_exps_fp4: None,
                     up_exps_fp4: None,
                     down_exps_fp4: None,
@@ -2000,9 +2039,9 @@ impl GpuQwen35 {
                         up_exps,
                         down_exps,
                         shexp_gate_inp: dt("ffn_gate_inp_shexp.weight")?,
-                        shexp_gate: qt("ffn_gate_shexp.weight")?,
-                        shexp_up: qt("ffn_up_shexp.weight")?,
-                        shexp_down: qt("ffn_down_shexp.weight")?,
+                        shexp_gate: DenseW::Vram(qt("ffn_gate_shexp.weight")?),
+                        shexp_up: DenseW::Vram(qt("ffn_up_shexp.weight")?),
+                        shexp_down: DenseW::Vram(qt("ffn_down_shexp.weight")?),
                         gate_exps_fp4: None,
                         up_exps_fp4: None,
                         down_exps_fp4: None,
@@ -2030,9 +2069,9 @@ impl GpuQwen35 {
         // exports omit `output.weight` and reuse `token_embd`). Per-tensor
         // dispatch: UD files ship the head Q6_K.
         let mut output = if map.tensor_info("output.weight").is_some() {
-            exec.load_quantw(map, "output.weight")?
+            DenseW::load(&exec, map, "output.weight", dense_host.output)?
         } else {
-            exec.load_quantw(map, "token_embd.weight")?
+            DenseW::Vram(exec.load_quantw(map, "token_embd.weight")?)
         };
         let kq_resident = kq_resident || output.kq().is_some();
         // the dedicated ternary decode lane: all of the file's linears or none
@@ -2085,15 +2124,20 @@ impl GpuQwen35 {
                     k.act128 = true;
                 }
             };
-            mark(&mut output);
+            if let Some(o) = output.vram_mut() {
+                mark(o);
+            }
             for l in layers.iter_mut() {
                 match &mut l.mixer {
                     Mixer::Full(w) => [&mut w.wq, &mut w.wk, &mut w.wv, &mut w.wo]
                         .into_iter()
                         .for_each(mark),
-                    Mixer::Linear(w) => [&mut w.in_qkv, &mut w.gate_w, &mut w.out_w]
-                        .into_iter()
-                        .for_each(mark),
+                    Mixer::Linear(w) => {
+                        [w.in_qkv.vram_mut(), Some(&mut w.gate_w), Some(&mut w.out_w)]
+                            .into_iter()
+                            .flatten()
+                            .for_each(mark)
+                    }
                 }
                 if let Ffn::Dense { gate, up, down } = &mut l.ffn {
                     [gate, up, down].into_iter().for_each(mark);
@@ -2148,7 +2192,7 @@ impl GpuQwen35 {
                         || fp8_native.is_some()
                         || exec.has_f8d_gemm_mma_ks())))
         {
-            match &output {
+            match &*output {
                 QuantW::Q8(q8) => (|| {
                     let d = &q8.dims;
                     let (i, o) = (d[0], d[1]);
@@ -2263,7 +2307,7 @@ impl GpuQwen35 {
         let out_f8t = if f8t_ffn_enabled(&exec)
             && paddock_models::dev_var_os!("PADDOCK_NO_F8T_LMHEAD").is_none()
         {
-            match &output {
+            match &*output {
                 QuantW::Q8(q8) => (|| {
                     let (i, o) = (q8.dims[0], q8.dims[1]);
                     if i % 128 != 0 || o % 128 != 0 {
@@ -2308,7 +2352,7 @@ impl GpuQwen35 {
         // its head on every die; only the opt-in adds the twin.
         if let (Some(_), true, None, false) =
             (out_f8.as_ref(), f8_head_min() <= 1, out_f8t.as_ref(), tied)
-            && let QuantW::Q8(q) = &mut output
+            && let DenseW::Vram(QuantW::Q8(q)) = &mut output
         {
             let freed = (q.data.len() + q.scale.len()) as u64;
             *q = crate::gpu::RepackedQ8 {
@@ -2667,7 +2711,7 @@ impl GpuQwen35 {
                 hashing,
                 ..Default::default()
             };
-            hd.qw(&output);
+            hd.dw(&output);
             hd.dt(&out_norm);
             hd.bytes += (sinks.len() * 4) as u64;
             hd.allocs += 1;

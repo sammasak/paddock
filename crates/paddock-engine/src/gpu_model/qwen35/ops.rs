@@ -2112,7 +2112,7 @@ pub(super) fn moe_ffn(
             batch,
         )?;
         exec.swiglu(shexp_gate, shexp_up, batch * dims.shexp_ff)?;
-        match &w.shexp_down {
+        match &*w.shexp_down {
             QuantW::Q8(q) => {
                 prefill_mm(exec, q, pxq, pxs, yq, skfix, shexp_gate, shexp_out, batch)?
             }
@@ -2154,7 +2154,7 @@ pub(super) fn moe_ffn(
         // per row to the splits. down reads the swiglu output, so it cannot
         // join. Kill: PADDOCK_NO_GEMV_MULTI. Q8_0 seats only - the k-quant
         // GEMV has no merged form.
-        match (&w.shexp_gate, &w.shexp_up) {
+        match (&*w.shexp_gate, &*w.shexp_up) {
             (QuantW::Q8(g), QuantW::Q8(u))
                 if exec.has_q8_0_gemv_repacked_multi() && !no_gemv_multi() =>
             {

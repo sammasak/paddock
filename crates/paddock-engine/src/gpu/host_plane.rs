@@ -24,7 +24,7 @@ use std::sync::Arc;
 use cudarc::driver::sys as cu;
 use cudarc::driver::{CudaStream, DevicePtr};
 
-use super::{GpuError, GpuExecutor, RepackedKQ};
+use super::{GpuError, GpuExecutor, QuantW, RepackedKQ};
 use paddock_models::mapped::MappedGguf;
 
 /// One device-mapped pinned host extent, RAII over `cuMemHostAlloc` /
@@ -209,6 +209,47 @@ impl std::ops::Deref for HostMappedKq {
     type Target = RepackedKQ;
     fn deref(&self) -> &RepackedKQ {
         &self.plane
+    }
+}
+
+impl HostMappedKq {
+    /// The same plane as a `QuantW` (a dense weight read zero-copy over
+    /// PCIe), keeping the mirrors that own its pages.
+    pub fn into_quantw(self) -> HostMappedQuantW {
+        let HostMappedKq {
+            plane,
+            _data,
+            _scales,
+        } = self;
+        HostMappedQuantW {
+            w: ManuallyDrop::new(QuantW::Kq(ManuallyDrop::into_inner(plane))),
+            _data,
+            _scales,
+        }
+    }
+}
+
+/// A dense `QuantW` whose bytes live in host-mapped memory, the
+/// [`HostMappedKq`] contract for the dense launch wrappers: the `CudaSlice`s
+/// inside are non-owning views, never freed, and the mirrors own the pages.
+pub struct HostMappedQuantW {
+    w: ManuallyDrop<QuantW>,
+    // Declared after `w` so the views are forgotten before the pages go.
+    _data: HostMirror,
+    _scales: HostMirror,
+}
+
+impl HostMappedQuantW {
+    /// Bytes held in host memory (data + scale streams).
+    pub fn host_bytes(&self) -> u64 {
+        (self._data.len() + self._scales.len()) as u64
+    }
+}
+
+impl std::ops::Deref for HostMappedQuantW {
+    type Target = QuantW;
+    fn deref(&self) -> &QuantW {
+        &self.w
     }
 }
 

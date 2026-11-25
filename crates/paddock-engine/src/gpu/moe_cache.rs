@@ -35,6 +35,47 @@ pub const MOE_CACHE_NONE: u32 = u32::MAX;
 pub struct MoeOffloadCfg {
     pub enabled: bool,
     pub vram_bytes: Option<u64>,
+    /// Dense planes kept in device-mapped host memory too (`dense_host`).
+    pub dense_host: DenseHost,
+}
+
+/// `[moe_offload] dense_host`: dense (non-expert) k-quant planes a qwen35
+/// load keeps in device-mapped host memory, read over PCIe, so a model whose
+/// dense part does not fit beside the slot cache still loads (slowly).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DenseHost {
+    pub token_embd: bool,
+    pub output: bool,
+    /// The shared expert's gate/up/down.
+    pub shexp: bool,
+    /// The DeltaNet layers' fused qkv input projection.
+    pub in_qkv: bool,
+}
+
+impl DenseHost {
+    pub fn any(&self) -> bool {
+        self.token_embd || self.output || self.shexp || self.in_qkv
+    }
+
+    /// From names (`token_embd`, `output`, `shexp`, `in_qkv`); an unknown
+    /// name is an error naming it.
+    pub fn parse<'a>(names: impl IntoIterator<Item = &'a str>) -> Result<Self, String> {
+        let mut d = Self::default();
+        for n in names {
+            match n.trim() {
+                "token_embd" => d.token_embd = true,
+                "output" => d.output = true,
+                "shexp" => d.shexp = true,
+                "in_qkv" => d.in_qkv = true,
+                other => {
+                    return Err(format!(
+                        "dense_host: unknown plane {other:?} (token_embd, output, shexp, in_qkv)"
+                    ));
+                }
+            }
+        }
+        Ok(d)
+    }
 }
 
 static MOE_OFFLOAD: std::sync::OnceLock<MoeOffloadCfg> = std::sync::OnceLock::new();
@@ -48,6 +89,13 @@ pub fn set_moe_offload(cfg: MoeOffloadCfg) {
 /// `PADDOCK_MOE_DISK` (see [`moe_disk_artifact`]) implies it.
 pub fn moe_offload() -> MoeOffloadCfg {
     let mut c = MOE_OFFLOAD.get().copied().unwrap_or_default();
+    // development switch for the gates, same names as the config key
+    if let Some(v) = paddock_models::dev_var!("PADDOCK_MOE_DENSE_HOST")
+        .ok()
+        .and_then(|v| DenseHost::parse(v.split(',').filter(|s| !s.is_empty())).ok())
+    {
+        c.dense_host = v;
+    }
     if paddock_models::dev_var_os!("PADDOCK_MOE_HOST").is_some() || moe_disk_artifact().is_some() {
         c.enabled = true;
     }
@@ -657,6 +705,18 @@ impl super::moe_disk::SlotCopier for CacheCopier<'_> {
 #[cfg(test)]
 mod layout_tests {
     use super::*;
+
+    #[test]
+    fn dense_host_parses_known_planes_and_refuses_others() {
+        let d = DenseHost::parse(["token_embd", "in_qkv"]).expect("parse");
+        assert!(d.token_embd && d.in_qkv && !d.output && !d.shexp && d.any());
+        assert!(!DenseHost::parse([]).expect("empty").any());
+        assert!(
+            DenseHost::parse(["lm_head"])
+                .unwrap_err()
+                .contains("lm_head")
+        );
+    }
 
     #[test]
     fn expert_plane_layout_does_not_depend_on_a_device_pointer() {

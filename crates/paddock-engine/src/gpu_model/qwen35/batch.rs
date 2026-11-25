@@ -1510,7 +1510,7 @@ impl GpuQwen35 {
                 && cm.iter().all(|&c| c == cm[0])
                 // epilogue class that splits device work from readback:
                 // hrow_gather + (gemv at n==1 | the BFL Q8/f8 GEMM)
-                && (shares.len() == 1 || matches!(&self.output, QuantW::Q8(_)))
+                && (shares.len() == 1 || matches!(&*self.output, QuantW::Q8(_)))
         };
         let bucket = if graph_ok {
             max_take.next_multiple_of(32)
@@ -1813,7 +1813,7 @@ impl GpuQwen35 {
         let layers = &self.layers;
         let tok_embd = self.tok_embd.src(&self.output);
         let rot = self.rot.as_ref();
-        let output = &self.output;
+        let output: &QuantW = &self.output;
         let out_f8_h = self.out_f8.as_ref();
         let out_norm = &self.out_norm;
         let kv_dtype = self.kv_dtype;
@@ -5029,7 +5029,7 @@ impl GpuQwen35 {
         let layers = &self.layers;
         let tok_embd = self.tok_embd.src(&self.output);
         let rot = self.rot.as_ref();
-        let output = &self.output;
+        let output: &QuantW = &self.output;
         let out_f8_h = self.out_f8.as_ref();
         let out_f8_t = self.out_f8_t.as_ref();
         let out_norm = &self.out_norm;
@@ -7865,7 +7865,10 @@ impl GpuQwen35 {
                 bmmq!($w, $x, $y, false)
             };
             ($w:expr, $x:expr, $y:expr, $pre:expr) => {{
-                match $w {
+                match {
+                    let w: &QuantW = $w;
+                    w
+                } {
                     QuantW::Q8(q) => bmm!(q, $x, $y, $pre),
                     QuantW::Kq(k) => {
                         if tern {
@@ -8792,7 +8795,7 @@ impl GpuQwen35 {
                         // twin of the fused W8/f8t DN in-proj plane above,
                         // which the b=1 path never reached (b >= 8 gates).
                         // Kill: PADDOCK_NO_GEMV_MULTI.
-                        match (&w.in_qkv, &w.gate_w) {
+                        match (&*w.in_qkv, &w.gate_w) {
                             (QuantW::Q8(iq), QuantW::Q8(gw))
                                 if b == 1
                                     && exec.has_q8_0_gemv_repacked_multi()
@@ -9766,7 +9769,7 @@ impl GpuQwen35 {
                     1,
                 )?;
             } else {
-                match &self.output {
+                match &*self.output {
                     QuantW::Kq(k) if tern => {
                         if !h_staged {
                             exec.quantize_q8_b128(&sc.d_h, &mut bs.d_xq, &mut bs.d_xs, embd)?;
@@ -9805,7 +9808,7 @@ impl GpuQwen35 {
                     _ => gemv_any(&exec, &self.output, &sc.d_h, &mut bs.d_logits)?,
                 }
             }
-        } else if let QuantW::Kq(k) = &self.output
+        } else if let QuantW::Kq(k) = &*self.output
             && tern
         {
             // the ternary head at every decode width: one read of the vocab
@@ -9857,7 +9860,7 @@ impl GpuQwen35 {
                 &mut bs.d_logits,
                 b,
             )?;
-        } else if let QuantW::Kq(k) = &self.output {
+        } else if let QuantW::Kq(k) = &*self.output {
             // k-quant lm_head: the W4A8 dp4a GEMM at every batched width (its
             // 4-row blocks fill the die at vocab-scale out_dims)
             exec.quantize_q8(&sc.d_h, &mut bs.d_xq, &mut bs.d_xs, b * embd)?;

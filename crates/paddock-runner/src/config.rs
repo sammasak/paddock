@@ -48,6 +48,10 @@ pub struct MoeOffload {
     pub disk_artifact: Option<PathBuf>,
     pub host_cache_gb: Option<f64>,
     pub verify_once: bool,
+    /// Dense (non-expert) qwen35 planes kept in device-mapped host memory,
+    /// read over PCIe, for a model whose dense part does not fit beside the
+    /// slot cache: any of "token_embd", "output", "shexp", "in_qkv".
+    pub dense_host: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
