@@ -3221,8 +3221,7 @@ fn moe_routed_disk(
     let gu_sums = crate::gpu::kq_needs_sums(g.ty) || crate::gpu::kq_needs_sums(u.ty);
     let d_sums = crate::gpu::kq_needs_sums(d.ty);
     if n_waves == 1 {
-        backing.fill_wave(exec, c, layer, na, 0)?;
-        let routing = c.idx_slot();
+        let routing = &backing.fill_wave(exec, c, layer, na, 0)?.slots;
         if gu_sums {
             exec.q8_sums_strided(xq, ssums, embd, batch)?;
         }
@@ -3256,9 +3255,8 @@ fn moe_routed_disk(
     }
     exec.zero_region(proj, 0, batch * embd)?;
     for wave in 0..n_waves {
-        backing.fill_wave(exec, c, layer, na, wave)?;
-        let routing = c.idx_wave();
-        let (pairs, n_pairs, tokens, n_tokens) = c.wave_lists();
+        let r = backing.fill_wave(exec, c, layer, na, wave)?;
+        let routing = &r.slots;
         // ssums holds the down sums after a wave: the input's again
         if gu_sums {
             exec.q8_sums_strided(xq, ssums, embd, batch)?;
@@ -3273,8 +3271,8 @@ fn moe_routed_disk(
             fused,
             na,
             batch,
-            pairs,
-            n_pairs,
+            &r.pairs,
+            &r.n_pairs,
         )?;
         // the rows of out-of-wave pairs hold stale values; down skips them
         exec.quantize_q8(fused, fq, fs, rows * ff)?;
@@ -3291,8 +3289,8 @@ fn moe_routed_disk(
             proj,
             na,
             batch,
-            tokens,
-            n_tokens,
+            &r.tokens,
+            &r.n_tokens,
         )?;
     }
     Ok(())

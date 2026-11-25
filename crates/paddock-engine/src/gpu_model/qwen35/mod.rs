@@ -1373,7 +1373,7 @@ impl GpuQwen35 {
         .map_err(|r| GpuModelError::Unsupported(r.to_string()))?;
         // a prompt's routing is served whole, in waves of experts
         let mut caches = b
-            .seat(&self.exec, slots, self.max_ctx * dims.n_active)?
+            .seat(&self.exec, slots, self.max_ctx, dims.n_active)?
             .into_iter();
         for l in &mut self.layers {
             if let Ffn::Moe(m) = &mut l.ffn

@@ -25,10 +25,10 @@
 //! every enqueued copy); the tests drive it with a recording fake.
 
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use cudarc::driver::CudaSlice;
+use cudarc::driver::{CudaSlice, DevicePtr};
 use paddock_models::ggml_type::GgmlType;
 use paddock_models::mapped::MappedGguf;
 
@@ -251,7 +251,7 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>> DiskExperts<B> {
         self.stats
     }
 
-    /// Resolve one chunk's `rows` of artifact layer `layer`, fill its misses
+    /// Resolve one launch's (or wave's) `rows` of artifact layer `layer`, fill its misses
     /// through `dev`, and write each row's slot into `slot_rows`. On `Ok` the
     /// copies are enqueued in stream order ahead of whatever the caller
     /// launches next on that stream; on `Err` no slot this call assigned is
@@ -272,6 +272,26 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>> DiskExperts<B> {
                 self.lru.len(),
                 rows.len(),
                 slot_rows.len()
+            )));
+        }
+        // resolve needs ids in range and the distinct ones within the slots
+        let lru = &self.lru[layer];
+        let mut seen = vec![false; lru.slot_of.len()];
+        let mut distinct = 0;
+        for &e in rows {
+            let Some(s) = seen.get_mut(e as usize) else {
+                return Err(GpuError::Driver(format!(
+                    "expert disk backing: routed expert {e} over {}",
+                    lru.slot_of.len()
+                )));
+            };
+            distinct += usize::from(!*s);
+            *s = true;
+        }
+        if distinct > lru.expert_in.len() {
+            return Err(GpuError::Driver(format!(
+                "expert disk backing: {distinct} distinct experts over {} slots",
+                lru.expert_in.len()
             )));
         }
         // the previous fill's copies are done by now in practice (the caller
@@ -577,6 +597,67 @@ pub(crate) struct MoeDiskBacking {
     /// `None` only if seating failed part-way; the model is then reloaded.
     state: Mutex<Option<Seat>>,
     scratch: Mutex<Scratch>,
+    /// Set by the first `seat`.
+    routing: OnceLock<DiskRouting>,
+}
+
+/// One launch's slot routing on the device, shared by every layer (they run
+/// one at a time): each pair's slot, `MOE_CACHE_NONE` outside the wave, and
+/// for a wave its pair and token lists with their counts, as the LIST pair
+/// kernels take them.
+pub(crate) struct DiskRouting {
+    pub(crate) slots: CudaSlice<u32>,
+    pub(crate) pairs: CudaSlice<u32>,
+    pub(crate) n_pairs: CudaSlice<u32>,
+    pub(crate) tokens: CudaSlice<u32>,
+    pub(crate) n_tokens: CudaSlice<u32>,
+}
+
+impl DiskRouting {
+    fn new(exec: &GpuExecutor, max_rows: usize, max_tokens: usize) -> Result<Self, GpuError> {
+        Ok(Self {
+            slots: exec.to_device_u32(&vec![MOE_CACHE_NONE; max_rows])?,
+            pairs: exec.to_device_u32(&vec![0; max_rows])?,
+            n_pairs: exec.to_device_u32(&[0])?,
+            tokens: exec.to_device_u32(&vec![0; max_tokens])?,
+            n_tokens: exec.to_device_u32(&[0])?,
+        })
+    }
+
+    /// Upload `slots`, and a wave's `pairs` and `tokens` with their counts.
+    fn upload(
+        &self,
+        exec: &GpuExecutor,
+        slots: &[u32],
+        wave: Option<(&[u32], &[u32])>,
+    ) -> Result<(), GpuError> {
+        htod(exec, &self.slots, slots)?;
+        if let Some((pairs, tokens)) = wave {
+            htod(exec, &self.pairs, pairs)?;
+            htod(exec, &self.tokens, tokens)?;
+            htod(exec, &self.n_pairs, &[pairs.len() as u32])?;
+            htod(exec, &self.n_tokens, &[tokens.len() as u32])?;
+        }
+        Ok(())
+    }
+}
+
+/// Copy `src` to the head of `dst` in stream order.
+fn htod(exec: &GpuExecutor, dst: &CudaSlice<u32>, src: &[u32]) -> Result<(), GpuError> {
+    if src.len() > dst.len() {
+        return Err(GpuError::Driver(format!(
+            "expert disk backing: {} routing words over a {}-word buffer",
+            src.len(),
+            dst.len()
+        )));
+    }
+    let (p, _g) = dst.device_ptr(&exec.stream);
+    // SAFETY: `dst` holds at least `src.len()` u32s (checked above), and the
+    // copy is ordered on the stream after every kernel already reading it.
+    // `src` is pageable memory, which the driver stages before returning, so
+    // the caller may reuse or free it at once.
+    unsafe { cudarc::driver::result::memcpy_htod_async(p, src, exec.stream.cu_stream()) }
+        .map_err(super::error::from_driver)
 }
 
 impl MoeDiskBacking {
@@ -594,6 +675,7 @@ impl MoeDiskBacking {
             layouts,
             state: Mutex::new(Some(Seat::Open(store))),
             scratch: Mutex::new(Scratch::default()),
+            routing: OnceLock::new(),
         })
     }
 
@@ -605,17 +687,41 @@ impl MoeDiskBacking {
             .sum()
     }
 
-    /// Seat `slots` per layer: the caches' LRUs and the pinned staging pool.
+    /// Seat `slots` per layer: the caches' LRUs, the pinned staging pool,
+    /// and routing for launches of up to `max_tokens` tokens at top-`n_active`.
     /// Returns one slot cache per layer, in layer order.
     pub(crate) fn seat(
         &self,
         exec: &GpuExecutor,
         slots: usize,
-        max_rows: usize,
+        max_tokens: usize,
+        n_active: usize,
     ) -> Result<Vec<ExpertCache>, GpuError> {
+        // the prefill waves' pair kernels, checked here rather than mid-request
+        if exec.kernels.kquant_moe_gate_up_list.is_none() {
+            return Err(GpuError::MissingOp("kquant_moe_gate_up_list"));
+        }
+        if exec.kernels.kquant_moe_down_list.is_none() {
+            return Err(GpuError::MissingOp("kquant_moe_down_list"));
+        }
+        let max_rows = max_tokens * n_active;
+        match self.routing.get() {
+            Some(r) if r.slots.len() < max_rows || r.tokens.len() < max_tokens => {
+                return Err(GpuError::Driver(format!(
+                    "expert disk backing: seated for {} routed rows, asked for {max_rows}",
+                    r.slots.len()
+                )));
+            }
+            Some(_) => {}
+            None => {
+                let _ = self
+                    .routing
+                    .set(DiskRouting::new(exec, max_rows, max_tokens)?);
+            }
+        }
         let mut caches = Vec::with_capacity(self.layouts.len());
         for l in &self.layouts {
-            caches.push(exec.new_expert_cache_for_disk(l.clone(), slots, max_rows)?);
+            caches.push(exec.new_expert_cache_for_disk(l.clone(), slots)?);
         }
         let mut state = lock(&self.state);
         // a re-seat starts from empty slots
@@ -646,8 +752,7 @@ impl MoeDiskBacking {
     /// Plan one launch of `layer`: download its `rows` routed ids from `idx`
     /// (a host sync) and assign its experts to waves that fit the cache.
     /// Returns the wave count; each wave is then served by [`fill_wave`] and
-    /// the caller's expert kernels: over `idx_slot` when there is one wave,
-    /// over the cache's wave lists otherwise.
+    /// the caller's expert kernels over the routing it returns.
     ///
     /// [`fill_wave`]: MoeDiskBacking::fill_wave
     pub(crate) fn plan(
@@ -662,6 +767,7 @@ impl MoeDiskBacking {
             x.settle(&mut CacheCopier { exec, cache })?;
         }
         let mut sc = lock(&self.scratch);
+        sc.n_waves = 0;
         sc.ids = exec.to_host_u32_len(idx, rows)?;
         let Scratch { ids, wave_of, .. } = &mut *sc;
         let n = plan_waves(ids, n_active, cache.n_expert, cache.slots, wave_of)?;
@@ -670,9 +776,9 @@ impl MoeDiskBacking {
     }
 
     /// Fill wave `wave` (from the last `plan`) of `layer` into `cache` and
-    /// upload its routing: every row's slot into `idx_slot` when the launch
-    /// has one wave, else the wave's routing (its pairs to their slots, the
-    /// rest absent), pair list and token list into the cache's wave buffers.
+    /// upload its routing: every row's slot when the launch has one wave,
+    /// else the wave's (its pairs to their slots, the rest absent) with its
+    /// pair and token lists.
     pub(crate) fn fill_wave(
         &self,
         exec: &GpuExecutor,
@@ -680,7 +786,8 @@ impl MoeDiskBacking {
         layer: usize,
         n_active: usize,
         wave: usize,
-    ) -> Result<(), GpuError> {
+    ) -> Result<&DiskRouting, GpuError> {
+        let dr = self.routing.get().ok_or(MoeDiskRefusal::NoCache)?;
         let mut state = lock(&self.state);
         let Some(Seat::Seated(x)) = &mut *state else {
             return Err(MoeDiskRefusal::NoCache.into());
@@ -707,7 +814,8 @@ impl MoeDiskBacking {
             slots.clear();
             slots.resize(ids.len(), MOE_CACHE_NONE);
             x.fill(layer, ids, slots, &mut dev)?;
-            return cache.upload_routing(exec, slots);
+            dr.upload(exec, slots, None)?;
+            return Ok(dr);
         }
         let w = wave as u32;
         pairs.clear();
@@ -731,7 +839,8 @@ impl MoeDiskBacking {
         for (&p, &s) in pairs.iter().zip(slots.iter()) {
             routing[p as usize] = s;
         }
-        cache.upload_wave(exec, routing, pairs, tokens)
+        dr.upload(exec, routing, Some((pairs, tokens)))?;
+        Ok(dr)
     }
 }
 
@@ -1036,7 +1145,7 @@ mod tests {
         let mut x = experts(&path, 4, 4);
         let mut dev = FakeDevice::new(4);
         let mut slot_rows = [MOE_CACHE_NONE; 3];
-        // 1 reads fine and is enqueued, 2 fails: the whole chunk fails
+        // 1 reads fine and is enqueued, 2 fails: the whole fill fails
         assert!(x.fill(0, &[1, 2, 6], &mut slot_rows, &mut dev).is_err());
         assert!(x.lru[0].slot_of.iter().all(|&s| s == MOE_CACHE_NONE));
         assert!(x.lru[0].expert_in.iter().all(|&e| e == MOE_CACHE_NONE));
@@ -1093,6 +1202,15 @@ mod tests {
         assert!(
             x.fill(0, &[1], &mut slot_rows, &mut dev).is_err(),
             "row count"
+        );
+        let mut five = [MOE_CACHE_NONE; 5];
+        assert!(
+            x.fill(0, &[0, 1, 2, 3, 4], &mut five, &mut dev).is_err(),
+            "more distinct experts than slots"
+        );
+        assert!(
+            x.fill(0, &[1, 8], &mut slot_rows, &mut dev).is_err(),
+            "expert id"
         );
         let store = || DiskExpertStore::open(&path, &ID, &layouts()).expect("open");
         let pool = |len| StagingPool::new(1, len, |n| Ok(vec![0u8; n])).expect("pool");

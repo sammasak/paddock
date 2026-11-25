@@ -300,14 +300,14 @@ impl GpuExecutor {
 
     /// A `slots`-expert cache whose misses the disk backing fills from the
     /// host (`moe_disk.rs`): same slot planes, no device-side fill sources.
-    /// `max_rows` bounds the routing a launch uploads.
+    /// Its launches route through the backing's shared buffers, so the
+    /// cache's own routing scratch is one row.
     pub(super) fn new_expert_cache_for_disk(
         &self,
         layout: ExpertLayerLayout,
         slots: usize,
-        max_rows: usize,
     ) -> Result<ExpertCache, GpuError> {
-        self.new_expert_cache_from_layout(layout, None, slots, max_rows)
+        self.new_expert_cache_from_layout(layout, None, slots, 1)
     }
 
     // Keep the existing pinned-host fill descriptors and kernel ABI intact.
@@ -573,66 +573,6 @@ impl GpuExecutor {
                 self.stream_ptr(),
             )
         })
-    }
-}
-
-impl ExpertCache {
-    /// Upload one launch's slot routing (`rows` ids, `MOE_CACHE_NONE` for an
-    /// absent pair) into `idx_slot`, in stream order. From pageable memory
-    /// the driver stages `rows` before returning, so the caller may reuse it.
-    pub(super) fn upload_routing(&self, exec: &GpuExecutor, rows: &[u32]) -> Result<(), GpuError> {
-        if rows.len() > self.max_rows {
-            return Err(GpuError::Driver(format!(
-                "expert cache: {} routed rows over {} scratch rows",
-                rows.len(),
-                self.max_rows
-            )));
-        }
-        let (ip, _g) = self.idx_slot.device_ptr(&exec.stream);
-        // SAFETY: `idx_slot` holds max_rows >= rows.len() u32s, and the copy
-        // is ordered on the stream after every kernel already reading it.
-        unsafe { cudarc::driver::result::memcpy_htod_async(ip, rows, exec.stream.cu_stream()) }
-            .map_err(super::error::from_driver)
-    }
-
-    /// Upload one wave of a disk-backed launch: `routing` (every pair's slot,
-    /// `MOE_CACHE_NONE` outside the wave) into `idx_wave`, and the wave's
-    /// `pairs` and `tokens` with their counts into the lists the LIST pair
-    /// kernels stride over.
-    pub(super) fn upload_wave(
-        &self,
-        exec: &GpuExecutor,
-        routing: &[u32],
-        pairs: &[u32],
-        tokens: &[u32],
-    ) -> Result<(), GpuError> {
-        if routing.len() > self.max_rows
-            || pairs.len() > routing.len()
-            || tokens.len() > pairs.len()
-        {
-            return Err(GpuError::Driver(format!(
-                "expert cache: a wave of {} pairs over {} routed rows ({} scratch rows)",
-                pairs.len(),
-                routing.len(),
-                self.max_rows
-            )));
-        }
-        let counts = [pairs.len() as u32, tokens.len() as u32];
-        for (dst, src) in [
-            (&self.idx_wave, routing),
-            (&self.pairs_w, pairs),
-            (&self.rows_w, tokens),
-            (&self.n_pairs_w, &counts[..1]),
-            (&self.n_rows_w, &counts[1..]),
-        ] {
-            let (p, _g) = dst.device_ptr(&exec.stream);
-            // SAFETY: each destination holds at least `src.len()` u32s (checked
-            // above; the counts are one element each), and the copy is ordered
-            // on the stream after every kernel already reading it.
-            unsafe { cudarc::driver::result::memcpy_htod_async(p, src, exec.stream.cu_stream()) }
-                .map_err(super::error::from_driver)?;
-        }
-        Ok(())
     }
 }
 
