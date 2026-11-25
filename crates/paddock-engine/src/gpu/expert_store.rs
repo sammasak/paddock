@@ -412,13 +412,14 @@ impl DiskExpertStore {
             .ok_or_else(overflow)
     }
 
-    /// Read `expert` of `layer` into `dst` (exactly one record long) and
-    /// verify it against its digest.
+    /// Read `expert` of `layer` into `dst` (exactly one record long) and,
+    /// when `verify`, check it against its digest.
     pub(super) fn read_expert(
         &self,
         layer: usize,
         expert: usize,
         dst: &mut [u8],
+        verify: bool,
     ) -> io::Result<()> {
         let off = self.record_offset(layer, expert)?;
         let len = self.extents.layers[layer].1;
@@ -430,7 +431,7 @@ impl DiskExpertStore {
         }
         pread_exact(&self.file, dst, off)?;
         let at = (layer * self.n_expert + expert) * DIGEST as usize;
-        if blake3::hash(dst).as_bytes()[..] != self.digests[at..at + DIGEST as usize] {
+        if verify && blake3::hash(dst).as_bytes()[..] != self.digests[at..at + DIGEST as usize] {
             return Err(invalid(format!(
                 "expert artifact: layer {layer} expert {expert} fails its digest"
             )));
@@ -604,7 +605,7 @@ mod tests {
             // reverse order: reads are positioned, not sequential
             for e in (0..N_EXPERT).rev() {
                 let mut buf = vec![0u8; len];
-                s.read_expert(l, e, &mut buf).expect("read");
+                s.read_expert(l, e, &mut buf, true).expect("read");
                 assert_eq!(buf, record(&ls, l, e), "layer {l} expert {e}");
             }
         }
@@ -689,23 +690,23 @@ mod tests {
         let s = DiskExpertStore::open(&path, &ID, &ls).expect("length is unchanged");
         let mut buf = vec![0u8; len0 as usize];
         assert_eq!(
-            kind(s.read_expert(0, 2, &mut buf)),
+            kind(s.read_expert(0, 2, &mut buf, true)),
             io::ErrorKind::InvalidData
         );
-        s.read_expert(0, 1, &mut buf)
+        s.read_expert(0, 1, &mut buf, true)
             .expect("neighbour still reads");
         assert_eq!(buf, record(&ls, 0, 1));
         assert_eq!(
-            kind(s.read_expert(0, N_EXPERT, &mut buf)),
+            kind(s.read_expert(0, N_EXPERT, &mut buf, true)),
             io::ErrorKind::InvalidData
         );
         assert_eq!(
-            kind(s.read_expert(2, 0, &mut buf)),
+            kind(s.read_expert(2, 0, &mut buf, true)),
             io::ErrorKind::InvalidData
         );
         let mut short = vec![0u8; len0 as usize - 1];
         assert_eq!(
-            kind(s.read_expert(0, 0, &mut short)),
+            kind(s.read_expert(0, 0, &mut short, true)),
             io::ErrorKind::InvalidData
         );
     }

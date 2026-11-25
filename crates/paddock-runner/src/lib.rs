@@ -338,6 +338,7 @@ pub async fn run(
             host_cache_bytes: mo
                 .host_cache_gb
                 .map_or(0, |g| (g.max(0.0) * (1u64 << 30) as f64) as u64),
+            verify_once: mo.verify_once,
         });
         tracing::info!(
             artifact = %artifact.display(),

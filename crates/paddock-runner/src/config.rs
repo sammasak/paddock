@@ -37,6 +37,9 @@ pub struct KvOffload {
 /// size of the expert tensors) and checked against the model on every load.
 /// It serves one sequence on the serial loop (`max_batch` must be 1).
 /// `host_cache_gb` keeps that many GiB of hot expert records in pinned RAM.
+/// `verify_once` checks each record's digest on its first read only (decode
+/// about 30% faster on a 3070; a record that rots after its first read in
+/// the process goes unnoticed, as with any mmapped weight).
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MoeOffload {
@@ -44,6 +47,7 @@ pub struct MoeOffload {
     pub vram_gb: Option<f64>,
     pub disk_artifact: Option<PathBuf>,
     pub host_cache_gb: Option<f64>,
+    pub verify_once: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]

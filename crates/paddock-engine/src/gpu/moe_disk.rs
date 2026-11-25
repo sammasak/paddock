@@ -103,6 +103,9 @@ pub struct MoeDiskStats {
     pub wait_time: Duration,
     /// Misses served from the host tier (no disk read).
     pub tier_hits: u64,
+    /// Records read whose digest was checked (all of them unless
+    /// verify-once is on).
+    pub digests_checked: u64,
 }
 
 /// Host-side LRU over one layer's slots: the state the resolve kernel keeps
@@ -394,6 +397,10 @@ pub(super) struct DiskExperts<B, M> {
     jobs: Vec<MissJob>,
     /// Threads a fill reads its misses on.
     readers: usize,
+    /// Verify-once (`[moe_offload] verify_once`): per layer, the
+    /// experts whose record already passed its digest check in this
+    /// process; `None` checks every read.
+    verified: Option<Vec<Vec<bool>>>,
     broken: bool,
     stats: MoeDiskStats,
 }
@@ -432,6 +439,8 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>, M> DiskExperts<B, M> {
             )));
         }
         let tier = HostTier::new(tier, lru.iter().map(|l| l.slot_of.len()).collect());
+        let verified = super::moe_cache::moe_disk_verify_once()
+            .then(|| lru.iter().map(|l| vec![false; l.slot_of.len()]).collect());
         Ok(Self {
             store,
             pool,
@@ -440,6 +449,7 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>, M> DiskExperts<B, M> {
             in_flight: VecDeque::new(),
             jobs: Vec::new(),
             readers,
+            verified,
             broken: false,
             stats: MoeDiskStats::default(),
         })
@@ -574,6 +584,15 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>, M> DiskExperts<B, M> {
                 .filter(|(_, s)| !matches!(s, Src::Hit(_)))
                 .map(|(j, _)| *j)
                 .collect();
+            // with verify-once, a record's digest is checked on its first read
+            let verify: Vec<bool> = reads
+                .iter()
+                .map(|j| {
+                    self.verified
+                        .as_ref()
+                        .is_none_or(|v| !v[layer][j.expert as usize])
+                })
+                .collect();
             let t0 = Instant::now();
             let read = {
                 let store = &self.store;
@@ -594,7 +613,7 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>, M> DiskExperts<B, M> {
                         Src::Staging(_) => staged.next(),
                     })
                     .collect();
-                read_records(store, layer, &reads, &mut bufs, len, self.readers)
+                read_records(store, layer, &reads, &verify, &mut bufs, len, self.readers)
             };
             self.stats.read_time += t0.elapsed();
             if let Err(e) = read {
@@ -612,6 +631,12 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>, M> DiskExperts<B, M> {
                     self.tier.pending[b] -= 1;
                 }
                 return Err(GpuError::ExpertIo(e));
+            }
+            self.stats.digests_checked += verify.iter().filter(|&&v| v).count() as u64;
+            if let Some(v) = &mut self.verified {
+                for j in &reads {
+                    v[layer][j.expert as usize] = true;
+                }
             }
             self.stats.misses += reads.len() as u64;
             self.stats.bytes_read += (reads.len() * len) as u64;
@@ -726,29 +751,34 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>, M> DiskExperts<B, M> {
 
 /// Read the records of `jobs` into `bufs` (one each, `len` bytes used),
 /// spread over up to `readers` threads: positioned reads share the file, and
-/// each thread verifies its own records' digests.
+/// each thread checks the digests of its records whose `verify` is set.
 fn read_records(
     store: &DiskExpertStore,
     layer: usize,
     jobs: &[MissJob],
+    verify: &[bool],
     bufs: &mut [&mut [u8]],
     len: usize,
     readers: usize,
 ) -> std::io::Result<()> {
-    let read = |jobs: &[MissJob], bufs: &mut [&mut [u8]]| {
+    let read = |jobs: &[MissJob], verify: &[bool], bufs: &mut [&mut [u8]]| {
         jobs.iter()
+            .zip(verify)
             .zip(bufs.iter_mut())
-            .try_for_each(|(j, b)| store.read_expert(layer, j.expert as usize, &mut b[..len]))
+            .try_for_each(|((j, &v), b)| {
+                store.read_expert(layer, j.expert as usize, &mut b[..len], v)
+            })
     };
     let per = jobs.len().div_ceil(readers.max(1));
     if per >= jobs.len() {
-        return read(jobs, bufs);
+        return read(jobs, verify, bufs);
     }
     std::thread::scope(|s| {
         let threads: Vec<_> = jobs
             .chunks(per)
+            .zip(verify.chunks(per))
             .zip(bufs.chunks_mut(per))
-            .map(|(j, b)| s.spawn(move || read(j, b)))
+            .map(|((j, v), b)| s.spawn(move || read(j, v, b)))
             .collect();
         // a panicked reader is a failed read: the fill invalidates its slots
         threads.into_iter().try_for_each(|t| {
@@ -1878,6 +1908,33 @@ mod tests {
             0,
             "copies with no mark are never reused"
         );
+    }
+
+    #[test]
+    fn verify_once_checks_a_record_on_its_first_read_only() {
+        let path = artifact("verify-once");
+        let mut x = experts(&path, 4, 4);
+        x.verified = Some(vec![vec![false; N_EXPERT]; 2]);
+        let mut dev = FakeDevice::new(4);
+        fill_and_check(&mut x, &mut dev, 0, &[1]);
+        // 2-5 take every slot, so 1 is read again
+        fill_and_check(&mut x, &mut dev, 0, &[2, 3, 4, 5]);
+        fill_and_check(&mut x, &mut dev, 0, &[1]);
+        let s = x.stats();
+        assert_eq!(
+            (s.misses, s.digests_checked),
+            (6, 5),
+            "1's second read skips its digest"
+        );
+        // a record corrupt on disk still fails its first read
+        let mut bytes = std::fs::read(&path).expect("read back");
+        let at = x.store().record_offset(0, 6).expect("offset") as usize;
+        bytes[at] ^= 0x01;
+        std::fs::write(&path, &bytes).expect("rewrite");
+        let mut x = experts(&path, 4, 4);
+        x.verified = Some(vec![vec![false; N_EXPERT]; 2]);
+        let mut slot = [MOE_CACHE_NONE; 1];
+        assert!(x.fill(0, &[6], &mut slot, &mut dev).is_err());
     }
 
     #[test]

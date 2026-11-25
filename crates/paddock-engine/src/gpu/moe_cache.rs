@@ -61,6 +61,9 @@ pub struct MoeDiskCfg {
     pub artifact: std::path::PathBuf,
     /// Pinned host tier of hot expert records (0 = none).
     pub host_cache_bytes: u64,
+    /// Check each expert record's digest on its first read in the process
+    /// only, not on every read.
+    pub verify_once: bool,
 }
 
 static MOE_DISK: std::sync::OnceLock<MoeDiskCfg> = std::sync::OnceLock::new();
@@ -80,6 +83,15 @@ pub fn moe_disk_artifact() -> Option<std::path::PathBuf> {
         .filter(|v| !v.is_empty())
         .map(Into::into)
         .or_else(|| MOE_DISK.get().map(|c| c.artifact.clone()))
+}
+
+/// Verify-once for the disk backing: `[moe_offload] verify_once`, or
+/// `PADDOCK_MOE_DISK_VERIFY_ONCE=1` (development switch, wins).
+pub(crate) fn moe_disk_verify_once() -> bool {
+    match paddock_models::dev_var_os!("PADDOCK_MOE_DISK_VERIFY_ONCE") {
+        Some(v) => v != "0",
+        None => MOE_DISK.get().is_some_and(|c| c.verify_once),
+    }
 }
 
 /// Bytes of the disk backing's host tier: `[moe_offload] host_cache_gb`, or
