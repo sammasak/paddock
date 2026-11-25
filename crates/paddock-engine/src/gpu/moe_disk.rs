@@ -34,7 +34,7 @@ use super::host_plane::PinnedBuf;
 use super::moe_cache::{
     CacheCopier, ExpertCache, ExpertLayerLayout, ExpertPlaneLayout, MOE_CACHE_NONE,
 };
-use super::{GpuError, GpuExecutor, HostMappedKq};
+use super::{GpuError, GpuExecutor};
 
 /// Routed rows one disk-backed launch serves at most: a prompt is split into
 /// token ranges of at most this many `(token, expert)` pairs, which also
@@ -524,30 +524,63 @@ pub(crate) fn expert_identity(
     Ok(*h.finalize().as_bytes())
 }
 
-/// Write the artifact for `layers` (gate, up, down per MoE layer, in layer
-/// order) from pinned planes, one expert record at a time.
+/// Write the artifact for the expert tensors `names` (gate, up, down per MoE
+/// layer, in layer order) straight from the GGUF. One layer's planes are
+/// repacked in VRAM at a time and copied down one expert record at a time,
+/// so host memory holds one record whatever the model's size, and nothing
+/// has to fit page-locked RAM.
 pub(crate) fn write_expert_artifact(
+    exec: &GpuExecutor,
+    map: &MappedGguf,
+    names: &[String],
     path: &Path,
-    identity: &Identity,
-    layers: &[[&HostMappedKq; 3]],
 ) -> Result<(), GpuError> {
-    let layouts = layers
-        .iter()
-        .map(|[g, u, d]| ExpertLayerLayout::from_pinned(g, u, d))
+    if names.is_empty() || !names.len().is_multiple_of(3) {
+        return Err(GpuError::Unsupported(
+            "expert artifact: want gate, up and down names per MoE layer".into(),
+        ));
+    }
+    let seat = |name: &String| match exec.kq_expert_layout(map, name)? {
+        Some(l) => Ok(l),
+        None => Err(GpuError::from(MoeDiskRefusal::Quant(
+            map.tensor_bytes(name)?.0.ggml_type,
+        ))),
+    };
+    let layouts = names
+        .chunks(3)
+        .map(|n| ExpertLayerLayout::new([seat(&n[0])?, seat(&n[1])?, seat(&n[2])?]))
         .collect::<Result<Vec<_>, _>>()?;
-    let mut w = super::expert_store::ExpertArtifactWriter::create(path, identity, &layouts)
+    let id = expert_identity(map, names, exec.pack_version())?;
+    let mut w = super::expert_store::ExpertArtifactWriter::create(path, &id, &layouts)
         .map_err(GpuError::ExpertIo)?;
     let mut record = Vec::new();
-    for (planes, layout) in layers.iter().zip(&layouts) {
-        let per = layout.stream_bytes();
-        for e in 0..layout.n_expert() {
-            record.clear();
-            for (i, p) in planes.iter().enumerate() {
-                let (data, scales) = p.host_streams();
-                let (nd, ns) = (per[2 * i], per[2 * i + 1]);
-                record.extend_from_slice(&data[e * nd..(e + 1) * nd]);
-                record.extend_from_slice(&scales[e * ns..(e + 1) * ns]);
+    for (layer, layout) in names.chunks(3).zip(&layouts) {
+        let mut planes = Vec::with_capacity(3);
+        for (name, want) in layer.iter().zip(&layout.planes) {
+            let p = exec
+                .try_repack_kquant(map, name)?
+                .ok_or_else(|| GpuError::Unsupported(format!("{name}: not a k-quant plane")))?;
+            if ExpertPlaneLayout::new(&p.dims, p.ty, p.data.len(), p.scales.len())? != *want {
+                return Err(GpuError::Driver(format!(
+                    "expert artifact: {name} repacked to a geometry its layout does not predict"
+                )));
             }
+            planes.push(p);
+        }
+        let per = layout.stream_bytes();
+        record.resize(per.iter().sum(), 0);
+        for e in 0..layout.n_expert() {
+            let mut at = 0;
+            for (i, p) in planes.iter().enumerate() {
+                for (j, s) in [&p.data, &p.scales].into_iter().enumerate() {
+                    let n = per[2 * i + j];
+                    exec.stream
+                        .memcpy_dtoh(&s.slice(e * n..(e + 1) * n), &mut record[at..at + n])
+                        .map_err(super::from_driver)?;
+                    at += n;
+                }
+            }
+            exec.stream.synchronize().map_err(super::from_driver)?;
             w.push_expert(&record).map_err(GpuError::ExpertIo)?;
         }
     }

@@ -1,11 +1,12 @@
 //! MoE expert offload with disk backing (PADDOCK_MOE_DISK) on the serial
 //! path, against the pinned backing (PADDOCK_MOE_HOST) on the same 35B-A3B
-//! UD file. Two gates, each run alone (`--exact`): the expert switches are
+//! UD file. Four gates, each run alone (`--exact`): the expert switches are
 //! process-wide, and the disk gate's peak RSS must be its own.
 //!
-//! 1. `moe_disk_write_artifact` - pinned load; writes the artifact named by
-//!    QWEN36_MOE_DISK_ARTIFACT (kept if it exists) and a pinned reference
-//!    beside it (`<artifact>.ref`: prefill logits + greedy tokens).
+//! 1. `moe_disk_write_artifact` - writes the artifact named by
+//!    QWEN36_MOE_DISK_ARTIFACT from the GGUF (kept if it exists), then a
+//!    pinned load writes a reference beside it (`<artifact>.ref`: prefill
+//!    logits + greedy tokens).
 //! 2. `moe_disk_parity_and_measure` - disk load; the same prompt must give
 //!    the reference's logits and tokens bit for bit, then one cold and
 //!    QWEN36_MOE_DISK_WARM warm runs report TTFT, prefill and decode tok/s,
@@ -209,6 +210,30 @@ fn moe_disk_write_artifact() {
     let Some((model, artifact, exec)) = setup() else {
         return;
     };
+    assert!(
+        std::env::var_os("PADDOCK_MOE_DISK").is_none(),
+        "the reference must run on the pinned backing"
+    );
+    let map = MappedGguf::open(&model).expect("open gguf");
+    // Written before the pinned load, so the write never shares the host
+    // with the pinned experts.
+    if artifact.exists() {
+        eprintln!(
+            "artifact {} exists - kept, the writer did not run",
+            artifact.display()
+        );
+    } else {
+        let t = Instant::now();
+        GpuQwen35::write_expert_artifact(&exec, &map, &artifact).expect("write artifact");
+        let len = std::fs::metadata(&artifact).expect("artifact").len();
+        eprintln!(
+            "artifact written: {:.2} GiB in {:.1}s, peak RSS (VmHWM): {:?} KiB",
+            len as f64 / (1u64 << 30) as f64,
+            t.elapsed().as_secs_f64(),
+            proc_field("/proc/self/status", "VmHWM:")
+        );
+    }
+    drop_page_cache(&artifact);
     // SAFETY: as in setup. The reference prefill runs eager like the disk
     // path: a captured prefill cannot seat the pack's split-K router scratch
     // on a small die and the capture fails with CUDA error 2 (R6, 600 tokens).
@@ -216,23 +241,9 @@ fn moe_disk_write_artifact() {
         std::env::set_var("PADDOCK_MOE_HOST", "1");
         std::env::set_var("PADDOCK_NO_PREFILL_GRAPH", "1");
     }
-    let map = MappedGguf::open(&model).expect("open gguf");
     let mut m = GpuQwen35::load(exec, &map, MAX_CTX).expect("load pinned");
     let slots = m.enable_moe_cache(u64::MAX).expect("seat expert cache");
     eprintln!("pinned: {slots} slots/layer");
-    if artifact.exists() {
-        eprintln!("artifact {} exists - kept", artifact.display());
-    } else {
-        let t = Instant::now();
-        m.write_expert_artifact(&map, &artifact)
-            .expect("write artifact");
-        let len = std::fs::metadata(&artifact).expect("artifact").len();
-        eprintln!(
-            "artifact written: {:.2} GiB in {:.1}s",
-            len as f64 / (1u64 << 30) as f64,
-            t.elapsed().as_secs_f64()
-        );
-    }
     let (logits, tokens) = run(&mut m, &prompt(PARITY_PROMPT), PARITY_TOKENS);
     eprintln!("pinned tokens {tokens:?}");
     write_ref(&ref_path(&artifact), &logits, &tokens);
