@@ -50,6 +50,8 @@ Final serve config (`w/serve/paddock.toml`: the block above plus `vram_budget = 
 
 Limits seen: max_ctx 8192 does not fit (prefill scratch for the whole prompt, 3.96 GB); a cold prompt of a few hundred tokens reads most of the artifact (TTFT about 12 s at 300 tokens).
 
+Review of the serve change (one subagent pass): serial fallback, non-disk behaviour and verify_once sound. Fixed after it: `max_batch > 1` with `disk_artifact` now refuses before any load: "[moe_offload] disk_artifact serves one sequence on the serial loop, but max_batch = 2: set max_batch = 1, or drop disk_artifact to serve with pinned backing" (checked on asus); a stale `<artifact>.partial` names itself and the way out; Metal refuses disk_artifact; `enabled = false` with disk_artifact warns; an unknown VRAM headroom is an error; the decode pipe is off on disk. Open: no parent-directory fsync after the artifact rename; image requests on an mmproj model get only the 512 MiB margin.
+
 ## Current state (head of asus/ssd-expert-backing), against the PR 2 checklist
 
 Each line points at the run below that proves it; logs are in `~/paddock-runs/w/logs` on asus.
