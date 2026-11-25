@@ -1,6 +1,6 @@
 //! MoE expert offload with disk backing (PADDOCK_MOE_DISK) on the serial
 //! path, against the pinned backing (PADDOCK_MOE_HOST) on the same 35B-A3B
-//! UD file. Four gates, each run alone (`--exact`): the expert switches are
+//! UD file. Five gates, each run alone (`--exact`): the expert switches are
 //! process-wide, and the disk gate's peak RSS must be its own.
 //!
 //! 1. `moe_disk_write_artifact` - writes the artifact named by
@@ -17,6 +17,9 @@
 //!    like-for-like baseline (pinned replays its graphs, disk runs eager).
 //! 4. `moe_disk_refuses_a_foreign_artifact` - a file that is not this
 //!    model's artifact fails the load with a sentence naming it.
+//! 5. `moe_disk_refuses_what_it_cannot_serve` - fewer slots than top-k,
+//!    DFlash, graph replay and batched serving each refuse with a sentence
+//!    naming the cause, and the model still serves afterwards.
 //!
 //! Both pin the token-batched expert class (PADDOCK_NO_SORTED_QMOE=1): the
 //! disk path serves a launch whose experts fit the slots through it, so that
@@ -433,4 +436,46 @@ fn moe_disk_refuses_a_foreign_artifact() {
         err.is_some_and(|e| e.contains("expert artifact") && e.contains("pdk-foreign")),
         "a foreign artifact must fail the load naming the file"
     );
+}
+
+#[test]
+fn moe_disk_refuses_what_it_cannot_serve() {
+    let Some((model, artifact, exec)) = setup() else {
+        return;
+    };
+    // SAFETY: as in setup.
+    unsafe {
+        std::env::set_var("PADDOCK_MOE_DISK", &artifact);
+        std::env::set_var("PADDOCK_MOE_CACHE_SLOTS", "4");
+    }
+    let map = MappedGguf::open(&model).expect("open gguf");
+    let mut m = GpuQwen35::load(exec, &map, MAX_CTX).expect("load disk-backed");
+    let few = m.enable_moe_cache(u64::MAX).err().map(|e| e.to_string());
+    eprintln!("4 slots at top-8: {few:?}");
+    assert!(
+        few.is_some_and(|e| e.contains("at least 8") && e.contains("buys 4")),
+        "fewer slots than top-k must refuse"
+    );
+    // SAFETY: as in setup.
+    unsafe { std::env::set_var("PADDOCK_MOE_CACHE_SLOTS", "32") };
+    m.enable_moe_cache(u64::MAX).expect("seat expert cache");
+    let refusals = [
+        (
+            "DFlash",
+            m.attach_dflash(Path::new("/nonexistent-drafter")).err(),
+        ),
+        ("CUDA graph", m.bench_decode_ms(&[760], 1, 1).err()),
+        ("batched serving", m.enable_batch(1).err()),
+    ];
+    for (what, err) in refusals {
+        let err = err.map(|e| e.to_string());
+        eprintln!("{what}: {err:?}");
+        assert!(
+            err.is_some_and(|e| e.contains(what) && e.contains("pinned backing")),
+            "{what} must refuse disk-backed experts with the way out"
+        );
+    }
+    // a refusal leaves the model serving
+    let (_, tokens) = run(&mut m, &[760], 4);
+    eprintln!("after the refusals: {tokens:?}");
 }
