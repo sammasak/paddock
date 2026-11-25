@@ -4,10 +4,51 @@ Host: i9-10900K, 32 GiB RAM, RTX 3070 8 GiB (46 SMs, sm_86, PCIe 3.0 x16), Kings
 Model: Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf. Pack: paddock-cuda-sm86-0.1.21 (nix store). Branch: asus/ssd-expert-backing.
 Run helper: ~/paddock-runs/w/run.sh (systemd-run MemoryMax cap, swap off, nvidia-smi every 200 ms); logs in ~/paddock-runs/w/logs.
 
+## Serving recipe (the Pi model on asus: Qwen3.6-35B-A3B, pinned expert offload, 32K context)
+
+Build (in the checkout, dev shell from PR 1; about 2.5 min):
+```
+cd ~/paddock && nix develop ~/paddock-devshell --command cargo build --release --locked -p paddock-runner --no-default-features
+```
+Binary: `~/paddock/target/release/paddock-runner` (68 MB, built from asus/ssd-expert-backing 3334408; `--no-default-features` drops PDF rendering, which needs the PDFium archive). Kernel pack: `/nix/store/agnxcsrh0jbx4vbqkg6kwg4zzpi3jm0p-paddock-cuda-sm86-0.1.21/lib/paddock/pd-cuda-sm86.so` (the PR 1 flake's `packages.x86_64-linux.paddock-cuda-sm86`).
+
+Files:
+- Model: `/home/lukas/paddock-runs/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf`, 22360456160 bytes (20.8 GiB), sha256 `707a55a8a4397ecde44de0c499d3e68c1ad1d240d1da65826b4949d1043f4450`.
+- Disk artifact (only for the disk-backed serve, not the Pi model): `/home/lukas/paddock-runs/paddock-ssd-art/qwen36-35b-a3b-ud-q4kxl.pdxa`, 20669863152 bytes (19.25 GiB); written from the GGUF on the first disk-backed start if missing (about 70 s).
+
+Config (`paddock.toml`):
+```toml
+host = "127.0.0.1"
+port = 11540
+model = "/home/lukas/paddock-runs/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"
+max_ctx = 32768
+max_batch = 1
+vram_budget = 7500
+prefill_chunk_rows = 1024
+
+[moe_offload]
+enabled = true
+```
+
+Command (as on asus today, a user unit; the Nix service replaces the systemd-run wrapper):
+```
+systemd-run --user --unit=paddock-serve --collect -p MemoryMax=26G -p MemorySwapMax=0 \
+  -E LD_LIBRARY_PATH=/run/opengl-driver/lib -E RUST_LOG=info \
+  ~/paddock/target/release/paddock-runner --config <dir>/paddock.toml \
+  --kernel-pack /nix/store/agnxcsrh0jbx4vbqkg6kwg4zzpi3jm0p-paddock-cuda-sm86-0.1.21/lib/paddock/pd-cuda-sm86.so
+```
+`LD_LIBRARY_PATH=/run/opengl-driver/lib` is required (cudarc dlopens libcuda.so by name). No dev variables.
+
+Resources (measured on the running server): VmRSS 19.8 GiB (18.3 GiB of it the page-locked expert planes, RssAnon 378 MiB); cgroup memory.peak 26.0 GiB with `MemoryMax=26G` (the rest is page cache of the GGUF, reclaimable; the cap is what holds it); VRAM 6907 MiB of 8192 (14 expert slots a layer at 32K). Start-up: about 23 s from start to `admin surface listening` (load 20 s + batched warm wave 2.3 s); the API answers on `http://127.0.0.1:11540` (OpenAI + Anthropic). GPU shared with ollama: stop ollama models first (`ollama stop`).
+
+Measured on it: decode 27-30 tok/s, TTFT 0.8 s short prompts, 2.8 s at 300 tokens, 26.7 s at 6199 tokens cold and 0.44 s when the same prefix repeats; tool calls well-formed.
+
+Disk-backed variant (bounded RAM, 4K context): same binary, `max_ctx = 4096`, `vram_budget = 7500`, and in `[moe_offload]` add `disk_artifact = "<artifact>"` and `verify_once = true` (our serving config; the code default is off); `MemoryMax=8G`. Decode 9-15 tok/s.
+
 ## Resume here (state at 2026-11-25 16:30, branch asus/ssd-expert-backing)
 
 - Goals done: SSD streaming (accepted), HTTP serving of the disk-backed 35B (queue item 6), model plan for the Pi agent (#807, first candidate measured).
-- Running on asus: `paddock-serve.service` (user unit), the 35B **pinned** at max_ctx 32768 on 127.0.0.1:11540, config `~/paddock-runs/w/serve-pinned/paddock.toml`. Restart: `~/paddock-runs/w/serve-pinned/start.sh` (26G cap). The disk-backed serve: `~/paddock-runs/w/serve/start.sh` (8G cap). Requests: `python3 -I ~/paddock-runs/w/serve/stream.py <request.json>` (chat.json, tool.json, long*.json).
+- Running on asus until 20:45: `paddock-serve.service` (user unit), the 35B **pinned** at max_ctx 32768 on 127.0.0.1:11540, config `~/paddock-runs/w/serve-pinned/paddock.toml`. Restart: `~/paddock-runs/w/serve-pinned/start.sh` (26G cap). The disk-backed serve: `~/paddock-runs/w/serve/start.sh` (8G cap). Requests: `python3 -I ~/paddock-runs/w/serve/stream.py <request.json>` (chat.json, tool.json, long*.json).
 - Next step: real Pi tasks through the gateway against the pinned serve (coordinator; needs a non-loopback bind and an API key, which is the owner's call). If RAM must stay bounded instead: a chunked serial prefill for the disk path (it is limited to max_ctx 4096 on 8 GB), then the Q3_K_XL quant.
 - Owner decisions open: default of `verify_once` (off) and of the host tier (off); whether to file the K-split capture report (no, per the coordinator).
 - Builds: `nix develop ~/paddock-devshell --command cargo build --release --locked -p paddock-runner --no-default-features` (2.5 min); GPU gates: `~/paddock-runs/w/run.sh <name> <cap> <bin> <test>`.
