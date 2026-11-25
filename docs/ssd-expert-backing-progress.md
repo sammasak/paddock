@@ -4,6 +4,19 @@ Host: i9-10900K, 32 GiB RAM, RTX 3070 8 GiB (46 SMs, sm_86, PCIe 3.0 x16), Kings
 Model: Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf. Pack: paddock-cuda-sm86-0.1.21 (nix store). Branch: asus/ssd-expert-backing.
 Run helper: ~/paddock-runs/w/run.sh (systemd-run MemoryMax cap, swap off, nvidia-smi every 200 ms); logs in ~/paddock-runs/w/logs.
 
+## Current state (head of asus/ssd-expert-backing), against the PR 2 checklist
+
+Each line points at the run below that proves it; logs are in `~/paddock-runs/w/logs` on asus.
+
+- Pinned path bit-identical: R3 `kq_moe_pair_host_mapped_bitmatches_resident` bitwise true on the branch; `gpu_qwen36_moe_host` greedy tokens byte-equal to main in 10 of 10 interleaved runs (R4b, R4c, R4d, R4e).
+- Pinned path no slower: R4e (245c57c, the last change near the pinned path) decode median main 31.07 (31.07-31.08), branch 31.08 (31.08-31.09), same hit rate 70.5%.
+- Disk parity: prefill logits bit for bit equal to pinned's default class and greedy tokens equal, for a one-token, a 37-token text and a 600-token synthetic prompt (sorted class, waves, eviction, duplicate routed ids across tokens), in every process of the full R7 at 2bc49a9. A 5-token prompt (LIST waves, under the sorted threshold) is teacher-forced 32/32 with equal greedy tokens.
+- Bounded RAM: the full gate passes under a 2 GiB cgroup cap with swap off (RssAnon 287 MB) against a 19.25 GiB artifact; no OOM, no Xid.
+- Throughput at 4K (4000-token prompt, one request), full R7 at 2bc49a9: 8G cap cold TTFT median 14.40 s (n=5), warm 13.26 s (n=20), decode 9.72 tok/s; 2G cap 14.35 s, 14.12 s, 5.45 tok/s. Pinned on the same harness (R22, 28G): TTFT 13.23 s, decode 34.45 tok/s.
+- I/O: miss rate, artifact read rate and device read_bytes per run are in every R7 log line (prefill reads median 1420 MiB/s at 8G, the SSD's measured ceiling is 1.35-1.65 GB/s).
+- Clean failure: foreign artifact (R9b), fewer slots than top-k, DFlash, graph replay and batched serving (R15) refuse with a sentence naming the cause and the way out; a dense qwen35 ignores the switch (245c57c). Not covered on the GPU: a corrupt record (CPU tests cover it; it fails the request and invalidates the slots, it is not detectable at load without reading 19 GiB).
+- Stability: R16 (26 min, 56 prefills, 1.63 TB read) clean; R24 on the final binary below.
+
 ## Proven, with numbers
 
 ### R6 failure: root cause (neither host nor GPU memory exhaustion)
@@ -191,11 +204,10 @@ Decode ceiling: about 90 slot misses a token at 32 slots (71.5% hit), about 2 MB
 
 ## Next
 
-1. Decide whether the host tier (e6f4d75 + af00dbb, +11-12% decode, off by default) belongs in the upstream stack or stays a fork experiment; it is the top of the stack and can be dropped as one unit.
-2. Step 5 (config and estimator) is not started: slots, staging, readers and the tier are development variables.
-3. Rerun R4 after any change near the pinned path.
-
-Consults: the host tier design came from the Fable consult above; wave prefill, overlap and staging did not.
+1. Owner decisions: keep or drop the host tier (e6f4d75, af00dbb) in the upstream stack; file the upstream K-split capture report (draft below); fold `asus/devshell-driver-lib` into PR 1.
+2. Step 5 (config and estimator) is not started: slots, staging, readers and the host tier are development variables (`PADDOCK_MOE_CACHE_SLOTS`, `PADDOCK_MOE_DISK_STAGING`, `PADDOCK_MOE_DISK_READERS`, `PADDOCK_MOE_DISK_HOST_MB`).
+3. Decode is read bound (see the ceiling note above).
+4. The stack carries fix commits on top of the features (no force push here); squashing into the RFC's step order is for whoever rebases it for upstream.
 
 ## Open questions
 
