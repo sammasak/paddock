@@ -3184,13 +3184,14 @@ pub(super) fn prefill_ffn_f8w(
     }
 }
 
-/// The routed experts of a disk-backed layer (`PADDOCK_MOE_DISK`): the
-/// token-batched k-quant pair over the slot cache, once per token range
-/// whose experts fit the slots, each launched over just that range's rows.
-/// The pair computes every row on its own, so a range's rows are
-/// bit-identical to the same rows of one token-batched launch. Activation
-/// inputs and `proj` are viewed at the range's rows; the pair's scratch
-/// (`fused`, `fq`, `fs`, `ssums`) is reused from its head.
+/// The routed experts of a disk-backed layer (`PADDOCK_MOE_DISK`) over the
+/// slot cache. When the launch's experts fit the slots (decode), the
+/// token-batched k-quant pair runs once, as on the pinned cache. Otherwise
+/// (prefill) it runs expert-major, as qwen4exp's `kq_moe_routed_waves`: per
+/// wave of at most `slots` experts, fill them, then the LIST pair over just
+/// the wave's pairs, down accumulating into a zeroed `proj`. A token's
+/// experts are then summed in wave order, the reassociation class the
+/// sorted and wave paths carry.
 #[allow(clippy::too_many_arguments)]
 fn moe_routed_disk(
     exec: &GpuExecutor,
@@ -3210,52 +3211,88 @@ fn moe_routed_disk(
     fs: &mut CudaSlice<f32>,
     proj: &mut CudaSlice<f32>,
 ) -> Result<(), GpuModelError> {
-    use crate::gpu::{RowsView, RowsViewMut};
     let c = w.cache.as_ref().ok_or_else(|| {
         GpuModelError::Unsupported(crate::gpu::MoeDiskRefusal::NoCache.to_string())
     })?;
-    let na = dims.n_active;
-    let mut chunks = Vec::new();
-    backing.plan(exec, c, idx, batch * na, na, &mut chunks)?;
+    let (na, ff) = (dims.n_active, dims.moe_ff);
+    let rows = batch * na;
+    let n_waves = backing.plan(exec, c, idx, rows, na)?;
     let (g, u, d) = (&c.gate, &c.up, &c.down);
     let gu_sums = crate::gpu::kq_needs_sums(g.ty) || crate::gpu::kq_needs_sums(u.ty);
     let d_sums = crate::gpu::kq_needs_sums(d.ty);
-    for tokens in chunks {
-        let (t0, nt) = (tokens.start, tokens.len());
-        backing.fill_chunk(exec, c, layer, na, tokens)?;
+    if n_waves == 1 {
+        backing.fill_wave(exec, c, layer, na, 0)?;
         let routing = c.idx_slot();
-        let xq_r = RowsView::new(exec, xq, t0 * embd, nt * embd)?;
-        let xs_r = RowsView::new(exec, xs, t0 * embd / 32, nt * embd / 32)?;
-        let tw_r = RowsView::new(exec, topk_w, t0 * na, nt * na)?;
         if gu_sums {
-            exec.q8_sums_strided(&xq_r, ssums, embd, nt)?;
+            exec.q8_sums_strided(xq, ssums, embd, batch)?;
         }
         exec.kquant_moe_gate_up(
             g,
             u,
             routing,
-            &xq_r,
-            &xs_r,
+            xq,
+            xs,
             gu_sums.then_some(&*ssums),
             fused,
             na,
-            nt,
+            batch,
         )?;
-        exec.quantize_q8(fused, fq, fs, nt * na * dims.moe_ff)?;
+        exec.quantize_q8(fused, fq, fs, rows * ff)?;
         if d_sums {
-            exec.q8_sums_strided(fq, ssums, dims.moe_ff, nt * na)?;
+            exec.q8_sums_strided(fq, ssums, ff, rows)?;
         }
-        let mut out = RowsViewMut::new(exec, proj, t0 * embd, nt * embd)?;
         exec.kquant_moe_down(
             d,
             routing,
-            &tw_r,
+            topk_w,
             fq,
             fs,
             d_sums.then_some(&*ssums),
-            &mut out,
+            proj,
             na,
-            nt,
+            batch,
+        )?;
+        return Ok(());
+    }
+    exec.zero_region(proj, 0, batch * embd)?;
+    for wave in 0..n_waves {
+        backing.fill_wave(exec, c, layer, na, wave)?;
+        let routing = c.idx_wave();
+        let (pairs, n_pairs, tokens, n_tokens) = c.wave_lists();
+        // ssums holds the down sums after a wave: the input's again
+        if gu_sums {
+            exec.q8_sums_strided(xq, ssums, embd, batch)?;
+        }
+        exec.kquant_moe_gate_up_list(
+            g,
+            u,
+            routing,
+            xq,
+            xs,
+            gu_sums.then_some(&*ssums),
+            fused,
+            na,
+            batch,
+            pairs,
+            n_pairs,
+        )?;
+        // the rows of out-of-wave pairs hold stale values; down skips them
+        exec.quantize_q8(fused, fq, fs, rows * ff)?;
+        if d_sums {
+            exec.q8_sums_strided(fq, ssums, ff, rows)?;
+        }
+        exec.kquant_moe_down_list(
+            d,
+            routing,
+            topk_w,
+            fq,
+            fs,
+            d_sums.then_some(&*ssums),
+            proj,
+            na,
+            batch,
+            tokens,
+            n_tokens,
         )?;
     }
     Ok(())

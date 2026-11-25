@@ -59,8 +59,7 @@ mod moe_disk;
 pub(crate) use moe_cache::{ExpertLayerLayout, ExpertPlaneLayout};
 pub use moe_disk::MoeDiskStats;
 pub(crate) use moe_disk::{
-    DISK_CHUNK_ROWS, MoeDiskBacking, MoeDiskRefusal, RowsView, RowsViewMut, disk_slots,
-    expert_identity, write_expert_artifact,
+    MoeDiskBacking, MoeDiskRefusal, disk_slots, expert_identity, write_expert_artifact,
 };
 mod host_plane;
 pub use host_plane::{HostMappedKq, HostMirror};

@@ -1371,9 +1371,9 @@ impl GpuQwen35 {
             dims.n_expert,
         )
         .map_err(|r| GpuModelError::Unsupported(r.to_string()))?;
-        // prompts are served in ranges of at most DISK_CHUNK_ROWS rows
+        // a prompt's routing is served whole, in waves of experts
         let mut caches = b
-            .seat(&self.exec, slots, crate::gpu::DISK_CHUNK_ROWS)?
+            .seat(&self.exec, slots, self.max_ctx * dims.n_active)?
             .into_iter();
         for l in &mut self.layers {
             if let Ffn::Moe(m) = &mut l.ffn

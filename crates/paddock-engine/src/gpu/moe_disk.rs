@@ -10,6 +10,12 @@
 //! goes back up. The LRU walk is the resolve kernel's (`moe/offload.cuh`:
 //! same victim choice), so both backings see the same hits and misses.
 //!
+//! A launch whose distinct experts fit the slots (decode) runs the
+//! token-batched pair once, the pinned cache's class. A wider one (prefill)
+//! runs expert-major in waves of at most `slots` experts, like
+//! `kq_moe_routed_waves` in qwen4exp: each touched expert is read at most
+//! once per layer and launch, and the pair runs over the wave's pairs only.
+//!
 //! A slot whose fill did not complete is never consumed. A failed read or
 //! enqueue invalidates every slot the launch assigned before the error
 //! returns. A failed wait breaks the backing for good: the device may still
@@ -18,14 +24,11 @@
 //! The device is behind [`SlotCopier`] (enqueue a host-to-slot copy, wait for
 //! every enqueued copy); the tests drive it with a recording fake.
 
-use std::marker::PhantomData;
-use std::mem::ManuallyDrop;
-use std::ops::Range;
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use cudarc::driver::{CudaSlice, DevicePtr};
+use cudarc::driver::CudaSlice;
 use paddock_models::ggml_type::GgmlType;
 use paddock_models::mapped::MappedGguf;
 
@@ -35,11 +38,6 @@ use super::moe_cache::{
     CacheCopier, ExpertCache, ExpertLayerLayout, ExpertPlaneLayout, MOE_CACHE_NONE,
 };
 use super::{GpuError, GpuExecutor};
-
-/// Routed rows one disk-backed launch serves at most: a prompt is split into
-/// token ranges of at most this many `(token, expert)` pairs, which also
-/// sizes each cache's routing scratch (16 KiB) instead of `max_ctx * top-k`.
-pub(crate) const DISK_CHUNK_ROWS: usize = 4096;
 
 /// Staging buffers a disk backing pins: one expert record each, so this
 /// bounds the host memory the miss path holds (about 2 MB a record on the
@@ -110,7 +108,7 @@ impl SlotLru {
 
     /// Resolve `rows` routed ids: each row's slot into `slot_rows`, each
     /// miss appended to `jobs`. The caller guarantees the rows' distinct
-    /// experts fit the slots (`plan_chunks`), so a tick never evicts an
+    /// experts fit the slots (`plan_waves`), so a tick never evicts an
     /// expert it reads; the slots in `jobs` hold nothing valid until their
     /// fill completes.
     fn resolve(&mut self, rows: &[u32], slot_rows: &mut [u32], jobs: &mut Vec<MissJob>) {
@@ -129,7 +127,7 @@ impl SlotLru {
                 .enumerate()
                 .filter(|&(_, &lu)| lu != t)
                 .min_by_key(|&(c, &lu)| (lu, c))
-                .expect("plan_chunks keeps a tick's distinct experts within the slots");
+                .expect("plan_waves keeps a tick's distinct experts within the slots");
             let old = self.expert_in[victim];
             if old != MOE_CACHE_NONE {
                 self.slot_of[old as usize] = MOE_CACHE_NONE;
@@ -158,24 +156,21 @@ impl SlotLru {
     }
 }
 
-/// Split a launch's routing (`n_active` rows per token) into consecutive
-/// token ranges whose distinct experts fit `slots` and whose rows fit
-/// `max_rows`, greedily. Every range is served by one resolve, so a range
-/// never evicts what it reads.
-pub(super) fn plan_chunks(
+/// Assign a launch's distinct routed experts (`n_active` rows per token) to
+/// waves of at most `slots` each, into `wave_of` (one entry per expert,
+/// `MOE_CACHE_NONE` for an expert the launch does not route to), in id
+/// order. Returns the wave count: 1 when every distinct expert fits the
+/// slots at once. Waves set the order a token's experts are summed in, so
+/// they depend on the routing alone, never on what the slots hold: the same
+/// prompt gives the same logits whatever ran before it.
+pub(super) fn plan_waves(
     ids: &[u32],
     n_active: usize,
     n_expert: usize,
     slots: usize,
-    max_rows: usize,
-    out: &mut Vec<Range<usize>>,
-) -> Result<(), GpuError> {
-    out.clear();
-    if n_active == 0
-        || slots < n_active
-        || max_rows < n_active
-        || !ids.len().is_multiple_of(n_active)
-    {
+    wave_of: &mut Vec<u32>,
+) -> Result<usize, GpuError> {
+    if n_active == 0 || slots < n_active || !ids.len().is_multiple_of(n_active) {
         return Err(GpuError::Driver(format!(
             "expert disk backing: {} routed rows at top-{n_active} over {slots} slots",
             ids.len()
@@ -186,30 +181,18 @@ pub(super) fn plan_chunks(
             "expert disk backing: routed expert {e} over {n_expert}"
         )));
     }
-    // chunk-stamped membership: no clear between chunks
-    let mut seen = vec![0u32; n_expert];
-    let (mut stamp, mut start, mut distinct) = (1u32, 0usize, 0usize);
-    for (t, tok) in ids.chunks(n_active).enumerate() {
-        let new = tok
-            .iter()
-            .enumerate()
-            .filter(|&(i, &e)| seen[e as usize] != stamp && !tok[..i].contains(&e))
-            .count();
-        if distinct + new > slots || (t + 1 - start) * n_active > max_rows {
-            out.push(start..t);
-            stamp += 1;
-            start = t;
-            distinct = 0;
-        }
-        for &e in tok {
-            if seen[e as usize] != stamp {
-                seen[e as usize] = stamp;
-                distinct += 1;
-            }
-        }
+    let mut routed = vec![false; n_expert];
+    for &e in ids {
+        routed[e as usize] = true;
     }
-    out.push(start..ids.len() / n_active);
-    Ok(())
+    wave_of.clear();
+    wave_of.resize(n_expert, MOE_CACHE_NONE);
+    let mut n = 0;
+    for (i, e) in (0..n_expert).filter(|&e| routed[e]).enumerate() {
+        wave_of[e] = (i / slots) as u32;
+        n = i / slots + 1;
+    }
+    Ok(n)
 }
 
 /// The disk backing of one model: the artifact, the staging pool every layer
@@ -593,8 +576,7 @@ pub(crate) struct MoeDiskBacking {
     layouts: Vec<ExpertLayerLayout>,
     /// `None` only if seating failed part-way; the model is then reloaded.
     state: Mutex<Option<Seat>>,
-    /// Per-launch host scratch: the routing, then its slot form.
-    scratch: Mutex<(Vec<u32>, Vec<u32>)>,
+    scratch: Mutex<Scratch>,
 }
 
 impl MoeDiskBacking {
@@ -611,7 +593,7 @@ impl MoeDiskBacking {
         Ok(Self {
             layouts,
             state: Mutex::new(Some(Seat::Open(store))),
-            scratch: Mutex::new((Vec::new(), Vec::new())),
+            scratch: Mutex::new(Scratch::default()),
         })
     }
 
@@ -662,11 +644,12 @@ impl MoeDiskBacking {
     }
 
     /// Plan one launch of `layer`: download its `rows` routed ids from `idx`
-    /// (a host sync) and split its tokens into ranges whose experts fit the
-    /// cache. Each range is then served by [`fill_chunk`] and the caller's
-    /// expert kernels over the cache's routing.
+    /// (a host sync) and assign its experts to waves that fit the cache.
+    /// Returns the wave count; each wave is then served by [`fill_wave`] and
+    /// the caller's expert kernels: over `idx_slot` when there is one wave,
+    /// over the cache's wave lists otherwise.
     ///
-    /// [`fill_chunk`]: MoeDiskBacking::fill_chunk
+    /// [`fill_wave`]: MoeDiskBacking::fill_wave
     pub(crate) fn plan(
         &self,
         exec: &GpuExecutor,
@@ -674,51 +657,99 @@ impl MoeDiskBacking {
         idx: &CudaSlice<u32>,
         rows: usize,
         n_active: usize,
-        chunks: &mut Vec<Range<usize>>,
-    ) -> Result<(), GpuError> {
+    ) -> Result<usize, GpuError> {
         if let Some(Seat::Seated(x)) = &mut *lock(&self.state) {
             x.settle(&mut CacheCopier { exec, cache })?;
         }
-        let mut scratch = lock(&self.scratch);
-        scratch.0 = exec.to_host_u32_len(idx, rows)?;
-        plan_chunks(
-            &scratch.0,
-            n_active,
-            cache.n_expert,
-            cache.slots,
-            cache.max_rows,
-            chunks,
-        )
+        let mut sc = lock(&self.scratch);
+        sc.ids = exec.to_host_u32_len(idx, rows)?;
+        let Scratch { ids, wave_of, .. } = &mut *sc;
+        let n = plan_waves(ids, n_active, cache.n_expert, cache.slots, wave_of)?;
+        sc.n_waves = n;
+        Ok(n)
     }
 
-    /// Fill the experts of `tokens` (a range from the last `plan`) of
-    /// `layer` into `cache` and upload those tokens' slot routing to the
-    /// head of `idx_slot`, for kernels launched over just their rows.
-    pub(crate) fn fill_chunk(
+    /// Fill wave `wave` (from the last `plan`) of `layer` into `cache` and
+    /// upload its routing: every row's slot into `idx_slot` when the launch
+    /// has one wave, else the wave's routing (its pairs to their slots, the
+    /// rest absent), pair list and token list into the cache's wave buffers.
+    pub(crate) fn fill_wave(
         &self,
         exec: &GpuExecutor,
         cache: &ExpertCache,
         layer: usize,
         n_active: usize,
-        tokens: Range<usize>,
+        wave: usize,
     ) -> Result<(), GpuError> {
-        let mut scratch = lock(&self.scratch);
-        let (ids, routing) = &mut *scratch;
-        let r = tokens.start * n_active..tokens.end * n_active;
-        if r.end > ids.len() {
-            return Err(GpuError::Driver(format!(
-                "expert disk backing: tokens {tokens:?} past the planned launch"
-            )));
-        }
-        routing.clear();
-        routing.resize(r.len(), MOE_CACHE_NONE);
         let mut state = lock(&self.state);
         let Some(Seat::Seated(x)) = &mut *state else {
             return Err(MoeDiskRefusal::NoCache.into());
         };
-        x.fill(layer, &ids[r], routing, &mut CacheCopier { exec, cache })?;
-        cache.upload_routing(exec, routing)
+        let mut sc = lock(&self.scratch);
+        if wave >= sc.n_waves {
+            return Err(GpuError::Driver(format!(
+                "expert disk backing: wave {wave} of {} planned",
+                sc.n_waves
+            )));
+        }
+        let mut dev = CacheCopier { exec, cache };
+        let Scratch {
+            ids,
+            wave_of,
+            n_waves,
+            rows,
+            slots,
+            routing,
+            pairs,
+            tokens,
+        } = &mut *sc;
+        if *n_waves == 1 {
+            slots.clear();
+            slots.resize(ids.len(), MOE_CACHE_NONE);
+            x.fill(layer, ids, slots, &mut dev)?;
+            return cache.upload_routing(exec, slots);
+        }
+        let w = wave as u32;
+        pairs.clear();
+        rows.clear();
+        tokens.clear();
+        for (p, &e) in ids.iter().enumerate() {
+            if wave_of[e as usize] == w {
+                pairs.push(p as u32);
+                rows.push(e);
+                let t = (p / n_active) as u32;
+                if tokens.last() != Some(&t) {
+                    tokens.push(t);
+                }
+            }
+        }
+        slots.clear();
+        slots.resize(rows.len(), MOE_CACHE_NONE);
+        x.fill(layer, rows, slots, &mut dev)?;
+        routing.clear();
+        routing.resize(ids.len(), MOE_CACHE_NONE);
+        for (&p, &s) in pairs.iter().zip(slots.iter()) {
+            routing[p as usize] = s;
+        }
+        cache.upload_wave(exec, routing, pairs, tokens)
     }
+}
+
+/// Per-launch host scratch of a disk backing.
+#[derive(Default)]
+struct Scratch {
+    /// The launch's routed ids, one per `(token, expert)` pair.
+    ids: Vec<u32>,
+    /// Each expert's wave, and the wave count, from `plan_waves`.
+    wave_of: Vec<u32>,
+    n_waves: usize,
+    /// One wave's routed ids and the slots they resolved to.
+    rows: Vec<u32>,
+    slots: Vec<u32>,
+    /// The wave's routing over every pair, its pairs and its tokens.
+    routing: Vec<u32>,
+    pairs: Vec<u32>,
+    tokens: Vec<u32>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -754,93 +785,6 @@ fn broken() -> GpuError {
     GpuError::Driver(
         "expert disk backing: an earlier slot copy failed to complete; reload the model".into(),
     )
-}
-
-/// A read-only view of `len` elements of a device buffer from `off`, as
-/// the whole `CudaSlice` the launch wrappers take: how a disk-backed launch
-/// runs the expert kernels over one token range's rows. Never freed (the
-/// parent owns the memory); it borrows the parent for as long as it lives.
-pub(crate) struct RowsView<'a, T> {
-    view: ManuallyDrop<CudaSlice<T>>,
-    _parent: PhantomData<&'a CudaSlice<T>>,
-}
-
-/// [`RowsView`] that can be written: borrows its parent mutably.
-pub(crate) struct RowsViewMut<'a, T> {
-    view: ManuallyDrop<CudaSlice<T>>,
-    _parent: PhantomData<&'a mut CudaSlice<T>>,
-}
-
-/// The alias both views hold. The engine runs with cudarc's event tracking
-/// off, so the alias carries no events to leak.
-fn alias<T>(
-    exec: &GpuExecutor,
-    parent: &CudaSlice<T>,
-    off: usize,
-    len: usize,
-) -> Result<ManuallyDrop<CudaSlice<T>>, GpuError> {
-    if off.checked_add(len).is_none_or(|end| end > parent.len()) {
-        return Err(GpuError::Driver(format!(
-            "rows view {off}+{len} over {} elements",
-            parent.len()
-        )));
-    }
-    let (p, _g) = parent.device_ptr(&exec.stream);
-    let at = p + (off * std::mem::size_of::<T>()) as u64;
-    // SAFETY: `at..at + len` lies inside `parent`'s live allocation (checked
-    // above); the ManuallyDrop keeps the alias from ever freeing it, and the
-    // views' lifetimes keep it from outliving `parent`.
-    Ok(ManuallyDrop::new(unsafe {
-        exec.stream.upgrade_device_ptr::<T>(at, len)
-    }))
-}
-
-impl<'a, T> RowsView<'a, T> {
-    pub(crate) fn new(
-        exec: &GpuExecutor,
-        parent: &'a CudaSlice<T>,
-        off: usize,
-        len: usize,
-    ) -> Result<Self, GpuError> {
-        Ok(Self {
-            view: alias(exec, parent, off, len)?,
-            _parent: PhantomData,
-        })
-    }
-}
-
-impl<'a, T> RowsViewMut<'a, T> {
-    pub(crate) fn new(
-        exec: &GpuExecutor,
-        parent: &'a mut CudaSlice<T>,
-        off: usize,
-        len: usize,
-    ) -> Result<Self, GpuError> {
-        Ok(Self {
-            view: alias(exec, parent, off, len)?,
-            _parent: PhantomData,
-        })
-    }
-}
-
-impl<T> std::ops::Deref for RowsView<'_, T> {
-    type Target = CudaSlice<T>;
-    fn deref(&self) -> &CudaSlice<T> {
-        &self.view
-    }
-}
-
-impl<T> std::ops::Deref for RowsViewMut<'_, T> {
-    type Target = CudaSlice<T>;
-    fn deref(&self) -> &CudaSlice<T> {
-        &self.view
-    }
-}
-
-impl<T> std::ops::DerefMut for RowsViewMut<'_, T> {
-    fn deref_mut(&mut self) -> &mut CudaSlice<T> {
-        &mut self.view
-    }
 }
 
 #[cfg(test)]
@@ -983,35 +927,38 @@ mod tests {
     }
 
     #[test]
-    fn plan_chunks_keeps_each_range_within_the_slots() {
-        let mut out = Vec::new();
-        // decode: one token, one range
-        plan_chunks(&[1, 2], 2, N_EXPERT, 4, 64, &mut out).expect("plan");
-        assert_eq!(out, vec![0..1]);
-        // tokens 0-1 touch {0,1,2,3}; token 2 adds 4 -> new range
-        plan_chunks(&[0, 1, 2, 3, 4, 0, 4, 5], 2, N_EXPERT, 4, 64, &mut out).expect("plan");
-        assert_eq!(out, vec![0..2, 2..4]);
+    fn plan_waves_fits_each_wave_in_the_slots() {
+        let mut w = Vec::new();
+        // decode: one token, one wave
+        assert_eq!(
+            plan_waves(&[1, 2], 2, N_EXPERT, 4, &mut w).expect("plan"),
+            1
+        );
+        assert_eq!(
+            &w[..3],
+            &[MOE_CACHE_NONE, 0, 0],
+            "an expert not routed to has no wave"
+        );
+        // six distinct experts over four slots: two waves, in id order
+        let ids = [5, 1, 2, 3, 4, 0, 4, 5];
+        assert_eq!(plan_waves(&ids, 2, N_EXPERT, 4, &mut w).expect("plan"), 2);
+        assert_eq!(&w[..6], &[0, 0, 0, 0, 1, 1]);
         // repeated experts do not count twice
-        plan_chunks(&[1, 1, 1, 2, 2, 1], 2, N_EXPERT, 2, 64, &mut out).expect("plan");
-        assert_eq!(out, vec![0..3]);
+        assert_eq!(
+            plan_waves(&[1, 1, 1, 2, 2, 1], 2, N_EXPERT, 2, &mut w).expect("plan"),
+            1
+        );
         assert!(
-            plan_chunks(&[0, 8], 2, N_EXPERT, 4, 64, &mut out).is_err(),
+            plan_waves(&[0, 8], 2, N_EXPERT, 4, &mut w).is_err(),
             "id range"
         );
         assert!(
-            plan_chunks(&[0, 1], 2, N_EXPERT, 1, 64, &mut out).is_err(),
+            plan_waves(&[0, 1], 2, N_EXPERT, 1, &mut w).is_err(),
             "slots < top-k"
         );
         assert!(
-            plan_chunks(&[0, 1, 2], 2, N_EXPERT, 4, 64, &mut out).is_err(),
+            plan_waves(&[0, 1, 2], 2, N_EXPERT, 4, &mut w).is_err(),
             "ragged"
-        );
-        // the row bound splits even when the experts would fit
-        plan_chunks(&[1, 2, 1, 2, 1, 2], 2, N_EXPERT, 4, 4, &mut out).expect("plan");
-        assert_eq!(out, vec![0..2, 2..3]);
-        assert!(
-            plan_chunks(&[1, 2], 2, N_EXPERT, 4, 1, &mut out).is_err(),
-            "rows < top-k"
         );
     }
 
