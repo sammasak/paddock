@@ -658,6 +658,26 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+impl Drop for MoeDiskBacking {
+    /// The counters at unload, so every run reports them without a probe.
+    fn drop(&mut self) {
+        let s = self.stats();
+        if s.rows > 0 {
+            tracing::info!(
+                rows = s.rows,
+                misses = s.misses,
+                hit_pct = 100.0 * (1.0 - s.misses as f64 / s.rows as f64),
+                read_mib = s.bytes_read >> 20,
+                read_mib_s = (s.bytes_read >> 20) as f64 / s.read_time.as_secs_f64().max(1e-9),
+                read_s = s.read_time.as_secs_f64(),
+                staging_waits = s.staging_waits,
+                wait_s = s.wait_time.as_secs_f64(),
+                "disk-backed MoE experts: totals at unload"
+            );
+        }
+    }
+}
+
 enum Seat {
     Open(DiskExpertStore),
     Seated(DiskExperts<PinnedBuf>),
