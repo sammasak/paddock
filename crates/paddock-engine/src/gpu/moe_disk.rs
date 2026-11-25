@@ -42,7 +42,19 @@ use super::{GpuError, GpuExecutor};
 /// Staging buffers a disk backing pins: one expert record each, so this
 /// bounds the host memory the miss path holds (about 2 MB a record on the
 /// 35B-A3B UD file) and the reads in flight before a fill waits.
+/// PADDOCK_MOE_DISK_STAGING overrides it (development instrument).
 const STAGING_RECORDS: usize = 8;
+
+/// Threads a fill reads its misses on. PADDOCK_MOE_DISK_READERS overrides
+/// it (development instrument).
+const READERS: usize = 4;
+
+fn dev_count(v: Result<String, std::env::VarError>, default: usize) -> usize {
+    v.ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(default)
+}
 
 /// The device half of a fill: copies from host staging memory into one
 /// layer's slot planes, on the stream the expert kernels run on.
@@ -204,6 +216,8 @@ pub(super) struct DiskExperts<B> {
     /// Leases whose copies were enqueued and not yet waited for.
     in_flight: Vec<StagingLease>,
     jobs: Vec<MissJob>,
+    /// Threads a fill reads its misses on.
+    readers: usize,
     broken: bool,
     stats: MoeDiskStats,
 }
@@ -215,6 +229,7 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>> DiskExperts<B> {
         store: DiskExpertStore,
         pool: StagingPool<B>,
         slots: usize,
+        readers: usize,
     ) -> Result<Self, GpuError> {
         let n_layers = store.n_layers();
         let mut lru = Vec::with_capacity(n_layers);
@@ -237,6 +252,7 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>> DiskExperts<B> {
             lru,
             in_flight: Vec::new(),
             jobs: Vec::new(),
+            readers,
             broken: false,
             stats: MoeDiskStats::default(),
         })
@@ -324,43 +340,57 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>> DiskExperts<B> {
             .layout(layer)
             .expect("layer checked by fill")
             .stream_bytes();
-        for j in jobs {
-            let lease = match self.pool.acquire() {
-                Some(l) => l,
-                None => {
-                    self.stats.staging_waits += 1;
-                    self.drain(dev)?;
-                    self.pool.acquire().expect("drain released every lease")
-                }
-            };
+        let mut todo = jobs;
+        let mut leases = Vec::new();
+        while !todo.is_empty() {
+            // as many misses as there are free buffers, read side by side
+            if self.pool.available() == 0 {
+                self.stats.staging_waits += 1;
+                self.drain(dev)?;
+            }
+            let n = todo.len().min(self.pool.available());
+            let (batch, rest) = todo.split_at(n);
+            todo = rest;
+            leases.clear();
+            leases.extend((0..n).map(|_| self.pool.acquire().expect("counted free")));
             let t0 = Instant::now();
-            let read = self.store.read_expert(
-                layer,
-                j.expert as usize,
-                &mut self.pool.buf_mut(&lease)[..len],
-            );
+            let read = {
+                let store = &self.store;
+                let mut bufs = self.pool.bufs_mut(&leases);
+                read_records(store, layer, batch, &mut bufs, len, self.readers)
+            };
             self.stats.read_time += t0.elapsed();
             if let Err(e) = read {
-                // nothing was enqueued from this buffer
-                self.pool.release(lease);
+                // nothing was enqueued from these buffers
+                for l in leases.drain(..) {
+                    self.pool.release(l);
+                }
                 return Err(GpuError::ExpertIo(e));
             }
-            self.stats.misses += 1;
-            self.stats.bytes_read += len as u64;
-            let buf = self.pool.buf(&lease);
-            let mut off = 0;
-            for (k, &n) in streams.iter().enumerate() {
-                // SAFETY: the lease joins `in_flight` below, or on error is
-                // held until a wait; a buffer is released only by `drain`,
-                // after `wait` returned Ok.
-                let r = unsafe { dev.enqueue(k, j.slot, &buf[off..off + n]) };
-                if let Err(e) = r {
-                    self.in_flight.push(lease);
-                    return Err(e);
+            self.stats.misses += n as u64;
+            self.stats.bytes_read += (n * len) as u64;
+            let mut held = leases.drain(..);
+            for j in batch {
+                let lease = held.next().expect("one lease a miss");
+                let buf = self.pool.buf(&lease);
+                let mut off = 0;
+                for (k, &n) in streams.iter().enumerate() {
+                    // SAFETY: the lease joins `in_flight` below, or on error
+                    // is held until a wait; a buffer is released only by
+                    // `drain`, after `wait` returned Ok.
+                    let r = unsafe { dev.enqueue(k, j.slot, &buf[off..off + n]) };
+                    if let Err(e) = r {
+                        self.in_flight.push(lease);
+                        // nothing was enqueued from the batch's later buffers
+                        for l in held {
+                            self.pool.release(l);
+                        }
+                        return Err(e);
+                    }
+                    off += n;
                 }
-                off += n;
+                self.in_flight.push(lease);
             }
-            self.in_flight.push(lease);
         }
         Ok(())
     }
@@ -393,6 +423,39 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>> DiskExperts<B> {
         }
         Ok(())
     }
+}
+
+/// Read the records of `jobs` into `bufs` (one each, `len` bytes used),
+/// spread over up to `readers` threads: positioned reads share the file, and
+/// each thread verifies its own records' digests.
+fn read_records(
+    store: &DiskExpertStore,
+    layer: usize,
+    jobs: &[MissJob],
+    bufs: &mut [&mut [u8]],
+    len: usize,
+    readers: usize,
+) -> std::io::Result<()> {
+    let read = |jobs: &[MissJob], bufs: &mut [&mut [u8]]| {
+        jobs.iter()
+            .zip(bufs.iter_mut())
+            .try_for_each(|(j, b)| store.read_expert(layer, j.expert as usize, &mut b[..len]))
+    };
+    let per = jobs.len().div_ceil(readers.max(1));
+    if per >= jobs.len() {
+        return read(jobs, bufs);
+    }
+    std::thread::scope(|s| {
+        let threads: Vec<_> = jobs
+            .chunks(per)
+            .zip(bufs.chunks_mut(per))
+            .map(|(j, b)| s.spawn(move || read(j, b)))
+            .collect();
+        threads
+            .into_iter()
+            .map(|t| t.join().expect("a reader thread panicked"))
+            .collect()
+    })
 }
 
 /// Why a qwen35-style family refuses to serve with disk-backed experts. One
@@ -735,9 +798,17 @@ impl MoeDiskBacking {
             .max()
             .expect("an artifact has at least one layer");
         let stream = exec.stream.clone();
-        let pool = StagingPool::new(STAGING_RECORDS, len, |n| PinnedBuf::new(stream.clone(), n))
+        let records = dev_count(
+            paddock_models::dev_var!("PADDOCK_MOE_DISK_STAGING"),
+            STAGING_RECORDS,
+        );
+        let readers = dev_count(
+            paddock_models::dev_var!("PADDOCK_MOE_DISK_READERS"),
+            READERS,
+        );
+        let pool = StagingPool::new(records, len, |n| PinnedBuf::new(stream.clone(), n))
             .map_err(|e| GpuError::Driver(format!("expert staging: {e}")))?;
-        *state = Some(Seat::Seated(DiskExperts::new(store, pool, slots)?));
+        *state = Some(Seat::Seated(DiskExperts::new(store, pool, slots, readers)?));
         Ok(caches)
     }
 
@@ -955,7 +1026,7 @@ mod tests {
             .max()
             .expect("layers");
         let pool = StagingPool::new(staging, len, |n| Ok(vec![0u8; n])).expect("pool");
-        DiskExperts::new(store, pool, slots).expect("experts")
+        DiskExperts::new(store, pool, slots, 2).expect("experts")
     }
 
     /// A device that applies each copy only at `wait`, reading the source
@@ -1218,13 +1289,16 @@ mod tests {
             .filter_map(|l| store().record_bytes(l))
             .max()
             .expect("layers");
-        assert!(DiskExperts::new(store(), pool(big), 0).is_err(), "no slots");
         assert!(
-            DiskExperts::new(store(), pool(big), N_EXPERT + 1).is_err(),
+            DiskExperts::new(store(), pool(big), 0, 1).is_err(),
+            "no slots"
+        );
+        assert!(
+            DiskExperts::new(store(), pool(big), N_EXPERT + 1, 1).is_err(),
             "slots"
         );
         assert!(
-            DiskExperts::new(store(), pool(big - 1), 4).is_err(),
+            DiskExperts::new(store(), pool(big - 1), 4, 1).is_err(),
             "staging too small"
         );
     }

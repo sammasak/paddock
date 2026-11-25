@@ -506,6 +506,16 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>> StagingPool<B> {
         self.bufs[lease.0].as_mut()
     }
 
+    /// The buffers of `leases`, in their order, to fill side by side.
+    pub(super) fn bufs_mut(&mut self, leases: &[StagingLease]) -> Vec<&mut [u8]> {
+        let mut bufs: Vec<Option<&mut [u8]>> =
+            self.bufs.iter_mut().map(|b| Some(b.as_mut())).collect();
+        leases
+            .iter()
+            .map(|l| bufs[l.0].take().expect("a lease is held once"))
+            .collect()
+    }
+
     pub(super) fn release(&mut self, lease: StagingLease) {
         self.free.push(lease.0);
     }
