@@ -181,6 +181,26 @@ pub async fn run(
 ) -> Result<(), Box<dyn std::error::Error>> {
     cfg.check_vram_budget()?;
     resolve_local_model(&mut cfg)?;
+    if cfg.moe_offload.disk_artifact.is_some() {
+        if cfg.device == "metal" {
+            return Err(
+                "[moe_offload] disk_artifact is CUDA-only (qwen35 MoE); remove it on Metal".into(),
+            );
+        }
+        if cfg.max_batch > 1 {
+            return Err(format!(
+                "[moe_offload] disk_artifact serves one sequence on the serial loop, but max_batch = {}: \
+                 set max_batch = 1, or drop disk_artifact to serve with pinned backing",
+                cfg.max_batch
+            )
+            .into());
+        }
+        if !cfg.moe_offload.enabled {
+            tracing::warn!(
+                "[moe_offload] disk_artifact is set with enabled = false - offload is on anyway"
+            );
+        }
+    }
 
     if cfg.device == "metal" {
         let bonsai = cfg

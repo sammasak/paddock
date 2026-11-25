@@ -211,7 +211,24 @@ impl ExpertArtifactWriter {
         let mut tmp = path.as_os_str().to_owned();
         tmp.push(".partial");
         let tmp = PathBuf::from(tmp);
-        let file = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .map_err(|e| {
+                if e.kind() == io::ErrorKind::AlreadyExists {
+                    io::Error::new(
+                        e.kind(),
+                        format!(
+                            "{} exists: another writer is running, or an earlier write was \
+                             interrupted - remove it if no other paddock is writing this artifact",
+                            tmp.display()
+                        ),
+                    )
+                } else {
+                    e
+                }
+            })?;
         let w = Self {
             file,
             tmp,

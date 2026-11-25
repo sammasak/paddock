@@ -174,6 +174,7 @@ impl GpuQwen35 {
         // the cursor and the drafter goes permanently cold; see
         // dflash_ensure_warm). Classic ticks carry decode while attached.
         self.dflash.is_none()
+            && self.moe_disk.is_none()
             && self.exec.has_sample_rows()
             && self.exec.has_pipe_advance()
             // k-quant rides the pipe since the kq batch step is the

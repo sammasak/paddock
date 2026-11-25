@@ -1367,7 +1367,13 @@ impl GpuQwen35 {
         let headroom = self
             .exec
             .vram_headroom()
-            .map_or(budget, |h| h.saturating_sub(512 << 20));
+            .ok_or_else(|| {
+                GpuModelError::Unsupported(
+                    "disk-backed MoE experts: free VRAM could not be read to size the slot cache"
+                        .into(),
+                )
+            })?
+            .saturating_sub(512 << 20);
         let budget = crate::gpu::moe_offload()
             .vram_bytes
             .map_or(budget, |cap| budget.min(cap))
