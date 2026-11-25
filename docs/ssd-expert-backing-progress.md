@@ -45,6 +45,14 @@ Measured on it: decode 27-30 tok/s, TTFT 0.8 s short prompts, 2.8 s at 300 token
 
 Disk-backed variant (bounded RAM, 4K context): same binary, `max_ctx = 4096`, `vram_budget = 7500`, and in `[moe_offload]` add `disk_artifact = "<artifact>"` and `verify_once = true` (our serving config; the code default is off); `MemoryMax=8G`. Decode 9-15 tok/s.
 
+## Pi on the pinned serve (real coding tasks, 2026-11-25)
+
+Pi 1.2.0 (`/etc/profiles/per-user/lukas/bin/pi`) against `http://127.0.0.1:11540/v1`, scratch agent dir `~/paddock-runs/w/pi/agent` (`models.json`: provider `paddock`, `api: openai-completions`, model `Qwen3.6-35B-A3B-UD-Q4_K_XL`, `contextWindow 32768`, `maxTokens 4096`), print mode, thinking off, run inside the dev shell for cargo, in a scratch clone of sammasak/llm-gateway (`~/paddock-runs/w/pi/llm-gateway`, nothing pushed). Pi print mode hangs on an open stdin: run it with `< /dev/null`.
+
+- Task 1, "add a unit test `ceil_secs_rounds_up` for `Millis::ceil_secs` in crates/core/src/time.rs and run the time tests": done in 63 s, 4 turns, 3 tool calls (read, edit, bash `cargo test`), correct test (0, 1, 1000, 1001 ms), only that file changed, `3 passed`.
+- Task 2, "a test fails (regression_70_telemetry_privacy_and_exporter_isolation, unwrap on None at issue_70.rs:361): find the cause and fix it": not finished at the 40-minute timeout. 46 turns, 46 well-formed tool calls (read, grep, cargo test), 2 benign tool errors (greps with no match), no file changed. It got as far as the right lead: the test passes alone and fails in the full suite (shared tracing subscriber state between tests). Where it broke: the 32K window. Pi auto-compacted 7 times (one compaction failed: "generation hit the token cap"); each compaction and the turn after it re-prefill ~20-25K tokens cold at ~230 tok/s (2-5 min a turn), while the 40 of 46 turns that hit the server's prefix cache took 6-10 s. 10807 output tokens over 2157 s.
+- So the tool loop holds (well-formed calls every turn, no malformed JSON, no lost turns); long tasks are throughput-bound by cold prefill after compaction at 32K.
+
 ## Resume here (state at 2026-11-25 16:30, branch asus/ssd-expert-backing)
 
 - Goals done: SSD streaming (accepted), HTTP serving of the disk-backed 35B (queue item 6), model plan for the Pi agent (#807, first candidate measured).
