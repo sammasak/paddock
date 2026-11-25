@@ -21,10 +21,11 @@
 //!    DFlash, graph replay and batched serving each refuse with a sentence
 //!    naming the cause, and the model still serves afterwards.
 //!
-//! Both pin the token-batched expert class (PADDOCK_NO_SORTED_QMOE=1): the
-//! disk path serves a launch whose experts fit the slots through it, so that
-//! is the class the pinned reference must run for a bit-exact comparison.
-//! Wider launches run in waves, which sum a token's experts in wave order.
+//! The disk path serves every launch in the class the pinned path picks for
+//! it (token-batched for decode, the sorted pair from 16 prompt tokens), so
+//! the reference runs the default classes and prompts in them must match it
+//! bit for bit. Only a short prompt with more experts than slots runs the
+//! LIST waves, which sum a token's experts in wave order.
 mod common;
 
 use std::path::{Path, PathBuf};
@@ -36,12 +37,13 @@ use paddock_models::mapped::MappedGguf;
 const MAX_CTX: usize = 4608;
 const PARITY_TOKENS: usize = 32;
 
-/// The parity prompts, each followed by PARITY_TOKENS greedy tokens. A
-/// single token keeps every launch within the slots (one wave, the pinned
-/// cache's class), so its logits must match bit for bit. The other two
-/// prefill in waves: text (gpu_qwen36_moe_host's prompt and its greedy
-/// continuation, 37 tokens) and 600 synthetic tokens, which evict.
-fn parity_prompts() -> [(&'static str, Vec<u32>); 3] {
+/// The parity prompts, each followed by PARITY_TOKENS greedy tokens: one
+/// token (every launch fits the slots, the token-batched class); five text
+/// tokens (40 pairs, under the sorted class's 128: more experts than slots
+/// run the LIST waves); text (gpu_qwen36_moe_host's prompt and its greedy
+/// continuation, 37 tokens) and 600 synthetic tokens, which prefill in the
+/// sorted class over waves and evict.
+fn parity_prompts() -> [(&'static str, Vec<u32>); 4] {
     let mut text = vec![760, 6511, 314, 9338, 369];
     text.extend([
         11751, 11, 264, 3177, 34756, 364, 1141, 25438, 57902, 1680, 430, 279, 242476, 300, 21262,
@@ -50,6 +52,7 @@ fn parity_prompts() -> [(&'static str, Vec<u32>); 3] {
     ]);
     [
         ("one token", vec![760]),
+        ("five tokens", text[..5].to_vec()),
         ("text", text),
         ("synthetic", prompt(600)),
     ]
@@ -74,7 +77,6 @@ fn setup() -> Option<(
     let exec = common::gpu_arc()?;
     // SAFETY: single-threaded test binary (run with --exact), set before any reader.
     unsafe {
-        std::env::set_var("PADDOCK_NO_SORTED_QMOE", "1");
         std::env::set_var("PADDOCK_NO_SPEC", "1");
         if std::env::var_os("PADDOCK_MOE_CACHE_SLOTS").is_none() {
             std::env::set_var("PADDOCK_MOE_CACHE_SLOTS", "32");
@@ -316,7 +318,7 @@ fn moe_disk_parity_and_measure() {
     let refs = read_ref(&ref_path(&artifact));
     assert_eq!(
         refs.len(),
-        3,
+        parity_prompts().len(),
         "reference from this gate's prompts: rerun the writer"
     );
     drop_page_cache(&artifact);
@@ -349,10 +351,11 @@ fn moe_disk_parity_and_measure() {
             s1.rows - s0.rows
         );
         let first = tokens.iter().zip(ref_tokens).position(|(a, b)| a != b);
-        if p.len() == 1 {
+        // one token or the sorted class (16 tokens of top-8 = 128 pairs)
+        if p.len() == 1 || p.len() >= 16 {
             assert_eq!(
                 mismatched, 0,
-                "{name}: one wave must match pinned bit for bit"
+                "{name}: the pinned class must match pinned bit for bit"
             );
             assert_eq!(first, None, "{name}: greedy tokens must equal pinned");
             continue;
