@@ -43,6 +43,8 @@ Resources (measured on the running server): VmRSS 19.8 GiB (18.3 GiB of it the p
 
 Measured on it: decode 27-30 tok/s, TTFT 0.8 s short prompts, 2.8 s at 300 tokens, 26.7 s at 6199 tokens cold and 0.44 s when the same prefix repeats; tool calls well-formed.
 
+Pi client settings that keep long tasks moving on this serve (measured, see "Pi on the pinned serve"): in Pi's `models.json` the model entry `{"id": "Qwen3.6-35B-A3B-UD-Q4_K_XL", "contextWindow": 32768, "maxTokens": 4096, "reasoning": false, "samplingParams": {"chat_template_kwargs": {"enable_thinking": false}}}` under an `openai-completions` provider; in `settings.json` `"compaction": {"reserveTokens": 6144, "keepRecentTokens": 8000}`; short tool output (grep cargo output, read files in ranges).
+
 Disk-backed variant (bounded RAM, 4K context): same binary, `max_ctx = 4096`, `vram_budget = 7500`, and in `[moe_offload]` add `disk_artifact = "<artifact>"` and `verify_once = true` (our serving config; the code default is off); `MemoryMax=8G`. Decode 9-15 tok/s.
 
 ## Pi on the pinned serve (real coding tasks, 2026-11-25)
