@@ -127,9 +127,25 @@ fio on the artifact, direct random reads, 12 s each: 512 KiB 956 MiB/s (1 job) /
 
 Question: which change raises decode tok/s most at a bounded host RAM budget. Answer, ranked: (1) an explicit pinned host tier of hot expert records, admitted by routing frequency (counts from the ids `plan` already downloads), copied straight from the tier to the slot with no read and no second digest check: estimated 14-16 tok/s at 6-8 GiB from 9.6, because even a page-cache hit costs a 2 MB memcpy plus BLAKE3 (the whole artifact in page cache still caps decode at 13.3 tok/s); (2) not allocating the sorted path's partials scratch on the disk path, about 3 more slots, +4-6%; (3) a frequency-aware VRAM policy, deferred because disk and pinned would then see different misses; (4) no legal overlap inside a decode step without speculation. Next step follows (1).
 
+### Host tier (e6f4d75; design from the Fable consult above)
+
+A pinned host tier of expert records, split evenly between layers, admitted by routing count (an expert replaces the least routed held one when routed at least as often). A slot miss found there is copied straight to the slot, with no read and no second digest check; a tier buffer is never written while a copy out of it is pending (it rides the batch marks like staging). Off unless `PADDOCK_MOE_DISK_HOST_MB` is set. Parity unchanged (all R18 runs: one-token bit exact, text and synthetic teacher-forced 32/32, free-running equal).
+
+R18 (32 slots, 4000-token prompt, 64 decode tokens; run 0 cold, runs 1-2 warm; "tier" = slot misses served from the tier out of 5720 per decode):
+
+| cgroup cap | tier | cold / warm TTFT | decode run 0 / 1 / 2 | tier share of decode slot misses | without a tier |
+|---|---|---|---|---|---|
+| 4G | 2 GiB | 20.1 / 20.1 / 20.0 s | 6.79 / 3.66 / 6.66 tok/s | 1150 | 6.5-6.8 tok/s |
+| 8G | 4 GiB | 20.0 / 19.8 / 19.9 s | 10.56 / 13.34 / 13.29 | 1990 | 9.6 |
+| 8G | 6 GiB | 19.8 / 19.7 / 19.7 s | 9.92 / 11.29 / 11.74 | 2730 | 9.6 |
+| 16G | 8 GiB | 19.5 / 19.5 / 19.5 s | 16.28 / 16.51 / 16.62 | 3360 | 11.9 |
+| 16G | 12 GiB | 19.2 / 19.2 / 19.2 s | 17.56 / 18.41 / 18.68 | 4470 | 11.9 |
+
+The tier is charged to the cgroup like the page cache, so it pays when it leaves room for page cache (4 of 8 GiB; 6 of 8 GiB is worse than 4) and not at all at 4G. Peak VmHWM rises by the tier size (7.4 GiB with 4 GiB). Not done from the consult: reclaiming the sorted path's partials scratch on the disk path, because the shared expert's 2-64-row path borrows it for K-split planes and its size need there is not established.
+
 ## Next
 
-1. Pinned host tier of hot expert records (design from the consult above), measured against the 16G page-cache number (11.9 tok/s).
+1. Review of the host tier (subagent), then a default for the tier budget (step 5 config is still a dev variable).
 2. Rerun R4 after any change near the pinned path.
 
 Consults: the host tier design came from the Fable consult above; wave prefill, overlap and staging did not.
