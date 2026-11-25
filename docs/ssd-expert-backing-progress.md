@@ -110,14 +110,29 @@ Command: `~/paddock-runs/w/r7full.sh 3fc49a8 <cap>` (logs `~/paddock-runs/w/logs
 - Against pinned on the same harness (R8: TTFT 149.1 s, decode 34.3 tok/s at 28G): disk prefill is 7x faster (pinned prefill reads experts zero-copy over PCIe per token), disk decode is 3.6x slower at 8G and 6x at 2G (read bound).
 - R4c (pinned path at 3fc49a8): tokens byte-equal to main in 10 of 10 runs; decode median 31.11 on both (main 31.08-31.13, branch 31.10-31.13); R3 bitwise true.
 
+### Stability (R16, ddf764c, 8G cap, 32 slots)
+
+One process, 1 cold + 55 warm runs of a 4000-token prefill and 64 decode tokens, 26 min 20 s of service runtime: all ok. Warm TTFT median 20.08 s (19.75-27.99), decode median 9.59 tok/s (9.27-9.78), 808069 expert reads, 1.63 TB from the artifact (987 GB from the device). RssAnon 286 MB at the end, GPU memory flat at 7271 MiB, no swap, no Xid/NVRM/oom in `journalctl -k`. Five runs took about 27.8 s with slow reads (runs 2, 24-25, 43-44: pairs about 10 minutes apart); the cause is not established. NVMe temperature is now sampled by the run helper; in later runs it peaked at 43.9 C (max 74.9 C).
+
+### Read size (negative result)
+
+fio on the artifact, direct random reads, 12 s each: 512 KiB 956 MiB/s (1 job) / 1083 (4 jobs); 1 MiB 1148 / 1144; 2 MiB 1346 / 1280; 4 MiB 1652 / 1366. Tried coalescing adjacent expert records (waves take experts in id order) into one `preadv` of up to N records, buffered (R17, 8G, 32 slots, cold/warm TTFT): 1 reader 1 record 21.0 / 20.7 s; 4 readers 4 records 20.7 / 20.5 s (decode 9.96 / 10.06 tok/s); 1 reader 8 records 21.1 / 20.7 s; 2 readers 8 records 21.7 / 21.1 s; 1 reader 32 records 21.1 / 20.8 s. Buffered reads stay at 1.1-1.4 GB/s whatever the run length, so the change was reverted (not committed). Large reads would need direct I/O, which needs 4 KiB-aligned records (an artifact format change).
+
+### Refusals and environment (ddf764c)
+
+- `moe_disk_refuses_what_it_cannot_serve` (R15): 4 slots at top-8 refuse with "need a VRAM slot cache of at least 8 experts a layer (top-8 routing); the budget buys 4"; DFlash, `bench_decode_ms` (graph replay) and `enable_batch` refuse with "is not supported with them yet - serve this model with pinned backing for it"; afterwards the model generates pinned's tokens [2614, 513, 5081, 5576]. `moe_disk_refuses_a_foreign_artifact` (R9b) passes on the same binary.
+- Dev shell (asus/devshell-driver-lib): with LD_LIBRARY_PATH unset outside, `nix develop ~/paddock-devshell` sets it and `kq_moe_pair_host_mapped_bitmatches_resident` runs (`gate_up bitwise=true down bitwise=true`). Outside the shell with no driver path, the heavy disk gate fails: `gate cannot run: no usable CUDA device (...)`, `test result: FAILED`.
+
+### Decode design consult (Fable subagent, read-only, 2026-11-25)
+
+Question: which change raises decode tok/s most at a bounded host RAM budget. Answer, ranked: (1) an explicit pinned host tier of hot expert records, admitted by routing frequency (counts from the ids `plan` already downloads), copied straight from the tier to the slot with no read and no second digest check: estimated 14-16 tok/s at 6-8 GiB from 9.6, because even a page-cache hit costs a 2 MB memcpy plus BLAKE3 (the whole artifact in page cache still caps decode at 13.3 tok/s); (2) not allocating the sorted path's partials scratch on the disk path, about 3 more slots, +4-6%; (3) a frequency-aware VRAM policy, deferred because disk and pinned would then see different misses; (4) no legal overlap inside a decode step without speculation. Next step follows (1).
+
 ## Next
 
-1. Refusal gate on the GPU (fewer slots than top-k, DFlash, graph replay, batched serving).
-2. 30-minute stability run, read-size check with fio, dev-shell check without LD_LIBRARY_PATH.
-3. Decode is read bound; options are more slots (VRAM) or a host tier beyond the page cache.
-4. Rerun R4 after any change near the pinned path.
+1. Pinned host tier of hot expert records (design from the consult above), measured against the 16G page-cache number (11.9 tok/s).
+2. Rerun R4 after any change near the pinned path.
 
-Consults: none of the designs so far came from a Fable consult (allowed since the brief addition; noted here when used).
+Consults: the host tier design came from the Fable consult above; wave prefill, overlap and staging did not.
 
 ## Open questions
 
