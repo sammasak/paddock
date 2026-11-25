@@ -6,9 +6,10 @@
 //! 1. `moe_disk_write_artifact` - writes the artifact named by
 //!    QWEN36_MOE_DISK_ARTIFACT from the GGUF (kept if it exists), then a
 //!    pinned load writes a reference beside it (`<artifact>.ref`: prefill
-//!    logits + greedy tokens).
-//! 2. `moe_disk_parity_and_measure` - disk load; the same prompt must give
-//!    the reference's logits and tokens bit for bit, then one cold and
+//!    logits + greedy tokens of each parity prompt).
+//! 2. `moe_disk_parity_and_measure` - disk load; each prompt must give the
+//!    reference's greedy tokens, and the one-token prompt (one wave) its
+//!    logits bit for bit; then one cold and
 //!    QWEN36_MOE_DISK_WARM warm runs report TTFT, prefill and decode tok/s,
 //!    misses, bytes and read rate, staging waits, device read bytes and the
 //!    process peak RSS. Batched serving must refuse.
@@ -18,8 +19,9 @@
 //!    model's artifact fails the load with a sentence naming it.
 //!
 //! Both pin the token-batched expert class (PADDOCK_NO_SORTED_QMOE=1): the
-//! disk path serves every width through it, so that is the class the pinned
-//! reference must run for a bit-exact comparison.
+//! disk path serves a launch whose experts fit the slots through it, so that
+//! is the class the pinned reference must run for a bit-exact comparison.
+//! Wider launches run in waves, which sum a token's experts in wave order.
 mod common;
 
 use std::path::{Path, PathBuf};
@@ -29,8 +31,26 @@ use paddock_engine::gpu_model::qwen35::GpuQwen35;
 use paddock_models::mapped::MappedGguf;
 
 const MAX_CTX: usize = 4608;
-const PARITY_PROMPT: usize = 600;
 const PARITY_TOKENS: usize = 32;
+
+/// The parity prompts, each followed by PARITY_TOKENS greedy tokens. A
+/// single token keeps every launch within the slots (one wave, the pinned
+/// cache's class), so its logits must match bit for bit. The other two
+/// prefill in waves: text (gpu_qwen36_moe_host's prompt and its greedy
+/// continuation, 37 tokens) and 600 synthetic tokens, which evict.
+fn parity_prompts() -> [(&'static str, Vec<u32>); 3] {
+    let mut text = vec![760, 6511, 314, 9338, 369];
+    text.extend([
+        11751, 11, 264, 3177, 34756, 364, 1141, 25438, 57902, 1680, 430, 279, 242476, 300, 21262,
+        11, 279, 9440, 46890, 15849, 11, 321, 279, 42027, 9141, 368, 54832, 13, 11751, 369, 1048,
+        10919,
+    ]);
+    [
+        ("one token", vec![760]),
+        ("text", text),
+        ("synthetic", prompt(600)),
+    ]
+}
 
 fn setup() -> Option<(
     PathBuf,
@@ -88,33 +108,53 @@ fn run(m: &mut GpuQwen35, prompt: &[u32], n: usize) -> (Vec<f32>, Vec<u32>) {
     (logits, out)
 }
 
+/// Mean |a - b| over the row, relative to the reference row's RMS.
+fn rel_diff(r: &[f32], o: &[f32]) -> f64 {
+    let rms = (r.iter().map(|v| (*v as f64).powi(2)).sum::<f64>() / r.len() as f64).sqrt();
+    r.iter()
+        .zip(o)
+        .map(|(a, b)| (*a as f64 - *b as f64).abs())
+        .sum::<f64>()
+        / r.len() as f64
+        / rms.max(1e-3)
+}
+
 fn ref_path(artifact: &Path) -> PathBuf {
     let mut p = artifact.as_os_str().to_owned();
     p.push(".ref");
     p.into()
 }
 
-fn write_ref(path: &Path, logits: &[f32], tokens: &[u32]) {
+/// One `(prefill logits, greedy tokens)` record per parity prompt.
+fn write_ref(path: &Path, runs: &[(Vec<f32>, Vec<u32>)]) {
     let mut b = Vec::new();
-    b.extend_from_slice(&(logits.len() as u32).to_le_bytes());
-    logits
-        .iter()
-        .for_each(|x| b.extend_from_slice(&x.to_le_bytes()));
-    b.extend_from_slice(&(tokens.len() as u32).to_le_bytes());
-    tokens
-        .iter()
-        .for_each(|x| b.extend_from_slice(&x.to_le_bytes()));
+    for (logits, tokens) in runs {
+        b.extend_from_slice(&(logits.len() as u32).to_le_bytes());
+        logits
+            .iter()
+            .for_each(|x| b.extend_from_slice(&x.to_le_bytes()));
+        b.extend_from_slice(&(tokens.len() as u32).to_le_bytes());
+        tokens
+            .iter()
+            .for_each(|x| b.extend_from_slice(&x.to_le_bytes()));
+    }
     std::fs::write(path, b).expect("write reference");
 }
 
-fn read_ref(path: &Path) -> (Vec<f32>, Vec<u32>) {
+fn read_ref(path: &Path) -> Vec<(Vec<f32>, Vec<u32>)> {
     let b = std::fs::read(path).expect("pinned reference: run moe_disk_write_artifact first");
     let word = |i: usize| u32::from_le_bytes(b[4 * i..4 * i + 4].try_into().expect("4 bytes"));
-    let nl = word(0) as usize;
-    let logits = (0..nl).map(|i| f32::from_bits(word(1 + i))).collect();
-    let nt = word(1 + nl) as usize;
-    let tokens = (0..nt).map(|i| word(2 + nl + i)).collect();
-    (logits, tokens)
+    let mut runs = Vec::new();
+    let mut at = 0;
+    while 4 * at < b.len() {
+        let nl = word(at) as usize;
+        let logits = (0..nl).map(|i| f32::from_bits(word(at + 1 + i))).collect();
+        let nt = word(at + 1 + nl) as usize;
+        let tokens = (0..nt).map(|i| word(at + 2 + nl + i)).collect();
+        runs.push((logits, tokens));
+        at += 2 + nl + nt;
+    }
+    runs
 }
 
 /// Evict the artifact's clean pages so the first run reads from the device.
@@ -244,9 +284,15 @@ fn moe_disk_write_artifact() {
     let mut m = GpuQwen35::load(exec, &map, MAX_CTX).expect("load pinned");
     let slots = m.enable_moe_cache(u64::MAX).expect("seat expert cache");
     eprintln!("pinned: {slots} slots/layer");
-    let (logits, tokens) = run(&mut m, &prompt(PARITY_PROMPT), PARITY_TOKENS);
-    eprintln!("pinned tokens {tokens:?}");
-    write_ref(&ref_path(&artifact), &logits, &tokens);
+    let runs: Vec<_> = parity_prompts()
+        .iter()
+        .map(|(name, p)| {
+            let r = run(&mut m, p, PARITY_TOKENS);
+            eprintln!("pinned {name}: tokens {:?}", r.1);
+            r
+        })
+        .collect();
+    write_ref(&ref_path(&artifact), &runs);
 }
 
 #[test]
@@ -260,7 +306,12 @@ fn moe_disk_parity_and_measure() {
     );
     // SAFETY: as in setup.
     unsafe { std::env::set_var("PADDOCK_MOE_DISK", &artifact) };
-    let (ref_logits, ref_tokens) = read_ref(&ref_path(&artifact));
+    let refs = read_ref(&ref_path(&artifact));
+    assert_eq!(
+        refs.len(),
+        3,
+        "reference from this gate's prompts: rerun the writer"
+    );
     drop_page_cache(&artifact);
     let map = MappedGguf::open(&model).expect("open gguf");
     let t = Instant::now();
@@ -271,24 +322,67 @@ fn moe_disk_parity_and_measure() {
         t.elapsed().as_secs_f64()
     );
 
-    let (logits, tokens) = run(&mut m, &prompt(PARITY_PROMPT), PARITY_TOKENS);
-    eprintln!("disk tokens   {tokens:?}");
-    let mismatched = logits
-        .iter()
-        .zip(&ref_logits)
-        .filter(|(a, b)| a.to_bits() != b.to_bits())
-        .count();
-    eprintln!(
-        "parity: {mismatched} of {} prefill logits differ bitwise, tokens equal={}",
-        logits.len(),
-        tokens == ref_tokens
-    );
-
-    assert_eq!(tokens, ref_tokens, "disk greedy tokens must equal pinned");
-    assert_eq!(
-        mismatched, 0,
-        "disk prefill logits must equal pinned bit for bit"
-    );
+    for ((name, p), (ref_logits, ref_tokens)) in parity_prompts().iter().zip(&refs) {
+        let s0 = m.moe_disk_stats().expect("disk stats");
+        let (logits, tokens) = run(&mut m, p, PARITY_TOKENS);
+        let s1 = m.moe_disk_stats().expect("disk stats");
+        let mismatched = logits
+            .iter()
+            .zip(ref_logits)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        eprintln!(
+            "parity {name} ({} tokens): {mismatched} of {} prefill logits differ bitwise, \
+             |d|/rms {:.5}, greedy tokens equal={}, {} misses of {} rows",
+            p.len(),
+            logits.len(),
+            rel_diff(ref_logits, &logits),
+            tokens == *ref_tokens,
+            s1.misses - s0.misses,
+            s1.rows - s0.rows
+        );
+        let first = tokens.iter().zip(ref_tokens).position(|(a, b)| a != b);
+        if p.len() == 1 {
+            assert_eq!(
+                mismatched, 0,
+                "{name}: one wave must match pinned bit for bit"
+            );
+            assert_eq!(first, None, "{name}: greedy tokens must equal pinned");
+            continue;
+        }
+        if let Some(i) = first {
+            eprintln!(
+                "  free-running: first difference at step {i}\n  disk   {tokens:?}\n  \
+                 pinned {ref_tokens:?}"
+            );
+        }
+        // Waves sum a token's experts in wave order, the reassociation class
+        // of the sorted prefill, so a near-tie may pick the other token and
+        // the runs then part: compared teacher-forced on pinned's tokens, as
+        // gpu_nemotron_gguf compares its regrouped bulk prefill.
+        m.reset();
+        let mut l = m.prefill(p).expect("prefill");
+        let prefill_diff = rel_diff(ref_logits, &l);
+        let mut top1 = 0;
+        for (i, &want) in ref_tokens.iter().enumerate() {
+            let got = argmax(&l);
+            if got == want {
+                top1 += 1;
+            } else {
+                eprintln!(
+                    "  step {i}: disk picks {got} ({:.4}) over pinned's {want} ({:.4})",
+                    l[got as usize], l[want as usize]
+                );
+            }
+            l = m.forward_one(want).expect("decode");
+        }
+        eprintln!("  teacher-forced top-1 {top1}/{}", ref_tokens.len());
+        assert!(
+            prefill_diff < 0.10 && top1 * 10 >= ref_tokens.len() * 9,
+            "{name}: drifted from pinned - prefill |d|/rms {prefill_diff:.4}, top-1 {top1}/{}",
+            ref_tokens.len()
+        );
+    }
     measure(&mut m, Some(&artifact));
     let refused = m.enable_batch(1).err().map(|e| e.to_string());
     eprintln!("enable_batch on disk experts: {refused:?}");
