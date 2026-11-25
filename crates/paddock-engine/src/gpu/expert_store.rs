@@ -506,13 +506,17 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>> StagingPool<B> {
         self.bufs[lease.0].as_mut()
     }
 
-    /// The buffers of `leases`, in their order, to fill side by side.
+    /// The buffers of `leases`, in their order, to fill side by side. Only
+    /// leased buffers are touched: the others may be under a copy.
     pub(super) fn bufs_mut(&mut self, leases: &[StagingLease]) -> Vec<&mut [u8]> {
-        let mut bufs: Vec<Option<&mut [u8]>> =
-            self.bufs.iter_mut().map(|b| Some(b.as_mut())).collect();
-        leases
-            .iter()
-            .map(|l| bufs[l.0].take().expect("a lease is held once"))
+        let mut out: Vec<Option<&mut [u8]>> = leases.iter().map(|_| None).collect();
+        for (i, b) in self.bufs.iter_mut().enumerate() {
+            if let Some(at) = leases.iter().position(|l| l.0 == i) {
+                out[at] = Some(b.as_mut());
+            }
+        }
+        out.into_iter()
+            .map(|b| b.expect("every lease names a buffer"))
             .collect()
     }
 

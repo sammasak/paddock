@@ -43,6 +43,10 @@ use super::moe_cache::{
 };
 use super::{GpuError, GpuExecutor};
 
+/// The default staging pool's ceiling, in records (about 128 MB pinned on
+/// the 35B-A3B UD file).
+const MAX_STAGING_RECORDS: usize = 64;
+
 /// Threads a fill reads its misses on. PADDOCK_MOE_DISK_READERS overrides
 /// it (development instrument).
 const READERS: usize = 4;
@@ -499,9 +503,11 @@ fn read_records(
             .zip(bufs.chunks_mut(per))
             .map(|(j, b)| s.spawn(move || read(j, b)))
             .collect();
-        threads
-            .into_iter()
-            .try_for_each(|t| t.join().expect("a reader thread panicked"))
+        // a panicked reader is a failed read: the fill invalidates its slots
+        threads.into_iter().try_for_each(|t| {
+            t.join()
+                .unwrap_or_else(|_| Err(std::io::Error::other("an expert reader thread panicked")))
+        })
     })
 }
 
@@ -733,6 +739,9 @@ struct HostRouting {
     /// Recorded after the copies out of each buffer.
     done: [Option<cudarc::driver::CudaEvent>; 2],
     next: usize,
+    /// A wait on an earlier upload failed: a buffer may still be read by a
+    /// copy with nothing left to wait on, so nothing is written again.
+    broken: bool,
 }
 
 impl DiskRouting {
@@ -752,6 +761,7 @@ impl DiskRouting {
                 bufs: [pinned()?, pinned()?],
                 done: [None, None],
                 next: 0,
+                broken: false,
             }),
         })
     }
@@ -765,12 +775,19 @@ impl DiskRouting {
         wave: Option<(&[u32], &[u32])>,
     ) -> Result<(), GpuError> {
         let mut h = lock(&self.host);
-        let i = h.next;
-        h.next ^= 1;
-        // the copies out of this buffer, two uploads back
-        if let Some(ev) = h.done[i].take() {
-            ev.synchronize().map_err(super::error::from_driver)?;
+        if h.broken {
+            return Err(broken());
         }
+        let i = h.next;
+        // the copies out of this buffer, two uploads back
+        if let Some(ev) = &h.done[i]
+            && let Err(e) = ev.synchronize()
+        {
+            h.broken = true;
+            return Err(super::error::from_driver(e));
+        }
+        h.done[i] = None;
+        h.next ^= 1;
         let (pairs, tokens) = wave.unwrap_or((&[], &[]));
         let counts = [pairs.len() as u32, tokens.len() as u32];
         let mut parts: Vec<(&CudaSlice<u32>, &[u32])> = vec![(&self.slots, slots)];
@@ -782,7 +799,9 @@ impl DiskRouting {
                 (&self.n_tokens, &counts[1..]),
             ]);
         }
-        let HostRouting { bufs, done, .. } = &mut *h;
+        let HostRouting {
+            bufs, done, broken, ..
+        } = &mut *h;
         let buf = bufs[i].as_mut();
         let mut at = 0;
         let mut r = Ok(());
@@ -799,6 +818,8 @@ impl DiskRouting {
             for (b, w) in buf[at..at + n].as_chunks_mut::<4>().0.iter_mut().zip(src) {
                 b.copy_from_slice(&w.to_ne_bytes());
             }
+            // a write through a read view: the engine runs with event
+            // tracking off, so the access kind records nothing
             let (p, _g) = dst.device_ptr(&exec.stream);
             // SAFETY: `dst` holds at least `src.len()` u32s (checked above),
             // and the copy is ordered on the stream after every kernel
@@ -821,9 +842,10 @@ impl DiskRouting {
             Ok(ev) => done[i] = Some(ev),
             // no event to wait on before the next write: wait now
             Err(e) => {
-                exec.stream
-                    .synchronize()
-                    .map_err(super::error::from_driver)?;
+                if let Err(s) = exec.stream.synchronize() {
+                    *broken = true;
+                    return Err(super::error::from_driver(s));
+                }
                 r = r.and(Err(e));
             }
         }
@@ -912,7 +934,10 @@ impl MoeDiskBacking {
         // kernels (cold TTFT at 4000 tokens and 32 slots: 8 buffers 26.6 s,
         // 32 20.5 s, 64 20.2 s). PADDOCK_MOE_DISK_STAGING overrides it
         // (development instrument).
-        let records = dev_count(paddock_models::dev_var!("PADDOCK_MOE_DISK_STAGING"), slots);
+        let records = dev_count(
+            paddock_models::dev_var!("PADDOCK_MOE_DISK_STAGING"),
+            slots.min(MAX_STAGING_RECORDS),
+        );
         let readers = dev_count(
             paddock_models::dev_var!("PADDOCK_MOE_DISK_READERS"),
             READERS,
@@ -1156,6 +1181,7 @@ mod tests {
         waits: usize,
         fail_enqueue_at: Option<usize>,
         fail_wait: bool,
+        fail_mark: bool,
     }
 
     impl FakeDevice {
@@ -1193,6 +1219,9 @@ mod tests {
         }
 
         fn mark(&mut self) -> Result<usize, GpuError> {
+            if self.fail_mark {
+                return Err(GpuError::Driver("injected mark failure".into()));
+            }
             Ok(self.copies)
         }
 
@@ -1338,6 +1367,47 @@ mod tests {
     }
 
     #[test]
+    fn only_the_oldest_batch_is_waited_for_and_released() {
+        // one miss, then two: the second fill finds one buffer free, sends
+        // a batch of one, then must wait for the first fill's batch alone
+        let path = artifact("oldest");
+        let mut x = experts(&path, 4, 2);
+        let mut dev = FakeDevice::new(4);
+        let mut one = [MOE_CACHE_NONE; 1];
+        x.fill(0, &[5], &mut one, &mut dev).expect("fill");
+        let mut two = [MOE_CACHE_NONE; 2];
+        x.fill(0, &[6, 7], &mut two, &mut dev).expect("fill");
+        assert_eq!(x.stats().staging_waits, 1);
+        // expert 5's copies landed; 6's are applied only once 7's buffer
+        // came from 5's, so 6 and 7 are still pending behind their marks
+        let ls = layouts();
+        assert_eq!(dev.slot(one[0]), record(&ls, 0, 5));
+        let held: usize = x.in_flight.iter().map(|(_, l)| l.len()).sum();
+        assert_eq!(held, 2, "the two later batches stay in flight");
+        dev.flush();
+        assert_eq!(dev.slot(two[0]), record(&ls, 0, 6));
+        assert_eq!(dev.slot(two[1]), record(&ls, 0, 7));
+    }
+
+    #[test]
+    fn a_failed_mark_breaks_the_backing_and_strands_the_batch() {
+        let path = artifact("mark");
+        let mut x = experts(&path, 4, 2);
+        let mut dev = FakeDevice::new(4);
+        dev.fail_mark = true;
+        let mut slot_rows = [MOE_CACHE_NONE; 2];
+        assert!(x.fill(0, &[1, 2], &mut slot_rows, &mut dev).is_err());
+        assert!(x.lru[0].slot_of.iter().all(|&s| s == MOE_CACHE_NONE));
+        dev.fail_mark = false;
+        assert!(x.fill(0, &[3], &mut slot_rows[..1], &mut dev).is_err());
+        assert_eq!(
+            x.pool.available(),
+            0,
+            "copies with no mark are never reused"
+        );
+    }
+
+    #[test]
     fn a_failed_read_leaves_no_slot_looking_filled() {
         let path = artifact("read");
         let mut x = experts(&path, 4, 4);
@@ -1351,7 +1421,7 @@ mod tests {
         let mut x = experts(&path, 4, 4);
         let mut dev = FakeDevice::new(4);
         let mut slot_rows = [MOE_CACHE_NONE; 3];
-        // 1 reads fine and is enqueued, 2 fails: the whole fill fails
+        // 1 reads fine, 2 fails: the batch fails before anything is enqueued
         assert!(x.fill(0, &[1, 2, 6], &mut slot_rows, &mut dev).is_err());
         assert!(x.lru[0].slot_of.iter().all(|&s| s == MOE_CACHE_NONE));
         assert!(x.lru[0].expert_in.iter().all(|&e| e == MOE_CACHE_NONE));
