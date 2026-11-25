@@ -143,14 +143,35 @@ R18 (32 slots, 4000-token prompt, 64 decode tokens; run 0 cold, runs 1-2 warm; "
 
 The tier is charged to the cgroup like the page cache, so it pays when it leaves room for page cache (4 of 8 GiB; 6 of 8 GiB is worse than 4) and not at all at 4G. Peak VmHWM rises by the tier size (7.4 GiB with 4 GiB). Not done from the consult: reclaiming the sorted path's partials scratch on the disk path, because the shared expert's 2-64-row path borrows it for K-split planes and its size need there is not established.
 
+### Host tier, interleaved A/B (af00dbb, `w/tier-ab.sh`, 3 processes each, runs 1-2 warm)
+
+The single-process R18 numbers above overstated the gain: the page-cache share of decode reads varies between processes (the second 8G/4 GiB process gave 10.84 against 13.34). Interleaved, 32 slots:
+
+| cap | tier | warm TTFT | warm decode |
+|---|---|---|---|
+| 8G | none | median 20.31 s (20.27-28.11, n=6) | median 9.60 tok/s (9.55-9.63) |
+| 8G | 4 GiB | median 19.89 s (19.84-19.91) | median 10.79 tok/s (10.68-10.87) |
+| 16G | none | median 20.20 s (20.12-20.31) | median 14.98 tok/s (14.89-15.61) |
+| 16G | 8 GiB | median 19.50 s (19.49-19.52) | median 16.69 tok/s (16.55-16.96) |
+
+So the tier gives +12% (8G) and +11% (16G) decode and 0.4-0.7 s TTFT. The consult's estimate (+50%) assumed the single-reader page-cache numbers (11.9 tok/s at 16G); with four readers, page-cache hits are already cheaper. Parity passed in all 12 processes. Review findings on the tier (a buffer in two in-flight batches, stats consumers, unused remainder) are fixed in af00dbb with a mutation-checked test.
+
+### Pinned path at af00dbb (R4d)
+
+Tokens byte-equal to main in 10 of 10 runs, same hit rate (19840 rows, 5845 misses). Decode rerun: main 31.09, 31.11, 31.07, 31.06, 31.10 (median 31.09); branch 31.07, 31.06, 31.03, 31.07, 31.07 (median 31.07). Inside main's range, at its low edge; the pinned path's code did not change since R4c (medians 31.11 both). R3 bitwise true.
+
 ## Next
 
-1. Review of the host tier (subagent), then a default for the tier budget (step 5 config is still a dev variable).
-2. Rerun R4 after any change near the pinned path.
+1. Decide whether the host tier (e6f4d75 + af00dbb, +11-12% decode, off by default) belongs in the upstream stack or stays a fork experiment; it is the top of the stack and can be dropped as one unit.
+2. Step 5 (config and estimator) is not started: slots, staging, readers and the tier are development variables.
+3. Rerun R4 after any change near the pinned path.
 
 Consults: the host tier design came from the Fable consult above; wave prefill, overlap and staging did not.
 
 ## Open questions
+
+- Host tier: worth +11-12% decode for about 250 lines (with tests)? Owner's call for the upstream stack.
+- Intermittent slow reads (about 800 MiB/s instead of 1.4 GB/s for a whole prefill or decode, a few runs per half hour, in pairs about 10 minutes apart in R16): not thermal (NVMe peak 43.9 C); cause not established.
 
 - Upstream pack bug: K-split router arm returns error 2 under capture with no partials plane. Draft an issue for truespar/paddock (owner decision to file).
 - Why the 4000-token pinned capture does not hit it.
