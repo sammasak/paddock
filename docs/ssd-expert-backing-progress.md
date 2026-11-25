@@ -4,6 +4,18 @@ Host: i9-10900K, 32 GiB RAM, RTX 3070 8 GiB (46 SMs, sm_86, PCIe 3.0 x16), Kings
 Model: Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf. Pack: paddock-cuda-sm86-0.1.21 (nix store). Branch: asus/ssd-expert-backing.
 Run helper: ~/paddock-runs/w/run.sh (systemd-run MemoryMax cap, swap off, nvidia-smi every 200 ms); logs in ~/paddock-runs/w/logs.
 
+## Biggest MoE that runs on asus (owner goal, 2026-11-25 evening; branch asus/biggest-moe)
+
+Fable consult (read-only, repo + web) ranked ports: Qwen3.8-Flash-Next via a qwen4exp disk port (66-111 GB, 20-30 h, 1.3-5 tok/s), Laguna S 2.1 118B-A8B / Kolibri 1 78B-A3.5B via a laguna disk port (12-20 h; Kolibri 5-9 tok/s estimated), gpt-oss-120b and Nemotron Super out (MXFP4 slot ABI, 22 active experts). It missed that the qwen35moe family itself has bigger releases, which the disk path serves with no port:
+
+| model, quant (unsloth) | GGUF | dense (non-expert) | experts | layout | blocker |
+|---|---|---|---|---|---|
+| Qwen3.5-397B-A17B UD-IQ1_M | 106.8 GB (4 shards) | 7.15 GB | 99.7 GB, ~3.2 MB a record | 60 x 512 x top-10, expert ff 1024, embd 4096 | dense does not fit 8 GB beside slots/KV/scratch: needs dense weights served from host |
+| Qwen3.5-122B-A10B UD-Q2_K_XL | 41.8 GB | 4.42 GB | 37.4 GB, ~3.0 MB a record (IQ2_XS gate/up, IQ3_XXS down) | 48 x 256 x top-8, embd 3072 | none known; small context |
+| Qwen3.5-122B-A10B UD-IQ1_M / UD-IQ3_XXS / Q3_K_S | 34.2 / 44.7 / 52.5 GB | 4.31 / 5.17 / 6.28 GB | 29.9 / 39.6 / 46.2 GB | same | dense grows with quant |
+
+(Sizes from the GGUF headers fetched by HTTP range, `~/paddock-runs/w/big/gguf_head.py`; split GGUFs are supported by `MappedGguf`; every i-quant type here is in `kq_params`.) Plan: 122B UD-Q2_K_XL first (disk path as is), then the 397B with a dense-weights-on-host change. Download in progress: `~/paddock-runs/models/q122/` (resumable: `~/paddock-runs/w/big/dl.sh <url> <dest>`).
+
 ## Serving recipe (the Pi model on asus: Qwen3.6-35B-A3B, pinned expert offload, 32K context)
 
 Build (in the checkout, dev shell from PR 1; about 2.5 min):
