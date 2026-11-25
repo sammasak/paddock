@@ -1561,7 +1561,7 @@ struct MoeFfnWeights {
     cache: Option<ExpertCache>,
     /// Disk backing (`PADDOCK_MOE_DISK`): the model's backing and this
     /// layer's index in its artifact. Every launch then serves through
-    /// `cache`, chunked to its slots (ops.rs `moe_routed_disk`).
+    /// `cache`, in waves of at most its slots (ops.rs `moe_routed_disk`).
     disk: Option<(Arc<MoeDiskBacking>, usize)>,
 }
 

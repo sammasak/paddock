@@ -51,9 +51,7 @@ mod spec_ops;
 pub use attention::PfQ;
 pub use canvas::CanvasStatus;
 pub use hadamard::HadamardGdnHeads;
-// The disk expert backing; a MoE family seats it once its host-assisted
-// cache fill lands. Until then only its tests use it.
-#[allow(dead_code)]
+// The disk expert backing (PADDOCK_MOE_DISK): the artifact and staging.
 mod expert_store;
 mod moe_disk;
 pub(crate) use moe_cache::{ExpertLayerLayout, ExpertPlaneLayout};

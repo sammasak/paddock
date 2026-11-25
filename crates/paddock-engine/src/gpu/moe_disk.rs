@@ -8,7 +8,8 @@
 //! gives each distinct expert a slot, the misses are read into staging
 //! buffers and copied into their slots in stream order, and the slot routing
 //! goes back up. The LRU walk is the resolve kernel's (`moe/offload.cuh`:
-//! same victim choice), so both backings see the same hits and misses.
+//! same victim choice), so a launch that fits the slots sees the same hits
+//! and misses on both backings.
 //!
 //! A launch whose distinct experts fit the slots (decode) runs the
 //! token-batched pair once, the pinned cache's class. A wider one (prefill)
@@ -799,14 +800,13 @@ impl GpuExecutor {
         // the repack's own pack checks (try_repack_kquant, repack_kquant_raw)
         if (super::kq_is_iq(ty) && !self.has_kquant_iq())
             || (super::kq_is_ternary(ty) && !self.has_kquant_ternary())
-            || (matches!(ty, GgmlType::Q5_1 | GgmlType::Q8_0) && !self.has_kquant_flat32())
-            || (ty == GgmlType::Q5_0 && !self.has_kquant_q50())
         {
             return Err(GpuError::NoKernel {
                 name: name.to_owned(),
                 ty,
             });
         }
+        self.kq_lanes_check(ty, name)?;
         let dims: Vec<usize> = info.dims.iter().map(|&d| d as usize).collect();
         let (data, scales) = super::kquant::kq_repacked_bytes(&dims, ty, name)?;
         ExpertPlaneLayout::new(&dims, ty, data, scales).map(Some)
@@ -1147,7 +1147,7 @@ impl MoeDiskBacking {
         // (development instrument; none by default).
         let tier_mb = dev_count(paddock_models::dev_var!("PADDOCK_MOE_DISK_HOST_MB"), 0);
         // whole buffers a layer only
-        let per_layer = (tier_mb << 20) / len / store.n_layers();
+        let per_layer = tier_mb.saturating_mul(1 << 20) / len / store.n_layers();
         let tier = (0..per_layer * store.n_layers())
             .map(|_| PinnedBuf::new(stream.clone(), len))
             .collect::<std::io::Result<Vec<_>>>()
@@ -1289,7 +1289,8 @@ impl Drop for MoeDiskBacking {
         if s.rows > 0 {
             tracing::info!(
                 rows = s.rows,
-                misses = s.misses + s.tier_hits,
+                slot_misses = s.misses + s.tier_hits,
+                disk_reads = s.misses,
                 tier_hits = s.tier_hits,
                 hit_pct = 100.0 * (1.0 - (s.misses + s.tier_hits) as f64 / s.rows as f64),
                 read_mib = s.bytes_read >> 20,

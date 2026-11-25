@@ -1949,9 +1949,10 @@ impl GpuQwen35 {
         // the W4A8 rungs (mmq's k-quant arm - dp4a + K-split mma), and the
         // nextn block's own weights go through the same per-tensor QuantW
         // dispatch below. MoE-FFN nextn blocks still need Q8 expert seats.
-        // disk-backed experts serve no speculative path (MoeDiskRefusal)
+        // disk-backed experts serve no speculative path (MoeDiskRefusal); a
+        // dense model ignores the switch
         let spec_wanted = std::env::var_os("PADDOCK_NO_SPEC").is_none()
-            && crate::gpu::moe_disk_artifact().is_none();
+            && (moe.is_none() || crate::gpu::moe_disk_artifact().is_none());
         let mtp = if n_nextn > 0 && spec_wanted {
             assert_eq!(n_nextn, 1, "only a single nextn/MTP block is supported");
             let i = n_layers; // blk.<n_layers>.*
@@ -2926,7 +2927,7 @@ impl GpuQwen35 {
         // back to f16 (serving.rs), and an explicit kv_cache_dtype wins.
         let kv_dtype = KvDtype::Fp8E4m3;
         let mut layers = layers;
-        let moe_disk = match crate::gpu::moe_disk_artifact() {
+        let moe_disk = match crate::gpu::moe_disk_artifact().filter(|_| moe.is_some()) {
             Some(path) => Some(open_moe_disk(&exec, map, &path, &mut layers)?),
             None => None,
         };

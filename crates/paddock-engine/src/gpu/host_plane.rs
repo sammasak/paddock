@@ -120,10 +120,11 @@ impl Drop for HostMirror {
     }
 }
 
-/// Page-locked host bytes for the disk backing's staging pool
-/// (`moe_disk.rs`): a miss is read into one, then copied to its slot with an
-/// async copy, which only overlaps the host when the source is pinned.
-/// Not device-mapped - nothing on the device addresses it directly.
+/// Page-locked host bytes for the disk backing (`moe_disk.rs`): its staging
+/// pool, host tier and routing uploads. A miss is read into one, then copied
+/// to its slot with an async copy, which only overlaps the host when the
+/// source is pinned. Not device-mapped - nothing on the device addresses it
+/// directly.
 pub struct PinnedBuf {
     ptr: *mut u8,
     len: usize,
@@ -132,17 +133,22 @@ pub struct PinnedBuf {
     stream: Arc<CudaStream>,
 }
 
-// SAFETY: the pointer is a driver allocation this value alone owns; the
-// engine thread owns every use, as for HostMirror.
+// SAFETY: the pointer is a driver allocation this value alone owns, and the
+// host reaches its bytes only through `&self` / `&mut self` (a reader thread
+// gets a `&mut [u8]` borrowed from it), so moving the owner between threads
+// is sound.
 unsafe impl Send for PinnedBuf {}
 
 impl PinnedBuf {
     pub(super) fn new(stream: Arc<CudaStream>, len: usize) -> std::io::Result<Self> {
+        if len == 0 {
+            return Err(std::io::Error::other("a zero-length pinned buffer"));
+        }
         // SAFETY: plain driver call; the pointer is owned here until Drop.
         let ptr = unsafe { cudarc::driver::result::malloc_host(len, cu::CU_MEMHOSTALLOC_PORTABLE) }
             .map_err(|e| {
                 std::io::Error::other(format!(
-                    "cuMemHostAlloc({} MiB) for expert staging: {e}",
+                    "cuMemHostAlloc({} MiB) for the expert disk backing: {e}",
                     len >> 20
                 ))
             })?;
@@ -163,9 +169,10 @@ impl AsRef<[u8]> for PinnedBuf {
 
 impl AsMut<[u8]> for PinnedBuf {
     fn as_mut(&mut self) -> &mut [u8] {
-        // SAFETY: as above; `&mut self` makes the host view exclusive. The
-        // staging pool hands out a buffer only after the copies reading it
-        // completed.
+        // SAFETY: as above; `&mut self` makes the host view exclusive. A
+        // copy may still read the bytes: its users write only after the copy
+        // completed (staging leases and host tier buffers after a wait on
+        // their batch's mark, routing buffers after their event).
         unsafe { core::slice::from_raw_parts_mut(self.ptr, self.len) }
     }
 }

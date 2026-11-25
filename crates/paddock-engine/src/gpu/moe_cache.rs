@@ -9,7 +9,9 @@
 //! resolve (ids -> slots, miss jobs) then fill (miss bytes from the mirror
 //! into their slots, PCIe-bound) and hands the unchanged MoE kernels the
 //! slot planes and the remapped ids. All of it captures into the decode
-//! graph; nothing here touches the host after load.
+//! graph; nothing here touches the host after load. The disk backing
+//! (`moe_disk.rs`) seats the same slot planes without fill sources and
+//! fills them from the host through [`CacheCopier`].
 //!
 //! Sizing: a slot is one expert's gate+up+down bytes (2.0 MB on the 35B-A3B
 //! UD file). Measured on a 4032-token prompt, per-layer LRU hit rates run

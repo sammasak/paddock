@@ -72,6 +72,7 @@ struct Extents {
     /// `(first record offset, record bytes)` per layer.
     layers: Vec<(u64, u64)>,
     /// End of the header proper; its digest follows.
+    #[cfg(test)]
     header_len: u64,
     digests_at: u64,
     len: u64,
@@ -105,6 +106,7 @@ impl Extents {
         }
         Ok(Self {
             layers,
+            #[cfg(test)]
             header_len,
             digests_at,
             len: at,
@@ -486,10 +488,12 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>> StagingPool<B> {
         self.bufs[0].as_ref().len()
     }
 
+    #[cfg(test)]
     pub(super) fn capacity(&self) -> usize {
         self.bufs.len()
     }
 
+    #[cfg(test)]
     pub(super) fn available(&self) -> usize {
         self.free.len()
     }
@@ -502,6 +506,7 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>> StagingPool<B> {
         self.bufs[lease.0].as_ref()
     }
 
+    #[cfg(test)]
     pub(super) fn buf_mut(&mut self, lease: &StagingLease) -> &mut [u8] {
         self.bufs[lease.0].as_mut()
     }

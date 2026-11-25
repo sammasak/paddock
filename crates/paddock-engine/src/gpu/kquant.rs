@@ -260,6 +260,26 @@ impl GpuExecutor {
         Ok(Some(self.repack_kquant(map, name)?))
     }
 
+    /// The flat 32-weight seats ride slot 600's entry points, and Q5_0
+    /// slot 655's on top: an older pack would repack the bytes into a
+    /// layout its lanes then misread, so the marker is checked at the
+    /// one place every k-quant plane passes through (and where the disk
+    /// backing seats one without a repack).
+    pub(super) fn kq_lanes_check(&self, ty: GgmlType, what: &str) -> Result<(), GpuError> {
+        if matches!(ty, GgmlType::Q5_1 | GgmlType::Q8_0) && !self.has_kquant_flat32() {
+            return Err(GpuError::Unsupported(format!(
+                "{what} is {ty:?} but the kernel pack has no flat 32-weight lanes (slot 600) - \
+                 rebuild packs/cuda"
+            )));
+        }
+        if ty == GgmlType::Q5_0 && !self.has_kquant_q50() {
+            return Err(GpuError::Unsupported(format!(
+                "{what} is Q5_0 but the kernel pack has no Q5_0 seat (slot 655) - rebuild packs/cuda"
+            )));
+        }
+        Ok(())
+    }
+
     /// Upload a Q4_K/Q5_K/Q6_K weight and repack it into the aligned data +
     /// scale-record streams the fused k-quant GEMV reads. The staged upload
     /// is freed on return - the tensor stays 4/5/6-bit resident.
@@ -292,21 +312,7 @@ impl GpuExecutor {
             name: what.to_owned(),
             ty,
         })?;
-        // The flat 32-weight seats ride slot 600's entry points, and Q5_0
-        // slot 655's on top: an older pack would repack the bytes into a
-        // layout its lanes then misread, so the marker is checked at the
-        // one place every k-quant plane passes through.
-        if matches!(ty, GgmlType::Q5_1 | GgmlType::Q8_0) && !self.has_kquant_flat32() {
-            return Err(GpuError::Unsupported(format!(
-                "{what} is {ty:?} but the kernel pack has no flat 32-weight lanes (slot 600) - \
-                 rebuild packs/cuda"
-            )));
-        }
-        if ty == GgmlType::Q5_0 && !self.has_kquant_q50() {
-            return Err(GpuError::Unsupported(format!(
-                "{what} is Q5_0 but the kernel pack has no Q5_0 seat (slot 655) - rebuild packs/cuda"
-            )));
-        }
+        self.kq_lanes_check(ty, what)?;
         let f = self
             .kernels
             .kquant_repack
