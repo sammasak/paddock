@@ -160,6 +160,24 @@ So the tier gives +12% (8G) and +11% (16G) decode and 0.4-0.7 s TTFT. The consul
 
 Tokens byte-equal to main in 10 of 10 runs, same hit rate (19840 rows, 5845 misses). Decode rerun: main 31.09, 31.11, 31.07, 31.06, 31.10 (median 31.09); branch 31.07, 31.06, 31.03, 31.07, 31.07 (median 31.07). Inside main's range, at its low edge; the pinned path's code did not change since R4c (medians 31.11 both). R3 bitwise true.
 
+### Prefill in the pinned sorted class (a325550, 2bc49a9)
+
+Profiling (temporary timing around the disk MoE call, artifact fully in page cache, 27G): the LIST pair took 17.0 s of an 18.9 s 4000-token prefill, with reads only 1.9 s. The pinned backing prefills in its sorted tensor-core class (`moe_align` + `kquant_moe_gate_up_mma` + `kquant_moe_down_mma` + `moe_slot_combine`). `pd_moe_align` cannot take a masked routing (it counts `idx[p]` with no absent check), so the host builds the same layout per wave from the pairs it already knows (`sorted_layout`: pairs grouped by slot into 32-row blocks) and uploads it into the sorted scratch. The unchanged kernels then write each pair's weighted partial once, over all waves, and the slot combine folds them in pair order as on the pinned path. A row of the sorted pair does not depend on its block neighbours (one CTA per 32-row block, no K-split across CTAs), so this is the pinned result bit for bit. The disk path takes it exactly when the pinned path takes the k-quant sorted branch (same `sorted` decision, one gate/up type, no i-quant seat); short prompts under the sorted threshold with more experts than slots keep the LIST waves.
+
+The gate now runs the pinned reference in its default class (no `PADDOCK_NO_SORTED_QMOE`). R21-disk (8G, 32 slots):
+
+```
+parity one token (1 tokens): 0 of 248320 prefill logits differ bitwise, |d|/rms 0.00000, greedy tokens equal=true
+parity five tokens (5 tokens): 248320 of 248320 prefill logits differ bitwise, |d|/rms 0.01383, greedy tokens equal=true  (LIST waves; teacher-forced top-1 32/32)
+parity text (37 tokens): 0 of 248320 prefill logits differ bitwise, |d|/rms 0.00000, greedy tokens equal=true
+parity synthetic (600 tokens): 0 of 248320 prefill logits differ bitwise, |d|/rms 0.00000, greedy tokens equal=true
+```
+
+TTFT at 4000 tokens (R21-disk2, 8G, 32 slots): cold 14.40 s (reads 12.21 s at 1273 MiB/s), warm 13.30 / 13.25 s; decode 9.55 / 9.73 / 9.75 tok/s.
+Pinned on the same harness in its default class (R22, 28G cap, graphs): TTFT 13.24 / 13.23 / 13.23 s, decode 33.44 / 34.47 / 34.45 tok/s, VmHWM 29.3 GiB.
+
+So disk-backed prefill now runs at the pinned speed (warm within 0.1 s, cold +1.2 s) under an 8 GiB cap, bit for bit equal; decode is 3.5x slower (read bound). The earlier pinned baseline (R8, 149 s TTFT) ran the token-batched class the old harness forced.
+
 ## Next
 
 1. Decide whether the host tier (e6f4d75 + af00dbb, +11-12% decode, off by default) belongs in the upstream stack or stays a fork experiment; it is the top of the stack and can be dropped as one unit.
