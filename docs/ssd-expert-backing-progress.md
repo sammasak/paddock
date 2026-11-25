@@ -1,5 +1,7 @@
 # SSD expert backing: progress on asus-b460m
 
+GPU NEEDED (2026-11-25 ~20:55, branch asus/biggest-moe): stop paddock.service, then I run, one at a time: (1) the Qwen3.5-122B-A10B UD-Q2_K_XL disk-backed serve (`~/paddock-runs/w/serve-122/start.sh`, user unit `paddock-big`, port 11541; the first start writes its ~37 GB artifact), one chat completion and one tool call; (2) the dense_host bit-exactness gate on the 35B; (3) later the 397B once its download (paused behind the 122B, now resumed) finishes. GGUF of the 122B is complete and checksum-verified (sha256 be44a62a...).
+
 Host: i9-10900K, 32 GiB RAM, RTX 3070 8 GiB (46 SMs, sm_86, PCIe 3.0 x16), Kingston SA2000 NVMe.
 Model: Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf. Pack: paddock-cuda-sm86-0.1.21 (nix store). Branch: asus/ssd-expert-backing.
 Run helper: ~/paddock-runs/w/run.sh (systemd-run MemoryMax cap, swap off, nvidia-smi every 200 ms); logs in ~/paddock-runs/w/logs.
