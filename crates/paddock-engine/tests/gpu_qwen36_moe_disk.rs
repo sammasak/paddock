@@ -9,7 +9,12 @@
 //! 2. `moe_disk_parity_and_measure` - disk load; the same prompt must give
 //!    the reference's logits and tokens bit for bit, then one cold and
 //!    QWEN36_MOE_DISK_WARM warm runs report TTFT, prefill and decode tok/s,
-//!    misses, bytes and read rate, staging waits, and the process peak RSS.
+//!    misses, bytes and read rate, staging waits, device read bytes and the
+//!    process peak RSS. Batched serving must refuse.
+//! 3. `moe_pinned_measure` - the same runs on the pinned backing, the
+//!    like-for-like baseline (pinned replays its graphs, disk runs eager).
+//! 4. `moe_disk_refuses_a_foreign_artifact` - a file that is not this
+//!    model's artifact fails the load with a sentence naming it.
 //!
 //! Both pin the token-batched expert class (PADDOCK_NO_SORTED_QMOE=1): the
 //! disk path serves every width through it, so that is the class the pinned
@@ -120,10 +125,80 @@ fn drop_page_cache(path: &Path) {
     }
 }
 
-fn peak_rss_kib() -> Option<u64> {
-    let s = std::fs::read_to_string("/proc/self/status").ok()?;
-    let line = s.lines().find(|l| l.starts_with("VmHWM:"))?;
+fn proc_field(file: &str, key: &str) -> Option<u64> {
+    let s = std::fs::read_to_string(file).ok()?;
+    let line = s.lines().find(|l| l.starts_with(key))?;
     line.split_whitespace().nth(1)?.parse().ok()
+}
+
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+/// One cold and QWEN36_MOE_DISK_WARM warm runs of a QWEN36_MOE_DISK_PROMPT
+/// token prompt plus QWEN36_MOE_DISK_DECODE greedy tokens; the disk counters
+/// per phase when the backing is disk.
+fn measure(m: &mut GpuQwen35, artifact: Option<&Path>) {
+    use paddock_engine::gpu::MoeDiskStats;
+    let n_prompt = env_usize("QWEN36_MOE_DISK_PROMPT", 4000);
+    let n_decode = env_usize("QWEN36_MOE_DISK_DECODE", 64);
+    let warm = env_usize("QWEN36_MOE_DISK_WARM", 5);
+    let p = prompt(n_prompt);
+    if let Some(a) = artifact {
+        drop_page_cache(a);
+    }
+    let line = |a: Option<MoeDiskStats>, b: Option<MoeDiskStats>| {
+        let (Some(a), Some(b)) = (a, b) else {
+            return String::from("pinned");
+        };
+        let rows = b.rows - a.rows;
+        let misses = b.misses - a.misses;
+        let mib = (b.bytes_read - a.bytes_read) as f64 / (1u64 << 20) as f64;
+        let rt = (b.read_time - a.read_time).as_secs_f64();
+        format!(
+            "misses {misses} of {rows} rows (hit {:.1}%), read {mib:.0} MiB in {rt:.2}s \
+             ({:.0} MiB/s), staging waits {}",
+            100.0 * (1.0 - misses as f64 / rows.max(1) as f64),
+            mib / rt.max(1e-9),
+            b.staging_waits - a.staging_waits
+        )
+    };
+    for r in 0..=warm {
+        let s0 = m.moe_disk_stats();
+        m.reset();
+        let t0 = Instant::now();
+        let logits = m.prefill(&p).expect("prefill");
+        let ttft = t0.elapsed().as_secs_f64();
+        let s1 = m.moe_disk_stats();
+        let mut tok = argmax(&logits);
+        let t1 = Instant::now();
+        for _ in 0..n_decode {
+            tok = argmax(&m.forward_one(tok).expect("decode"));
+        }
+        let dec = t1.elapsed().as_secs_f64();
+        let s2 = m.moe_disk_stats();
+        eprintln!(
+            "run {r} {}: ttft {:.0} ms ({:.1} prefill tok/s, {n_prompt} tokens) | {}",
+            if r == 0 { "cold" } else { "warm" },
+            ttft * 1e3,
+            n_prompt as f64 / ttft,
+            line(s0, s1)
+        );
+        eprintln!(
+            "run {r} decode: {:.2} tok/s over {n_decode} tokens | {}",
+            n_decode as f64 / dec,
+            line(s1, s2)
+        );
+    }
+    eprintln!("disk totals: {:?}", m.moe_disk_stats());
+    eprintln!(
+        "peak RSS (VmHWM): {:?} KiB, device read_bytes: {:?}",
+        proc_field("/proc/self/status", "VmHWM:"),
+        proc_field("/proc/self/io", "read_bytes:")
+    );
 }
 
 #[test]
@@ -190,68 +265,57 @@ fn moe_disk_parity_and_measure() {
         tokens == ref_tokens
     );
 
-    let n_prompt: usize = std::env::var("QWEN36_MOE_DISK_PROMPT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(4000);
-    let n_decode: usize = std::env::var("QWEN36_MOE_DISK_DECODE")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(64);
-    let warm: usize = std::env::var("QWEN36_MOE_DISK_WARM")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(5);
-    let p = prompt(n_prompt);
-    drop_page_cache(&artifact);
-    for r in 0..=warm {
-        let s0 = m.moe_disk_stats().expect("disk-backed");
-        m.reset();
-        let t0 = Instant::now();
-        let logits = m.prefill(&p).expect("prefill");
-        let ttft = t0.elapsed().as_secs_f64();
-        let s1 = m.moe_disk_stats().expect("disk-backed");
-        let mut tok = argmax(&logits);
-        let t1 = Instant::now();
-        for _ in 0..n_decode {
-            tok = argmax(&m.forward_one(tok).expect("decode"));
-        }
-        let dec = t1.elapsed().as_secs_f64();
-        let s2 = m.moe_disk_stats().expect("disk-backed");
-        let line = |a: &paddock_engine::gpu::MoeDiskStats,
-                    b: &paddock_engine::gpu::MoeDiskStats| {
-            let rows = b.rows - a.rows;
-            let misses = b.misses - a.misses;
-            let bytes = b.bytes_read - a.bytes_read;
-            let rt = (b.read_time - a.read_time).as_secs_f64();
-            format!(
-                "misses {misses} of {rows} rows (hit {:.1}%), read {:.0} MiB at {:.0} MiB/s, \
-                 staging waits {}",
-                100.0 * (1.0 - misses as f64 / rows.max(1) as f64),
-                bytes as f64 / (1u64 << 20) as f64,
-                bytes as f64 / (1u64 << 20) as f64 / rt.max(1e-9),
-                b.staging_waits - a.staging_waits
-            )
-        };
-        eprintln!(
-            "run {r} {}: ttft {:.0} ms ({:.1} prefill tok/s, {n_prompt} tokens) | prefill {}",
-            if r == 0 { "cold" } else { "warm" },
-            ttft * 1e3,
-            n_prompt as f64 / ttft,
-            line(&s0, &s1)
-        );
-        eprintln!(
-            "run {r} decode: {:.2} tok/s over {n_decode} tokens | {}",
-            n_decode as f64 / dec,
-            line(&s1, &s2)
-        );
-    }
-    let total = m.moe_disk_stats().expect("disk-backed");
-    eprintln!("disk totals: {total:?}");
-    eprintln!("peak RSS (VmHWM): {:?} KiB", peak_rss_kib());
+    measure(&mut m, Some(&artifact));
+    let refused = m.enable_batch(1).err().map(|e| e.to_string());
+    eprintln!("enable_batch on disk experts: {refused:?}");
+    assert!(
+        refused.is_some_and(|e| e.contains("batched serving")),
+        "batched serving must refuse disk-backed experts"
+    );
     assert_eq!(tokens, ref_tokens, "disk greedy tokens must equal pinned");
     assert_eq!(
         mismatched, 0,
         "disk prefill logits must equal pinned bit for bit"
+    );
+}
+
+#[test]
+fn moe_pinned_measure() {
+    let Some((model, _, exec)) = setup() else {
+        return;
+    };
+    // SAFETY: as in setup.
+    unsafe { std::env::set_var("PADDOCK_MOE_HOST", "1") };
+    let map = MappedGguf::open(&model).expect("open gguf");
+    let mut m = GpuQwen35::load(exec, &map, MAX_CTX).expect("load pinned");
+    let slots = m.enable_moe_cache(u64::MAX).expect("seat expert cache");
+    eprintln!("pinned: {slots} slots/layer");
+    measure(&mut m, None);
+    if let Some((rows, misses)) = m.moe_cache_stats().expect("cache stats") {
+        eprintln!(
+            "pinned expert cache: {misses} misses of {rows} rows (hit {:.1}%)",
+            100.0 * (1.0 - misses as f64 / rows.max(1) as f64)
+        );
+    }
+}
+
+#[test]
+fn moe_disk_refuses_a_foreign_artifact() {
+    let Some((model, _, exec)) = setup() else {
+        return;
+    };
+    let bad = std::env::temp_dir().join(format!("pdk-foreign-{}.pdxa", std::process::id()));
+    std::fs::write(&bad, vec![0x5au8; 1 << 16]).expect("write foreign file");
+    // SAFETY: as in setup.
+    unsafe { std::env::set_var("PADDOCK_MOE_DISK", &bad) };
+    let map = MappedGguf::open(&model).expect("open gguf");
+    let err = GpuQwen35::load(exec, &map, MAX_CTX)
+        .err()
+        .map(|e| e.to_string());
+    eprintln!("foreign artifact: {err:?}");
+    let _ = std::fs::remove_file(&bad);
+    assert!(
+        err.is_some_and(|e| e.contains("expert artifact") && e.contains("pdk-foreign")),
+        "a foreign artifact must fail the load naming the file"
     );
 }
