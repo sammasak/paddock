@@ -1218,11 +1218,8 @@ impl MoeDiskBacking {
         );
         let pool = StagingPool::new(records, len, |n| PinnedBuf::new(stream.clone(), n))
             .map_err(|e| GpuError::Driver(format!("expert staging: {e}")))?;
-        // The host tier: PADDOCK_MOE_DISK_HOST_MB of pinned records
-        // (development instrument; none by default).
-        let tier_mb = dev_count(paddock_models::dev_var!("PADDOCK_MOE_DISK_HOST_MB"), 0);
-        // whole buffers a layer only
-        let per_layer = tier_mb.saturating_mul(1 << 20) / len / store.n_layers();
+        // the host tier (none by default), whole buffers a layer only
+        let per_layer = super::moe_cache::moe_disk_host_bytes() as usize / len / store.n_layers();
         let tier = (0..per_layer * store.n_layers())
             .map(|_| PinnedBuf::new(stream.clone(), len))
             .collect::<std::io::Result<Vec<_>>>()

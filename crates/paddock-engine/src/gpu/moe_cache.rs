@@ -54,15 +54,42 @@ pub fn moe_offload() -> MoeOffloadCfg {
     c
 }
 
-/// `PADDOCK_MOE_DISK=<artifact>`: development switch for the disk backing -
-/// the routed experts are read on a miss from this artifact (`moe_disk.rs`)
-/// instead of being held in page-locked RAM. qwen35 serves it, qwen4exp
-/// refuses it at load, and families without `[moe_offload]` ignore it as
-/// they ignore `PADDOCK_MOE_HOST`.
+/// `[moe_offload] disk_artifact` / `host_cache_gb`: the disk backing, armed
+/// once by the runner like [`MoeOffloadCfg`].
+#[derive(Clone, Debug, Default)]
+pub struct MoeDiskCfg {
+    pub artifact: std::path::PathBuf,
+    /// Pinned host tier of hot expert records (0 = none).
+    pub host_cache_bytes: u64,
+}
+
+static MOE_DISK: std::sync::OnceLock<MoeDiskCfg> = std::sync::OnceLock::new();
+
+pub fn set_moe_disk(cfg: MoeDiskCfg) {
+    let _ = MOE_DISK.set(cfg);
+}
+
+/// The disk backing's artifact: the routed experts are read on a miss from
+/// it (`moe_disk.rs`) instead of being held in page-locked RAM. From
+/// `[moe_offload] disk_artifact`, or `PADDOCK_MOE_DISK=<artifact>` (the
+/// development switch, which wins). qwen35 serves it, qwen4exp refuses it at
+/// load, and families without `[moe_offload]` ignore it as they ignore
+/// `PADDOCK_MOE_HOST`.
 pub fn moe_disk_artifact() -> Option<std::path::PathBuf> {
     paddock_models::dev_var_os!("PADDOCK_MOE_DISK")
         .filter(|v| !v.is_empty())
         .map(Into::into)
+        .or_else(|| MOE_DISK.get().map(|c| c.artifact.clone()))
+}
+
+/// Bytes of the disk backing's host tier: `[moe_offload] host_cache_gb`, or
+/// `PADDOCK_MOE_DISK_HOST_MB` (development switch, wins).
+pub(crate) fn moe_disk_host_bytes() -> u64 {
+    paddock_models::dev_var!("PADDOCK_MOE_DISK_HOST_MB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|mb| mb.saturating_mul(1 << 20))
+        .unwrap_or_else(|| MOE_DISK.get().map_or(0, |c| c.host_cache_bytes))
 }
 
 /// `PADDOCK_MOE_CACHE_SLOTS=<n>`: development pin for the per-layer slot

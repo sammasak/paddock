@@ -3580,6 +3580,25 @@ projection floors restored (W8_MIN=64, F8_DEC_MIN=8) - planes resident"
                     );
                 }
                 let exec = make_exec(pack)?;
+                // [moe_offload] disk_artifact: written from the GGUF on the
+                // first start, then opened (and checked) by the load
+                let disk = paddock_engine::gpu::moe_disk_artifact()
+                    .filter(|_| map.gguf().arch_field("expert_count").is_some());
+                if let Some(a) = disk.as_ref().filter(|a| !a.exists()) {
+                    eprintln!(
+                        "[moe-disk] writing the expert artifact {} from the GGUF (once)",
+                        a.display()
+                    );
+                    let t = std::time::Instant::now();
+                    paddock_engine::gpu_model::qwen35::GpuQwen35::write_expert_artifact(
+                        &exec, &map, a,
+                    )
+                    .map_err(|e| format!("writing the expert artifact {}: {e}", a.display()))?;
+                    eprintln!(
+                        "[moe-disk] artifact written in {:.1}s",
+                        t.elapsed().as_secs_f64()
+                    );
+                }
                 let mut model = paddock_engine::gpu_model::qwen35::GpuQwen35::load_with(
                     exec, &map, max_ctx, fp8_native,
                 )
@@ -3613,6 +3632,14 @@ projection floors restored (W8_MIN=64, F8_DEC_MIN=8) - planes resident"
                              speculates from its in-file MTP head or a \"dflash\" drafter"
                         ));
                     }
+                }
+                // the disk backing has no zero-copy fallback: seat its slot
+                // cache now (the serial lane never calls enable_batch)
+                if disk.is_some() {
+                    let slots = model
+                        .enable_moe_cache(u64::MAX)
+                        .map_err(|e| e.to_string())?;
+                    eprintln!("[moe-disk] disk-backed experts: {slots} VRAM slots a layer");
                 }
                 Ok(Box::new(model))
             }

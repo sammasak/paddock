@@ -29,6 +29,13 @@ pub trait Generator: Send {
         Ok(1)
     }
 
+    /// Why this backend serves one sequence on the serial loop by design
+    /// (a single-user serve then skips the batched lane and says why); `None`
+    /// when the batched lane is the one to try.
+    fn serial_only(&self) -> Option<String> {
+        None
+    }
+
     /// True if this backend has a working speculative-decode drafter (a loaded MTP
     /// head with spec enabled). The service routes even single-user (max_batch 1)
     /// serving through the batched loop when this holds - spec decode, the big
@@ -1582,6 +1589,9 @@ impl Generator for crate::gpu_model::qwen35::GpuQwen35 {
 
     fn release_idle_memory(&mut self) {
         crate::gpu_model::qwen35::GpuQwen35::trim_idle(self);
+    }
+    fn serial_only(&self) -> Option<String> {
+        crate::gpu_model::qwen35::GpuQwen35::serial_only(self)
     }
     fn enable_batch(&mut self, max_batch: usize) -> Result<usize, GenError> {
         // to_gen_err so a Config reject stays typed (fatal at startup, never

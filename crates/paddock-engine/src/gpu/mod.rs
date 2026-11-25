@@ -63,8 +63,8 @@ mod host_plane;
 pub use host_plane::{HostMappedKq, HostMirror};
 mod moe_cache;
 pub use moe_cache::{
-    ExpertCache, MOE_CACHE_NONE, MoeOffloadCfg, moe_cache_slots_pin, moe_disk_artifact,
-    moe_offload, set_moe_offload,
+    ExpertCache, MOE_CACHE_NONE, MoeDiskCfg, MoeOffloadCfg, moe_cache_slots_pin, moe_disk_artifact,
+    moe_offload, set_moe_disk, set_moe_offload,
 };
 mod kquant;
 mod kumo;

@@ -332,6 +332,21 @@ pub async fn run(
             .vram_gb
             .map(|g| (g.max(0.0) * (1u64 << 30) as f64) as u64),
     });
+    if let Some(artifact) = &mo.disk_artifact {
+        paddock_engine::gpu::set_moe_disk(paddock_engine::gpu::MoeDiskCfg {
+            artifact: artifact.clone(),
+            host_cache_bytes: mo
+                .host_cache_gb
+                .map_or(0, |g| (g.max(0.0) * (1u64 << 30) as f64) as u64),
+        });
+        tracing::info!(
+            artifact = %artifact.display(),
+            host_cache_gb = mo.host_cache_gb,
+            "[moe_offload] disk-backed MoE experts armed"
+        );
+    } else if mo.host_cache_gb.is_some() {
+        tracing::warn!("[moe_offload] host_cache_gb is set without disk_artifact - ignored");
+    }
     if mo.enabled {
         tracing::info!(
             vram_gb = mo.vram_gb,

@@ -1358,11 +1358,20 @@ impl GpuQwen35 {
     ) -> Result<usize, GpuModelError> {
         let dims = self
             .moe
-            .as_ref()
             .ok_or_else(|| GpuModelError::Unsupported("disk backing on a dense model".into()))?;
+        // The serial lane prefills up to max_ctx: seat its decode state and
+        // prefill scratch first, so the slots take only what is left after
+        // them (less a margin for transient allocations).
+        self.ensure_decode()?;
+        self.ensure_scratch(self.max_ctx)?;
+        let headroom = self
+            .exec
+            .vram_headroom()
+            .map_or(budget, |h| h.saturating_sub(512 << 20));
         let budget = crate::gpu::moe_offload()
             .vram_bytes
-            .map_or(budget, |cap| budget.min(cap));
+            .map_or(budget, |cap| budget.min(cap))
+            .min(headroom);
         let slots = crate::gpu::disk_slots(
             budget,
             b.slot_price(),
@@ -1402,6 +1411,15 @@ impl GpuQwen35 {
             )),
             None => Ok(()),
         }
+    }
+
+    /// Disk-backed experts serve one sequence on the eager serial path.
+    pub fn serial_only(&self) -> Option<String> {
+        self.moe_disk.as_ref().map(|_| {
+            "disk-backed MoE experts ([moe_offload] disk_artifact) serve one sequence on the \
+             eager serial loop: no batched lane, prefix cache or speculative decoding"
+                .to_string()
+        })
     }
 
     /// The disk backing's counters since load; `None` when pinned or resident.

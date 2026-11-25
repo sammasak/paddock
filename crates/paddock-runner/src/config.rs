@@ -30,11 +30,20 @@ pub struct KvOffload {
 /// k-quant expert seats offload today. `vram_gb` caps the slot cache (unset =
 /// auto: everything the plan leaves). Lower `max_ctx` / `max_batch` to give
 /// the cache more room.
+///
+/// `disk_artifact` backs the experts with a file on disk instead of
+/// page-locked RAM (qwen35 MoE): a miss is read from it, so host memory stays
+/// bounded. The file is written from the GGUF on the first start (about the
+/// size of the expert tensors) and checked against the model on every load.
+/// It serves one sequence on the serial loop (`max_batch` must be 1).
+/// `host_cache_gb` keeps that many GiB of hot expert records in pinned RAM.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MoeOffload {
     pub enabled: bool,
     pub vram_gb: Option<f64>,
+    pub disk_artifact: Option<PathBuf>,
+    pub host_cache_gb: Option<f64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -3236,7 +3236,7 @@ fn open_moe_disk(
     tracing::info!(
         artifact = %path.display(),
         layers = next,
-        "qwen35 MoE expert offload: routed experts disk-backed (PADDOCK_MOE_DISK)"
+        "qwen35 MoE expert offload: routed experts disk-backed ([moe_offload] disk_artifact)"
     );
     Ok(backing)
 }

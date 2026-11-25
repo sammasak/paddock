@@ -747,6 +747,10 @@ impl Engine {
                     // only place the tuned W4A8 decode GEMV and prefix cache
                     // run (granite/laguna's serial lane falls back to the
                     // exact-f32 oracle GEMV and has no prefix cache at all).
+                    if let Some(why) = generator.serial_only() {
+                        tracing::info!("paddock: serving SERIAL by design - {why}");
+                        (1, false)
+                    } else {
                     match generator.enable_batch(1) {
                         Ok(c) => {
                             if generator.spec_capable() {
@@ -820,6 +824,7 @@ impl Engine {
                             );
                             (1, false)
                         }
+                    }
                     }
                 };
                 // Measured model footprint for telemetry - sampled here, after
