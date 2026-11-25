@@ -11,7 +11,7 @@ pub enum GpuError {
     /// The driver reported `CUDA_ERROR_OUT_OF_MEMORY` (device result code 2) on
     /// an allocation. Kept as its own variant - Not folded into `Driver(String)`
     /// - so an OOM is classified by the driver's numeric result code at this
-    ///   boundary (see [`from_driver`]) and threaded up as a type the whole way,
+    ///   boundary (see `from_driver`) and threaded up as a type the whole way,
     ///   instead of being re-recognized later by sniffing the driver's rendered
     ///   text. An OOM during a large prefill (a many-page PDF or a high-detail
     ///   image on a VRAM-constrained or busy device) is a CAPACITY event the

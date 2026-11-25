@@ -12,7 +12,7 @@
 //!   field and one scale (shared by 8, 16 or 32 weights).
 //!
 //! Every codebook format is therefore a small extractor that yields that
-//! triple per group ([`Group`]), and a single loop widens it. IQ1 differs only
+//! triple per group (`Group`), and a single loop widens it. IQ1 differs only
 //! in that its grid bytes are signed and carry a +-1/8 offset instead of a
 //! sign field. Q2_K / Q3_K (2- and 3-bit fields, no codebook) and IQ4_NL
 //! (nibble codebook, 32-weight blocks) get a per-weight walk of their own.

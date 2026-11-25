@@ -2,9 +2,11 @@
 //! (`laya/common.py::build_sequence`), because the ids are the model's input
 //! and a different id is a different question:
 //!
+//! ```text
 //!   [CLS] "<type> question: <instructions>" [SEP]
 //!   [MASK] " <option 0>" [MASK] " <option 1>" ... [SEP]
 //!   <state> [SEP]
+//! ```
 //!
 //! Every option is `[MASK]` + at most 48 tokens of its text; when the options
 //! overflow `head_max_len` each is cut to an equal share (never under 4
@@ -84,7 +86,7 @@ impl LayaTok {
 }
 
 /// A question's sequence minus the state: everything up to and including the
-/// [SEP] the state follows, with its markers.
+/// `[SEP]` the state follows, with its markers.
 pub struct Prefix {
     pub ids: Vec<u32>,
     pub markers: Vec<u32>,
@@ -134,7 +136,7 @@ impl Prefix {
     }
 
     /// State tokens a sequence can carry after this prefix (and before the
-    /// closing [SEP]).
+    /// closing `[SEP]`).
     pub fn room(&self, max_len: usize) -> usize {
         max_len.saturating_sub(self.ids.len() + 1)
     }

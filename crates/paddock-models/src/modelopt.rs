@@ -12,11 +12,11 @@
 //!   break_fp4_bytes convention)
 //!   `<m>.weight_scale`   F8_E4M3 [N, K/16] per-16-block scale
 //!   `<m>.weight_scale_2` F32     []        per-tensor global scale
-//!   dequant: w[n,k] = e2m1 * e4m3_scale * scale_2 (multiplied, in that order)
+//!   dequant: w\[n,k\] = e2m1 * e4m3_scale * scale_2 (multiplied, in that order)
 //! - `FP8` - static W8A8, per quantized module:
 //!   `<m>.weight`         F8_E4M3 [N, K]
 //!   `<m>.weight_scale`   F32     []        per-tensor weight scale
-//!   `<m>.input_scale`    F32     [1]       static activation scale
+//!   `<m>.input_scale`    F32     \[1\]       static activation scale
 //!
 //! llm-compressor exports (quant_method "compressed-tensors", e.g.
 //! `unsloth/Qwen3.8-27B-NVFP4`) carry the same payloads
@@ -25,7 +25,7 @@
 //! - NVFP4 (`tensor_group`, group 16):
 //!   `<m>.weight_packed`        U8      [N, K/2]  same nibble packing
 //!   `<m>.weight_scale`         F8_E4M3 [N, K/16] same per-16 block scale
-//!   `<m>.weight_global_scale`  F32     [1]       RECIPROCAL of modelopt's
+//!   `<m>.weight_global_scale`  F32     \[1\]       RECIPROCAL of modelopt's
 //!   scale_2: llm-compressor scales the group scales up by `global` before
 //!   fp8-encoding them (observed ~1e4 - raw scales would drown in e4m3
 //!   subnormals), so dequant divides: scale2 = 1 / weight_global_scale.
@@ -280,14 +280,14 @@ pub fn fp8_view<'a>(st: &'a ShardedSafetensors, prefix: &str) -> Result<Fp8View<
 pub struct Fp8ChannelView<'a> {
     /// [n, k] e4m3 weight bytes.
     pub weight: &'a [u8],
-    /// [n] per-output-row scales, decoded to f32.
+    /// \[n\] per-output-row scales, decoded to f32.
     pub scales: Vec<f32>,
     pub n: usize,
     pub k: usize,
 }
 
 /// Assemble `<prefix>.weight` (e4m3 [n, k]) + `<prefix>.weight_scale`
-/// (BF16 or F32, [n, 1] or [n]) into a channel-scaled fp8 view.
+/// (BF16 or F32, \[n, 1\] or \[n\]) into a channel-scaled fp8 view.
 pub fn fp8_channel_view<'a>(
     st: &'a ShardedSafetensors,
     prefix: &str,

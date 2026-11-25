@@ -346,7 +346,7 @@ impl ServerHandler for GraphTools {
 
 /// Streamable-HTTP MCP service, mounted at /api/mcp/graph (same stateless
 /// config as artifacts: one request per call, headers reach tools via
-/// Extension<Parts>).
+/// `Extension<Parts>`).
 pub fn mcp_service(
     bridge: Arc<Bridge>,
     allowed_hosts: Vec<String>,

@@ -11,7 +11,7 @@
 //! library searched for at startup, which meant PDF rendering could be quietly
 //! absent; now the only question left is whether the MODEL can read page
 //! images. Rendering is CPU-bound and must run off the request executor /
-//! inference thread - callers wrap [`render`] in `tokio::task::spawn_blocking`.
+//! inference thread - callers wrap `render` in `tokio::task::spawn_blocking`.
 //! pdfium's core is not reentrant, so every call goes through one process-wide
 //! instance behind a mutex. That serialization used to come free with
 //! `pdfium-render`'s `thread_safe` feature; `paddock-pdfium` deliberately does
@@ -298,7 +298,7 @@ pub(crate) fn render(bytes: &[u8], cfg: &PdfConfig, sel: PageSel) -> Result<Rend
 /// Render a single 0-based `page` to interleaved RGB8 at ~`dpi`, for the
 /// forensic render-vs-scan comparison (paddock-forensics `PageRenderer`). Uses
 /// the one process-wide pdfium (`bind`), so it must run under
-/// `spawn_blocking` like [`render`]. `None` on any load/render failure.
+/// `spawn_blocking` like `render`. `None` on any load/render failure.
 #[cfg(feature = "pdf")]
 pub(crate) fn render_page_rgb(bytes: &[u8], page: u32, dpi: f32) -> Option<(Vec<u8>, u32, u32)> {
     let pdfium = bind();

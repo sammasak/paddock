@@ -338,9 +338,9 @@ impl GpuExecutor {
         })
     }
 
-    /// The matching W16 down into `part` [rows][k + 1][embd] pre-weighted
+    /// The matching W16 down into `part` [rows][k + 1]\[embd\] pre-weighted
     /// partials (slot k = the shared expert) for `moe_slot_combine`. `act`
-    /// bf16 from [`Self::nvf4_moe_up_relu2_w16`]; `topk_w` [rows][k].
+    /// bf16 from [`Self::nvf4_moe_up_relu2_w16`]; `topk_w` \[rows\]\[k\].
     #[allow(clippy::too_many_arguments)]
     pub fn nvf4_moe_down_part_w16(
         &self,

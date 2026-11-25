@@ -5,17 +5,17 @@
 //!
 //! Three pieces, all granite/ASR shapes with this family's deltas:
 //!
-//! - A persistent [`ChunkedPrefill`] queue (qwen3-asr's), whose entries carry
-//!   the mm ROW PLAN (image rows as [`Row::Image`]) plus the assembled
+//! - A persistent `ChunkedPrefill` queue (qwen3-asr's), whose entries carry
+//!   the mm ROW PLAN (image rows as `Row::Image`) plus the assembled
 //!   per-image feature planes. Mixed ticks advance a row budget per tick
 //!   (`forward_mixed`), and `rows_pass_body` splices image rows from the
 //!   planes by (slot, position) - a chunk cut inside a picture is just
 //!   another cut.
-//! - An encode queue ([`OcrEnc`], granite's WaveEncode shape made per SLOT -
+//! - An encode queue (`OcrEnc`, granite's WaveEncode shape made per SLOT -
 //!   this tower shares nothing across requests, so a page queues the moment
 //!   its own encodes finish instead of waiting out wave-mates; this is also
 //!   what dissolves the classic path's 1+3 arrival-split artifact). One
-//!   `encode_step` spends one tower call (~25-50 ms: a ≤[`MAX_VIEWS`]-view
+//!   `encode_step` spends one tower call (~25-50 ms: a ≤[`super::encode::MAX_VIEWS`]-view
 //!   crops chunk or the global view), staging into the persistent `mm_src`
 //!   slab across ticks; the per-image gather rides the same tick as its last
 //!   encode. `MmAdmit::Encoding` until the row plan is queued.

@@ -3,7 +3,7 @@
 //! per REQUEST as the OpenAI inline `mcp` tool (server_url + headers), so it
 //! never configures a runner and stays invisible to external API clients. The
 //! endpoint-contract tier (a server's own tools, every client sees them) stays
-//! in servers/<port>.toml.
+//! in `servers/<port>.toml`.
 //!
 //! Headers are returned to the Studio (it builds the requests), which is a
 //! looser posture than cloud keys; the store schema comment carries the

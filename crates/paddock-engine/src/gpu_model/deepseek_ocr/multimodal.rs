@@ -12,7 +12,7 @@
 //! [`super::tiling::Layout::blocks`] to stitch the crop grid, drop an
 //! `image_newline` at the end of every token row, and close with the
 //! separator. Prefill chunks then splice with one contiguous dtod copy per
-//! image run - the interleaved layout [text..][image..][text..] guarantees at
+//! image run - the interleaved layout [text..]\[image..\][text..] guarantees at
 //! most a few runs per chunk.
 //!
 //! ## Prefix caching (the point of doing this carefully)
@@ -24,7 +24,7 @@
 //! "Same page, many questions" then resumes past the whole picture - and the
 //! tower runs only for the sources the recomputed tail actually reads: a
 //! block-aligned resume that lands in the global view's last rows re-encodes
-//! the 1 global view, not the up-to-32 crops ([`SpliceSource`] accounting).
+//! the 1 global view, not the up-to-32 crops (`prep_need` accounting).
 //!
 //! Unlike gemma4v there are no non-causal image spans here - the reference
 //! runs plain causal attention over the whole sequence - so resumes may land
@@ -414,7 +414,7 @@ impl GpuDeepseekOcr {
 
     /// Multimodal prefill into `slot` - the wave of one. Serial-surface
     /// callers (warmup, the classic per-slot path) pay one chunk clone; the
-    /// serving path arrives through [`Self::multimodal_prefill_wave`] with
+    /// serving path arrives through `Self::multimodal_prefill_wave` with
     /// the whole admission wave and never lands here.
     pub fn multimodal_prefill_slot(
         &mut self,

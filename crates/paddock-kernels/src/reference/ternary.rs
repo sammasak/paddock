@@ -8,7 +8,7 @@
 //!   PQ2_0  (34 B): f16 d | 32 B of 2-bit slots, element j in bits 2*(j%4) of
 //!          byte j/4; weight = (slot - 1) * d. Slot 3 decodes as +2: the codec
 //!          allows it, a ternary checkpoint never writes it.
-//!   PTQ1_0 (28 B): qs[24] five trits a byte | qh[2] four trits a byte | f16 d.
+//!   PTQ1_0 (28 B): qs\[24\] five trits a byte | qh\[2\] four trits a byte | f16 d.
 //!
 //! A PTQ1_0 byte is a base-3 fraction of 256 - ggml TQ1_0's codec at half the
 //! block. For the 5-trit value `v` (first trit most significant) the byte is
@@ -16,9 +16,9 @@
 //! `((b * 3^n) mod 256) * 3`. qh's four trits sit in the top four positions.
 //! Element order is not positional, it follows a 4-wide walk:
 //!
-//!   element n*16 + m       is trit n of qs[m]        (m in 0..16)
+//!   element n*16 + m       is trit n of qs\[m\]        (m in 0..16)
 //!   element 80 + n*8 + m   is trit n of qs[16 + m]   (m in 0..8)
-//!   element 120 + n*2 + h  is trit n of qh[h]        (n in 0..4)
+//!   element 120 + n*2 + h  is trit n of qh\[h\]        (n in 0..4)
 //!
 //! so four neighbouring bytes at one trit position are four neighbouring
 //! weights. Numerics: a trit times an f16 scale is exact in f32, which is why

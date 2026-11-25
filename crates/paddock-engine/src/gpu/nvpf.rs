@@ -540,7 +540,7 @@ impl GpuExecutor {
     }
 
     /// [`Self::nvf4_pf_moe_dn`] and the shared down (`sd` over act from
-    /// column `aoff`, into `y` [ntok][embd]) in one grid (slot 933), each its
+    /// column `aoff`, into `y` \[ntok\]\[embd\]) in one grid (slot 933), each its
     /// own launch's bits. `Ok(false)`, nothing launched, without the slot or
     /// off its arm.
     #[allow(clippy::too_many_arguments)]

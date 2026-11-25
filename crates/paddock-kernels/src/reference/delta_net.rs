@@ -352,8 +352,8 @@ pub fn gated_rmsnorm(
 /// surrounding in_proj / out_proj are plain Q8_0 GEMMs.
 ///
 /// Shapes (row-major): `mixed_qkv` [T, 2*key_dim+value_dim]; `z` [T, value_dim];
-/// `a`,`b` [T, n_v_heads]; `conv_w` [conv_dim, k]; `ssm_a`,`dt_bias` [n_v_heads];
-/// `ssm_norm_w` [s]; `core_out` [T, value_dim]. `s` = head_k_dim = head_v_dim;
+/// `a`,`b` \[T, n_v_heads\]; `conv_w` \[conv_dim, k\]; `ssm_a`,`dt_bias` \[n_v_heads\];
+/// `ssm_norm_w` \[s\]; `core_out` \[T, value_dim\]. `s` = head_k_dim = head_v_dim;
 /// `key_dim = s*n_k_heads`, `value_dim = s*n_v_heads`, `conv_dim = 2*key_dim+value_dim`.
 #[allow(clippy::too_many_arguments)]
 pub fn deltanet_mixer_core(

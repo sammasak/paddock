@@ -9,7 +9,7 @@
 //! is the one that knows where a sequence ends (`gpu::eg2_attn`, per-sequence
 //! tile lists).
 //!
-//!   ids -> x0 = E[ids] * sqrt(512)  (also the residual x)
+//!   ids -> x0 = E\[ids\] * sqrt(512)  (also the residual x)
 //!   24 x { [this layer's PLE: rmsnorm(x0 . P_l / sqrt(512)) * w_ple]
 //!          xn = attn_norm(x) -> q|k|v GEMM -> q/k rmsnorm + rope, v rmsnorm
 //!          -> bidirectional attention (sliding |i - j| <= 512 at hd 256,

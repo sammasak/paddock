@@ -22,7 +22,7 @@
 //!   2 x post-norm-free torch TransformerEncoderLayer (norm_first, ReLU FFN
 //!        of 4d, full attention with the in_proj bias); the LAST one runs its
 //!        attention over every row and the rest over only the rows anything
-//!        reads - the option markers and the [CLS] rows - which is most of
+//!        reads - the option markers and the \[CLS\] rows - which is most of
 //!        that layer's FFN saved
 //!   scorer: LN -> Linear(d, d) + GELU -> Linear(d, 1) at each marker
 //!   act head: [X at CLS | 4 features of the option distribution] -> 256 ->

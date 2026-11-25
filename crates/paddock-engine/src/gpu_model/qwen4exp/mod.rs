@@ -262,7 +262,7 @@ pub struct DenseStage {
     /// `kq_matmul`). Set per walk; the MTP head's passes and every decode walk
     /// leave it off, so their measured elections do not move.
     pub prefill: bool,
-    /// single-row staging for `row_exact` ([hc_width] in, [max(vocab,
+    /// single-row staging for `row_exact` (\[hc_width\] in, [max(vocab,
     /// hc_width)] out), taken out of the stage while a row runs; None off the
     /// GGUF lane
     pub xrow: Option<CudaSlice<f32>>,
@@ -2168,7 +2168,7 @@ pub enum ExpertSeats {
 /// One hyper-connection sub-block (attn_ and mlp_ each have one; the final
 /// mixer is the same minus `inject`).
 pub struct HcW {
-    /// group RMSNorm weight, (1+w) form, [4*hidden] f32
+    /// group RMSNorm weight, (1+w) form, \[4*hidden\] f32
     pub norm: DeviceTensor,
     /// input_mix_weight_down [lowrank, 4*hidden] - with the `block_inject`
     /// rows APPENDED when `inject_rows > 0`. Both projections read the same
@@ -2215,9 +2215,9 @@ pub struct GdnW {
     pub ab: DeviceTensor,
     /// bf16 twin of the folded a||b plane for the TGV lane (slot 547).
     pub ab16: Option<CudaSlice<u8>>,
-    /// conv1d [10240, 4] f32 (checkpoint [10240,1,4] squeezed); silu act
+    /// conv1d [10240, 4] f32 (checkpoint \[10240,1,4\] squeezed); silu act
     pub conv: DeviceTensor,
-    /// RAW A_log [48] f32 - the g = -exp(A_log)*softplus(a+dt_bias) fold is
+    /// RAW A_log \[48\] f32 - the g = -exp(A_log)*softplus(a+dt_bias) fold is
     /// the graph's call, kept un-baked so the kernel lane stays flexible
     pub a_log: DeviceTensor,
     /// `-exp(A_log)`, the form `pd_delta_gate` consumes (it computes
@@ -2225,7 +2225,7 @@ pub struct GdnW {
     /// plane above; 48 floats.
     pub ssm_a: DeviceTensor,
     pub dt_bias: DeviceTensor,
-    /// gated-norm weight [128] f32 (plain w, sigmoid gate - Not qwen35 silu)
+    /// gated-norm weight \[128\] f32 (plain w, sigmoid gate - Not qwen35 silu)
     pub norm: DeviceTensor,
     /// out_proj [hidden, 6144]
     pub out: DensePlane,
@@ -2252,7 +2252,7 @@ pub struct AttnW {
     pub qkv_f: Option<QuantTensor>,
     /// o_proj [hidden, 6144]
     pub o: DensePlane,
-    /// per-head q/k RMSNorm (1+w) [256] f32
+    /// per-head q/k RMSNorm (1+w) \[256\] f32
     pub q_norm: DeviceTensor,
     pub k_norm: DeviceTensor,
     /// indexer.index_qk_proj [640, hidden] bf16 (rows: q 4x128 | k 1x128)
@@ -2261,7 +2261,7 @@ pub struct AttnW {
     /// the GGUF and NVIDIA exports, MXFP8 on an MX-quantized one), and
     /// pinning it to bf16 refused a file whose every other plane loads.
     pub idx_qk: DensePlane,
-    /// indexer per-head RMSNorms [128] f32
+    /// indexer per-head RMSNorms \[128\] f32
     pub idx_q_norm: DeviceTensor,
     pub idx_k_norm: DeviceTensor,
 }
@@ -2298,7 +2298,7 @@ pub struct PleW {
     pub value: DensePlane,
     /// conv1d [4*hidden, 4] f32 (k=4, dilation 3 -> 9-token ring); silu
     pub conv: DeviceTensor,
-    /// group norms (1+w) [4*hidden] f32
+    /// group norms (1+w) \[4*hidden\] f32
     pub norm_key: DeviceTensor,
     pub norm_query: DeviceTensor,
     pub norm_conv: DeviceTensor,

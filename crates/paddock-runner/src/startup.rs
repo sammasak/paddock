@@ -30,10 +30,10 @@ pub enum ServiceAction {
     /// Register an auto-start OS service for a config file (Windows service /
     /// systemd unit). Windows needs an elevated terminal.
     Install {
-        /// The server's config file (servers/<port>.toml)
+        /// The server's config file (`servers/<port>.toml`)
         #[arg(long, value_name = "PATH")]
         config: PathBuf,
-        /// Service name (default: paddock-runner-<port>)
+        /// Service name (default: `paddock-runner-<port>`)
         #[arg(long, value_name = "NAME")]
         name: Option<String>,
     },
@@ -281,7 +281,7 @@ pub struct Cli {
     pub aliases: Option<String>,
     /// Parameter variants as one JSON object, e.g.
     /// {"high":{"chat_template_kwargs":{"reasoning_effort":"high"}}} -
-    /// each key becomes a selectable model id <model>:<key>
+    /// each key becomes a selectable model id `<model>:<key>`
     #[arg(long, value_name = "JSON")]
     pub variants: Option<String>,
     /// Client request fields to strip server-side (comma-separated), e.g.

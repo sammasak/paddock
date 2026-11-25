@@ -15,7 +15,7 @@ pub struct MessagesRequest {
     pub model: String,
     /// Required by the Anthropic API (no default).
     pub max_tokens: usize,
-    /// [{role: user|assistant, content: string | [blocks]}]
+    /// `[{role: user|assistant, content: string | [blocks]}]`
     pub messages: Vec<serde_json::Value>,
     /// Anthropic MCP connector (beta `mcp-client-2025-04-04`): remote MCP servers
     /// Paddock connects to and executes tool calls against, emitting

@@ -74,3 +74,10 @@ logs/
 
 # Throwaway ssh keypair for the test runner.
 .testbox/
+
+# Local Nix/devenv state.
+.devenv/
+.direnv/
+.pre-commit-config.yaml
+result
+result-*

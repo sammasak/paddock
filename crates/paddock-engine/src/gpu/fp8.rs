@@ -113,7 +113,7 @@ impl GpuExecutor {
 
     /// Concatenate repacked-Q8 weights along the out dimension (fused-QKV
     /// planes: one wide GEMM instead of several narrow wave-starved ones).
-    /// All inputs must share dims[0] (the input dim).
+    /// All inputs must share dims\[0\] (the input dim).
     pub fn concat_q8(&self, parts: &[&RepackedQ8]) -> Result<RepackedQ8, GpuError> {
         let in_dim = parts[0].dims[0];
         debug_assert!(parts.iter().all(|p| p.dims[0] == in_dim));
@@ -587,7 +587,7 @@ impl GpuExecutor {
         check(rc).map(|_| true)
     }
 
-    /// Fold-free per-row e4m3 GEMM: y = (e4m3 W x e4m3 X) * ws[row] * xs[col]
+    /// Fold-free per-row e4m3 GEMM: y = (e4m3 W x e4m3 X) * ws\[row\] * xs\[col\]
     /// applied in the epilogue only.
     #[allow(clippy::too_many_arguments)]
     pub fn f8row_gemm(
@@ -670,8 +670,8 @@ impl GpuExecutor {
     /// The two rowwise planes carry the same e4m3 payload under the same
     /// normalization (amax/2^e <= 448, weights pre-divided by 2^e); they differ
     /// only in how the per-output-row scale is ENCODED:
-    ///   q8_0_to_f8row -> f32  rscale[row] = 2^e
-    ///   bf16_to_f8r   -> e8m0 scale[row]  = e + 127   (multiplier 2^(b-127))
+    ///   q8_0_to_f8row -> f32  rscale\[row\] = 2^e
+    ///   bf16_to_f8r   -> e8m0 scale\[row\]  = e + 127   (multiplier 2^(b-127))
     /// so the transcode is exact, and f8_repack_tiles rewrites only `data` and
     /// carries the scale through untouched. Done once per plane at load, on the
     /// host: out_dim is at most a few 10k scalars, which is not worth a kernel.
@@ -2660,7 +2660,7 @@ impl GpuExecutor {
 
     /// Per-channel gu GEMM (kt4a scale-free mainloop): `as_row` =
     /// f32 per-token scales from the row quantizer, `ws` = f32 per-channel
-    /// scales [out_dim] (gate half at 0, up half at out_dim/2). Serves the
+    /// scales \[out_dim\] (gate half at 0, up half at out_dim/2). Serves the
     /// pc plane whose per-row pow2 exponents also fill the per-32 strip, so
     /// every other consumer of the same plane dequantizes identically.
     /// Ok(false) = route not covered (the pack's -2).
@@ -3003,7 +3003,7 @@ impl GpuExecutor {
 
     /// Block-scale tile-linear decode GEMM (official-FP8 byte passthrough):
     /// data-only 16384 B boxes in `wlin`, one f32 scale per 128×128 block in
-    /// `wsc` ([out/128][in/128]). Same contract as [`Self::f8_gemm_lin`].
+    /// `wsc` ([out/128]\[in/128\]). Same contract as [`Self::f8_gemm_lin`].
     #[allow(clippy::too_many_arguments)]
     pub fn f8_gemm_lin_bs(
         &self,
@@ -3046,7 +3046,7 @@ impl GpuExecutor {
     }
 
     /// Build a byte-passthrough (bs) decode plane: raw row-major e4m3 bytes
-    /// repacked to data-only lin boxes with the f32 [out/128][in/128] scale
+    /// repacked to data-only lin boxes with the f32 [out/128]\[in/128\] scale
     /// plane appended at the tail of `data`; `scale` is the 8-byte marker
     /// `f8d_gemm_mma_ks` dispatches on. CONSUMES the raw plane.
     pub fn f8w_build_lin_bs(
@@ -3284,7 +3284,7 @@ impl GpuExecutor {
         })
     }
 
-    /// Fused gate|up-layout bf16 swiglu + e4m3 quant: one [rows][2*ff] bf16
+    /// Fused gate|up-layout bf16 swiglu + e4m3 quant: one \[rows\]\[2*ff\] bf16
     /// buffer (the single-GEMM prefill FFN epilogue), gate cols [0,ff), up
     /// [ff,2ff). Per-element math identical to `quantize_e4m3_swiglu_b16`.
     pub fn quantize_e4m3_swiglu_b16_gu(

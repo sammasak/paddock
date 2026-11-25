@@ -2,7 +2,7 @@
 //! with its width, verify rows and wall time, and for every slot the chain
 //! drafted for its depth, accepted run and the drafter's log p(top1) at each
 //! position (see the qwen35 `spec_conf.rs` docs for what it is for).
-//! PADDOCK_SPEC_CONF_LOG=<path>, with PADDOCK_SPEC_CONF=1 arming the planes.
+//! `PADDOCK_SPEC_CONF_LOG=<path>`, with PADDOCK_SPEC_CONF=1 arming the planes.
 
 use std::io::Write as _;
 use std::sync::{Mutex, OnceLock};

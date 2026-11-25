@@ -798,7 +798,7 @@ impl GpuExecutor {
         })
     }
 
-    /// Batched-spec conv-ext staging: `ext[b]` = window(slots[b]) ++ mixed[b]
+    /// Batched-spec conv-ext staging: `ext[b]` = window(slots\[b\]) ++ mixed\[b\]
     /// (`[batch, km1 + r, conv_dim]`). One launch replaces 2·B copy_regions.
     #[allow(clippy::too_many_arguments)]
     pub fn conv_ext_build_slots(
@@ -871,8 +871,8 @@ impl GpuExecutor {
         })
     }
 
-    /// Ragged spec commit, state half: roll each short slot (committed[b] < r)
-    /// back to snapshot committed[b]-1. Snapshot layout = the v2 kernel's
+    /// Ragged spec commit, state half: roll each short slot (committed\[b\] < r)
+    /// back to snapshot committed\[b\]-1. Snapshot layout = the v2 kernel's
     /// [batch, r] t-major transposed tiles.
     #[allow(clippy::too_many_arguments)]
     pub fn state_restore_slots(
@@ -909,8 +909,8 @@ impl GpuExecutor {
         })
     }
 
-    /// Ragged spec commit, conv half: window(slots[b]) = ext[b] rows
-    /// [committed[b], committed[b]+km1).
+    /// Ragged spec commit, conv half: window(slots\[b\]) = ext\[b\] rows
+    /// [committed\[b\], committed\[b\]+km1).
     #[allow(clippy::too_many_arguments)]
     pub fn conv_commit_slots(
         &self,

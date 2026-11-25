@@ -8,7 +8,7 @@
 //! The graph, both checkpoints:
 //!
 //!   pictures -> Pixtral tower + Mistral 3 projector -> rows of `[IMG]`
-//!   ids -> E[ids] (bf16, widened exactly), `[IMG]` rows from the pictures
+//!   ids -> E\[ids\] (bf16, widened exactly), `[IMG]` rows from the pictures
 //!   34 x { xn = rms(x) -> q|k|v GEMM -> YaRN rope + Llama 4's q factor
 //!          -> bidirectional GQA attention (32 / 8, hd 128) -> x += o GEMM;
 //!          xn = rms(x) -> gate|up GEMM with silu(gate) * up landed

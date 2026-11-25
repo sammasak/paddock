@@ -6,7 +6,7 @@ use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 use paddock_models::ggml_type::GgmlType;
 
 impl GpuExecutor {
-    /// Build the reverse routing map slot_of[b][e] (255 = not selected) from the
+    /// Build the reverse routing map slot_of\[b\]\[e\] (255 = not selected) from the
     /// per-token expert ids - the index the grouped MoE kernels iterate over.
     pub fn moe_slot_map(
         &self,
@@ -146,7 +146,7 @@ impl GpuExecutor {
     }
 
     /// moe_align: group token-expert pairs into contiguous BM-padded blocks for
-    /// the sorted GEMM. `block_expert` is [max_blocks], the sorted arrays
+    /// the sorted GEMM. `block_expert` is \[max_blocks\], the sorted arrays
     /// [max_blocks * BM].
     #[allow(clippy::too_many_arguments)]
     pub fn moe_align(
@@ -981,7 +981,7 @@ impl GpuExecutor {
     }
 
     /// Quantize an f32 activation to symmetric int8 + per-32-block scale (Q8_1
-    /// style) for the dp4a integer-matmul path. `q` is [n] int8, `scale` [n/32].
+    /// style) for the dp4a integer-matmul path. `q` is \[n\] int8, `scale` [n/32].
     pub fn quantize_q8(
         &self,
         x: &CudaSlice<f32>,
@@ -1176,7 +1176,7 @@ impl GpuExecutor {
     }
 
     /// Fused MXFP4-dequant + GEMV for the expert at `idx[slot]` (device index):
-    /// y = bias[e] + W[e]·x. `w` is the whole MXFP4 expert tensor.
+    /// y = bias\[e\] + W\[e\]·x. `w` is the whole MXFP4 expert tensor.
     #[allow(clippy::too_many_arguments)]
     pub fn mxfp4_gemv_indexed(
         &self,
@@ -1321,7 +1321,7 @@ impl GpuExecutor {
         })
     }
 
-    /// Fused MoE gate+up+swiglu over the active experts -> `out` [n_active*ff].
+    /// Fused MoE gate+up+swiglu over the active experts -> `out` \[n_active*ff\].
     /// `gate`/`up` are the full MXFP4 expert tensors [embd, ff, n_experts]; their
     /// biases are [n_experts, ff]. One launch replaces the per-expert gate/up
     /// GEMV + swiglu.
@@ -1589,7 +1589,7 @@ impl GpuExecutor {
     }
 
     /// Fused MoE down + weighted expert mix + residual add: `residual` += Σ_slot
-    /// w[slot]·(down_e·fused[slot] + bias). One launch replaces the per-expert
+    /// w\[slot\]·(down_e·fused\[slot\] + bias). One launch replaces the per-expert
     /// down GEMV + scale_add and the final residual add (no scratch, no memset).
     #[allow(clippy::too_many_arguments)]
     pub fn mxfp4_moe_down(
@@ -1633,7 +1633,7 @@ impl GpuExecutor {
         })
     }
 
-    /// x[..n] += w[slot] * y[..n], weight from a device buffer.
+    /// x[..n] += w\[slot\] * y[..n], weight from a device buffer.
     pub fn scale_add_dev(
         &self,
         x: &mut CudaSlice<f32>,

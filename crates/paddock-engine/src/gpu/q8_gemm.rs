@@ -413,8 +413,8 @@ impl GpuExecutor {
 
     /// In-house f16xf16->f32 tensor-core GEMM (slot 383,
     /// PADDOCK_INHOUSE_F16) - the cuBLAS-free twin of `gemm_f16_f32_beta`. Same
-    /// semantics: y = beta*y + W^T x, W=[out_dim,in_dim] f16 row-major,
-    /// x=[batch,in_dim] f16 row-major, y=[batch,out_dim] f32.
+    /// semantics: y = beta*y + W^T x, W=\[out_dim,in_dim\] f16 row-major,
+    /// x=\[batch,in_dim\] f16 row-major, y=\[batch,out_dim\] f32.
     pub fn f16_gemm(
         &self,
         w16: &CudaSlice<f16>,
@@ -1310,7 +1310,7 @@ impl GpuExecutor {
     /// cp.async-pipelined (2-stage, double-buffered) tiled mmq GEMM for the
     /// very-large-M encoder prefill (the llama mul_mat_q approach). Same
     /// `RepackedQ8` weight + `quantize_q8_mmq` activation layout as
-    /// [`q8_0_gemm_mmq`], no stream-k fixup; requires in_dim % 128 == 0.
+    /// [`Self::q8_0_gemm_mmq`], no stream-k fixup; requires in_dim % 128 == 0.
     pub fn q8_0_gemm_mmq_pipe(
         &self,
         w: &RepackedQ8,
@@ -1397,7 +1397,7 @@ impl GpuExecutor {
 
     /// Slot 605 over `batch` rows from `row0`: `w` is a [in -> 4 * hidden]
     /// hyper-connection up plane, `yq` its chunk-local mmq rows, `xn` the
-    /// [rows][4 * hidden] normalized state and `out` the [rows][hidden] mixed
+    /// \[rows\][4 * hidden] normalized state and `out` the \[rows\]\[hidden\] mixed
     /// output - both row offsets ride the pointers. Byte-identical to
     /// [`Self::q8_0_gemm_mmq_pipe_rows`] followed by `q4x_hc_mix`.
     #[allow(clippy::too_many_arguments)]
@@ -1531,7 +1531,7 @@ impl GpuExecutor {
 
     /// High-occupancy (2 blocks/SM) tiled mmq GEMM for the very-large-M encoder
     /// prefill. Same `RepackedQ8` weight + `quantize_q8_mmq` activation layout
-    /// as [`q8_0_gemm_mmq`], no stream-k fixup.
+    /// as [`Self::q8_0_gemm_mmq`], no stream-k fixup.
     pub fn q8_0_gemm_mmq_hi(
         &self,
         w: &RepackedQ8,

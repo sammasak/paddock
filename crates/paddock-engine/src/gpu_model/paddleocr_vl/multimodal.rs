@@ -1,6 +1,6 @@
 //! PaddleOCR-VL multimodal serving.
 //!
-//! Two lanes share the [`MmPlan`] machinery here:
+//! Two lanes share the `MmPlan` machinery here:
 //!
 //! - the exclusive serial path: one image prompt at a time through the
 //!   serial spine (`forward_multimodal_impl` - the no-paged-kv fallback and

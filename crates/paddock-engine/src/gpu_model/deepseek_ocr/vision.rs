@@ -5,7 +5,7 @@
 //!   pixels @1024 -> SAM ViT-B (patch 16, 64x64 grid, windowed attention with
 //!                  decomposed rel-pos, global only at 4 of 12 blocks)
 //!                -> neck (1x1 conv 768->256, LN2d, 3x3 conv, LN2d)
-//!                -> net_2 (3x3 s2, 256->512) -> net_3 (3x3 s2, 512->1024)   [16x]
+//!                -> net_2 (3x3 s2, 256->512) -> net_3 (3x3 s2, 512->1024)   \[16x\]
 //!                -> CLIP-L consumes that as its patch embeddings (+CLS, +pos)
 //!                -> concat(clip[:, 1:], sam_net3_flat) = 2048
 //!                -> linear projector -> 1280 = the decoder's width
@@ -35,7 +35,7 @@
 //!   `LayerNorm2d`'s default). CLIP's is 1e-5 for both its block norms and its
 //!   pre-norm. One key, two towers - so [`CLIP_EPS`] is a constant here.
 //!
-//! And one tensor is dead weight: `v.patch_embd.weight` [14,14,3,1024] is
+//! And one tensor is dead weight: `v.patch_embd.weight` \[14,14,3,1024\] is
 //! CLIP's own conv stem, which `CLIPVisionEmbeddings.forward` only reaches on
 //! its `patch_embeds is None` branch. Every call site in the family passes
 //! SAM's net_3 output (`vision_model(img, sam_out)`), so the branch is never

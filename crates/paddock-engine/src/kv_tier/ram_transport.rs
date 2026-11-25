@@ -1106,7 +1106,7 @@ impl RamTransport {
     }
 
     /// Start whatever the queues and the no-duplex rule allow.
-    /// [`XferSink::expedite`]: mark the queued ones urgent and start them.
+    /// [`crate::kv_tier::pool_tier::XferSink::expedite`]: mark the queued ones urgent and start them.
     pub fn expedite_inner(&mut self, ops: &[OpId]) {
         let queued: HashSet<OpId> = self.q_store.iter().map(|q| q.job.op).collect();
         let before = self.urgent.len();

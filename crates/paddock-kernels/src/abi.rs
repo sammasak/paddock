@@ -127,8 +127,8 @@ pub type ScaleAddF32Fn = unsafe extern "C" fn(
 /// attention sinks + sliding window, online (flash-style) softmax. Replaces the
 /// per-head score-gemv / softmax / output-gemv loop with a single launch.
 ///
-/// q/out: [n_heads*head_dim] (query already RoPE'd). k_cache/v_cache:
-/// [_ * kv_dim] rows, head kvh at `p*kv_dim + kvh*head_dim`. sinks: [n_heads].
+/// q/out: \[n_heads*head_dim\] (query already RoPE'd). k_cache/v_cache:
+/// \[_ * kv_dim\] rows, head kvh at `p*kv_dim + kvh*head_dim`. sinks: \[n_heads\].
 /// Attends positions `first_pos .. first_pos+n_pos`. head_dim must be a power of 2.
 #[allow(clippy::too_many_arguments)]
 pub type AttnDecodeF32Fn = unsafe extern "C" fn(
@@ -147,7 +147,7 @@ pub type AttnDecodeF32Fn = unsafe extern "C" fn(
     stream: *mut core::ffi::c_void,
 ) -> KernelStatus;
 
-/// MoE top-k router: biased `logits` [n_expert] -> top-k expert ids (u32) and
+/// MoE top-k router: biased `logits` \[n_expert\] -> top-k expert ids (u32) and
 /// softmax-over-selected weights (f32), on device (no host round-trip).
 pub type MoeTopkFn = unsafe extern "C" fn(
     logits: *const core::ffi::c_void,
@@ -159,7 +159,7 @@ pub type MoeTopkFn = unsafe extern "C" fn(
 ) -> KernelStatus;
 
 /// Fused MXFP4-dequant + GEMV for one expert selected by a device index:
-/// y[o] = bias[e][o] + Σ_i dequant(W[e][o][i])·x[i], e = idx[slot]. `bias` may be
+/// y\[o\] = bias\[e\]\[o\] + Σ_i dequant(W\[e\]\[o\]\[i\])·x\[i\], e = idx\[slot\]. `bias` may be
 /// null. Rows are block-aligned (in_dim % 32 == 0).
 #[allow(clippy::too_many_arguments)]
 pub type Mxfp4GemvIndexedFn = unsafe extern "C" fn(
@@ -174,7 +174,7 @@ pub type Mxfp4GemvIndexedFn = unsafe extern "C" fn(
     stream: *mut core::ffi::c_void,
 ) -> KernelStatus;
 
-/// x[..n] += w[slot] * y[..n], with the weight read from a device buffer.
+/// x\[..n\] += w\[slot\] * y\[..n\], with the weight read from a device buffer.
 pub type ScaleAddDevFn = unsafe extern "C" fn(
     x: *mut core::ffi::c_void,
     y: *const core::ffi::c_void,
@@ -185,7 +185,7 @@ pub type ScaleAddDevFn = unsafe extern "C" fn(
 ) -> KernelStatus;
 
 /// Fused Q8_0-dequant + GEMV for a dense weight (attention q/k/v/o, router,
-/// lm_head): y[o] = bias[o] + Σ_i dequant(W[o][i])·x[i]. `w` is Q8_0
+/// lm_head): y\[o\] = bias\[o\] + Σ_i dequant(W\[o\]\[i\])·x\[i\]. `w` is Q8_0
 /// [in_dim, out_dim] in GGUF layout (out_dim rows of in_dim contiguous elems);
 /// `bias` may be null. Rows are block-aligned (in_dim % 32 == 0). Keeps the
 /// weight Q8_0-resident - ~3.8× less bandwidth than dequant-to-f32 then cuBLAS.
@@ -200,8 +200,8 @@ pub type Q8_0GemvFn = unsafe extern "C" fn(
 ) -> KernelStatus;
 
 /// FlashDecoding partial: one block per (head, split), online softmax over the
-/// split's KV slice -> UNnormalized partial output `out_o` [n_heads*n_splits*head_dim]
-/// plus per-partial (max, sum) in `out_ml` [n_heads*n_splits*2]. Sink is applied
+/// split's KV slice -> UNnormalized partial output `out_o` \[n_heads*n_splits*head_dim\]
+/// plus per-partial (max, sum) in `out_ml` \[n_heads*n_splits*2\]. Sink is applied
 /// in the combine, not here. head_dim must be a multiple of 32.
 #[allow(clippy::too_many_arguments)]
 pub type AttnDecodePartialFn = unsafe extern "C" fn(
@@ -222,7 +222,7 @@ pub type AttnDecodePartialFn = unsafe extern "C" fn(
 ) -> KernelStatus;
 
 /// FlashDecoding combine: merge the n_splits partials per head (flash log-sum-exp
-/// rule) into `out` [n_heads*head_dim], folding the per-head sink into the
+/// rule) into `out` \[n_heads*head_dim\], folding the per-head sink into the
 /// denominator. One block per head; head_dim threads.
 pub type AttnDecodeCombineFn = unsafe extern "C" fn(
     in_o: *const core::ffi::c_void,
@@ -237,7 +237,7 @@ pub type AttnDecodeCombineFn = unsafe extern "C" fn(
 
 /// Fused MoE gate+up+swiglu, batched over active experts. grid (ff, n_active):
 /// each block drives both projections for expert `idx[slot]` from a single read of
-/// `x`, then applies swiglu_oai and writes `out` [n_active*ff]. Replaces the
+/// `x`, then applies swiglu_oai and writes `out` \[n_active*ff\]. Replaces the
 /// per-expert gate/up GEMV + swiglu chain.
 #[allow(clippy::too_many_arguments)]
 pub type Mxfp4MoeGateUpFn = unsafe extern "C" fn(
@@ -259,8 +259,8 @@ pub type Mxfp4MoeGateUpFn = unsafe extern "C" fn(
 ) -> KernelStatus;
 
 /// Fused MoE down projection + weighted expert mix + residual add. grid (embd):
-/// each block sums Σ_slot w[slot]·(down_e·fused[slot] + bias) over active experts
-/// and adds it straight into `residual` [embd]. Replaces the per-expert down GEMV
+/// each block sums Σ_slot w\[slot\]·(down_e·fused\[slot\] + bias) over active experts
+/// and adds it straight into `residual` \[embd\]. Replaces the per-expert down GEMV
 /// + scale_add + the zero-init and final residual add.
 #[allow(clippy::too_many_arguments)]
 pub type Mxfp4MoeDownFn = unsafe extern "C" fn(
@@ -277,7 +277,7 @@ pub type Mxfp4MoeDownFn = unsafe extern "C" fn(
     stream: *mut core::ffi::c_void,
 ) -> KernelStatus;
 
-/// Batched Q8_0 GEMM: y[b][o] = bias[o] + Σ_i dequant(W[o][i])·x[b][i] for
+/// Batched Q8_0 GEMM: y\[b\]\[o\] = bias\[o\] + Σ_i dequant(W\[o\]\[i\])·x\[b\]\[i\] for
 /// b in 0..batch. `x` is row-major [batch, in_dim], `y` is [batch, out_dim].
 /// The weight row is dequanted once and applied across the batch - the
 /// weight-read amortization that makes concurrent decode scale with the batch.
@@ -292,7 +292,7 @@ pub type Q8_0GemmFn = unsafe extern "C" fn(
     stream: *mut core::ffi::c_void,
 ) -> KernelStatus;
 
-/// Quantize an f32 activation `x` [n] to symmetric int8 `q` [n] + per-32-block
+/// Quantize an f32 activation `x` \[n\] to symmetric int8 `q` \[n\] + per-32-block
 /// f32 `scale` [n/32] - the Q8_1-style activation quantization that enables the
 /// integer `__dp4a` dot-product path (llama.cpp/mistral.rs method).
 pub type QuantizeQ8Fn = unsafe extern "C" fn(
@@ -303,7 +303,7 @@ pub type QuantizeQ8Fn = unsafe extern "C" fn(
     stream: *mut core::ffi::c_void,
 ) -> KernelStatus;
 
-/// dp4a Q8_0 GEMV: y[o] = bias[o] + Σ_b wscale[b]·ascale[b]·Σ dp4a(w_int8, a_int8).
+/// dp4a Q8_0 GEMV: y\[o\] = bias\[o\] + Σ_b wscale\[b\]·ascale\[b\]·Σ dp4a(w_int8, a_int8).
 /// `xq`/`xs` are the pre-quantized activation (int8 + scale). Integer dot on the
 /// hardware dp4a unit - ~10× fewer instructions than f32 dequant, at the cost of
 /// activation-quantization error (perplexity-close, not bit-exact to f32).
@@ -376,7 +376,7 @@ pub type Mxfp4MoeDownDp4aFn = unsafe extern "C" fn(
 ) -> KernelStatus;
 
 /// Batched decode attention: grid (n_heads, batch). Block (h, b) attends
-/// sequence b's own KV cache (contiguous [batch][max_ctx][kv_dim]) up to its own
+/// sequence b's own KV cache (contiguous \[batch\]\[max_ctx\]\[kv_dim\]) up to its own
 /// `positions[b]`. The per-sequence attention continuous batching needs; at batch
 /// B it launches n_heads*B blocks (better GPU fill than the batch-1 path).
 #[allow(clippy::too_many_arguments)]
@@ -622,7 +622,7 @@ pub type AttnPrefillPaged2WpFn = unsafe extern "C" fn(
 ) -> KernelStatus;
 
 /// Batched fused MoE gate+up+swiglu: grid (ff, n_active, batch); block (o,slot,b)
-/// drives expert idx[b][slot] for token b's activation x[b] -> out [batch,n_active,ff].
+/// drives expert idx\[b\]\[slot\] for token b's activation x\[b\] -> out \[batch,n_active,ff\].
 #[allow(clippy::too_many_arguments)]
 pub type Mxfp4MoeGateUpBatchFn = unsafe extern "C" fn(
     gate_w: *const core::ffi::c_void,
@@ -658,7 +658,7 @@ pub type Mxfp4MoeDownBatchFn = unsafe extern "C" fn(
     stream: *mut core::ffi::c_void,
 ) -> KernelStatus;
 
-/// Batched MoE top-k router: grid `batch`, token b's biased logits [n_expert]
+/// Batched MoE top-k router: grid `batch`, token b's biased logits \[n_expert\]
 /// -> top-k `out_idx`/`out_w` [batch, k]. Bias folded in.
 pub type MoeTopkBatchFn = unsafe extern "C" fn(
     logits: *const core::ffi::c_void,
@@ -671,7 +671,7 @@ pub type MoeTopkBatchFn = unsafe extern "C" fn(
     stream: *mut core::ffi::c_void,
 ) -> KernelStatus;
 
-/// Reverse routing map: slot_of[b][e] = slot at which token b selected expert e,
+/// Reverse routing map: slot_of\[b\]\[e\] = slot at which token b selected expert e,
 /// else 255. `idx` [batch, n_active] -> `slot_of` [batch, n_expert] (u8).
 pub type MoeSlotMapFn = unsafe extern "C" fn(
     idx: *const core::ffi::c_void,
@@ -904,7 +904,7 @@ pub type CausalConv1dSiluFn = unsafe extern "C" fn(
 ) -> KernelStatus;
 
 /// DeltaNet gate math: `beta = sigmoid(b)`; `g = ssm_a · softplus(a + dt_bias)`.
-/// `a`,`b` [n_tokens, n_heads]; `ssm_a`,`dt_bias` [n_heads]; `g`,`beta` out.
+/// `a`,`b` \[n_tokens, n_heads\]; `ssm_a`,`dt_bias` \[n_heads\]; `g`,`beta` out.
 /// Matches reference::delta_net::delta_gate.
 #[allow(clippy::too_many_arguments)]
 pub type DeltaGateFn = unsafe extern "C" fn(
@@ -920,7 +920,7 @@ pub type DeltaGateFn = unsafe extern "C" fn(
 ) -> KernelStatus;
 
 /// Gated RMSNorm over `d` per row: `out = (x·rsqrt(mean(x²)+eps))·weight·silu(z)`.
-/// `x`,`z`,`out` [n_rows, d]; `weight` [d]. Matches reference::delta_net::gated_rmsnorm.
+/// `x`,`z`,`out` \[n_rows, d\]; `weight` \[d\]. Matches reference::delta_net::gated_rmsnorm.
 #[allow(clippy::too_many_arguments)]
 pub type GatedRmsNormFn = unsafe extern "C" fn(
     x: *const core::ffi::c_void,
@@ -951,7 +951,7 @@ pub type DeltanetSplitGqaFn = unsafe extern "C" fn(
 /// Partial sectioned M-RoPE (Qwen3.5 multimodal rotary), in-place over
 /// `x` [n_tokens, n_heads*head_dim]. Rotates NEOX pairs (p, p + n_rot/2) for
 /// p in [0, n_rot/2); channels [n_rot, head_dim) pass through untouched. Each
-/// pair p picks its position axis from the cumulative `sections` [t,h,w,e]:
+/// pair p picks its position axis from the cumulative `sections` \[t,h,w,e\]:
 /// `positions` is [4, n_tokens] axis-major (positions[axis*n_tokens + t]). For
 /// text all four axes carry the token index and this collapses to partial NEOX
 /// rope; for vision the axes differ. theta_scale = freq_base^(-2/n_rot). Matches
@@ -999,7 +999,7 @@ pub type SwigluF32Fn = unsafe extern "C" fn(
 /// Gather one embedding row selected by a device-resident token id:
 /// `out[i] = table[token[0]*embd + i]`. The token id lives on device so the whole
 /// decode step is CUDA-graph-capturable (only device-buffer contents change per
-/// token, never a captured host address). `table` [vocab*embd] f32, `out` [embd].
+/// token, never a captured host address). `table` \[vocab*embd\] f32, `out` \[embd\].
 pub type EmbedGatherFn = unsafe extern "C" fn(
     table: *const core::ffi::c_void,
     token: *const core::ffi::c_void,
@@ -1008,7 +1008,7 @@ pub type EmbedGatherFn = unsafe extern "C" fn(
     stream: *mut core::ffi::c_void,
 ) -> KernelStatus;
 
-/// Greedy decode epilogue for a graph-resident loop: argmax(`logits`[vocab]) ->
+/// Greedy decode epilogue for a graph-resident loop: argmax(`logits`\[vocab\]) ->
 /// next token id (ties broken by lowest index, matching a host first-max scan),
 /// then advance all per-token state on-device so the captured graph can replay
 /// with no host round-trip: write the id into `token` (next replay's input),
@@ -1120,8 +1120,8 @@ pub type GatedDeltaRecurrentSnapFn = unsafe extern "C" fn(
 ) -> KernelStatus;
 
 /// Repack a Q8_0 weight from the interleaved 34-byte block (f16 scale + 32 int8)
-/// into two aligned streams: `dst_data` [n_blocks*32] contiguous int8 and
-/// `dst_scale` [n_blocks] f16 - so the GEMV can vectorize the weight load. Run
+/// into two aligned streams: `dst_data` \[n_blocks*32\] contiguous int8 and
+/// `dst_scale` \[n_blocks\] f16 - so the GEMV can vectorize the weight load. Run
 /// once per weight at load. `n_blocks` = total elements / 32. Reorganization only
 /// (same byte count as the source), no precision change.
 pub type Q8_0RepackFn = unsafe extern "C" fn(
@@ -1135,7 +1135,7 @@ pub type Q8_0RepackFn = unsafe extern "C" fn(
 /// Vectorized fused Q8_0 GEMV over the repacked layout: `y[o] = bias[o] +
 /// sum_i (int8 data[o][i]) * scale[o][i/32] * x[i]`, f32 accumulate. Loads the
 /// int8 weight stream 16 bytes at a time (int4) instead of byte-wise - the decode
-/// bandwidth lever. `data` [out_dim*in_dim] int8, `scale` [out_dim*(in_dim/32)]
+/// bandwidth lever. `data` \[out_dim*in_dim\] int8, `scale` \[out_dim*(in_dim/32)\]
 /// f16. `in_dim % 32 == 0`.
 pub type Q8_0GemvRepackedFn = unsafe extern "C" fn(
     data: *const core::ffi::c_void,
@@ -1150,7 +1150,7 @@ pub type Q8_0GemvRepackedFn = unsafe extern "C" fn(
 
 /// Single-token depthwise causal conv1d + SiLU with a persistent window - the
 /// Qwen3.5 DeltaNet conv on the O(1) decode path. `win` [(k-1), conv_dim] holds the
-/// previous k-1 tokens' pre-conv input (win[0]=oldest); `x_new` [conv_dim] is this
+/// previous k-1 tokens' pre-conv input (win\[0\]=oldest); `x_new` \[conv_dim\] is this
 /// token. `out[c] = silu(sum_{j<k-1} w[c,j]*win[j,c] + w[c,k-1]*x_new[c])`, then the
 /// window advances (drop oldest, append x_new). `w` [conv_dim, k] (`w[c*k+kk]`).
 pub type ConvStepF32Fn = unsafe extern "C" fn(
@@ -1164,7 +1164,7 @@ pub type ConvStepF32Fn = unsafe extern "C" fn(
 ) -> KernelStatus;
 
 /// Split the Qwen3.5 full-attn joint QG projection `qg` [n_tokens, n_heads*2*head_dim]
-/// (per head: query[head_dim] then gate[head_dim]) into contiguous `q_out` and
+/// (per head: query\[head_dim\] then gate\[head_dim\]) into contiguous `q_out` and
 /// `gate_out`, each [n_tokens, n_heads*head_dim]. `q_out[t,h,:]=qg[t,h,0:head_dim]`,
 /// `gate_out[t,h,:]=qg[t,h,head_dim:2*head_dim]`.
 pub type SplitQgFn = unsafe extern "C" fn(
@@ -1283,10 +1283,10 @@ pub struct KernelTableV1 {
     /// q/k/v/out [B, T, n_heads, D] with q,k pre-normalized; g/beta [B, T,
     /// n_heads]. head_dim must be 128.
     pub gated_delta_recurrent_v2: Option<GatedDeltaRecurrentV2Fn>,
-    /// Row-wise argmax: out[row] = index of max logit (lowest index on ties,
+    /// Row-wise argmax: out\[row\] = index of max logit (lowest index on ties,
     /// matching the host argmax). `(logits, out_u32, rows, n, stream)`.
     pub argmax_rows: Option<ArgmaxRowsFn>,
-    /// Batched-spec conv-ext staging: ext[b] = window(slots[b]) ++ mixed[b].
+    /// Batched-spec conv-ext staging: ext\[b\] = window(slots\[b\]) ++ mixed\[b\].
     /// `(wins, slots, mixed, ext, batch, km1, r, conv_dim, stream)`.
     pub conv_ext_build_slots: Option<ConvExtBuildSlotsFn>,
     /// Causal conv+SiLU over per-slot extended segments, emitting only the r
@@ -1294,11 +1294,11 @@ pub struct KernelTableV1 {
     /// equal km1+1.
     pub conv_chunk_ext: Option<ConvChunkExtFn>,
     /// Ragged spec commit, state half: roll each short slot's state back to
-    /// snapshot committed[b]-1. `(states, snap, slots, committed, batch, r,
+    /// snapshot committed\[b\]-1. `(states, snap, slots, committed, batch, r,
     /// n_heads, head_dim, stream)`; head_dim must be a multiple of 4.
     pub state_restore_slots: Option<StateRestoreSlotsFn>,
-    /// Ragged spec commit, conv half: window(slots[b]) = ext[b] rows
-    /// [committed[b], committed[b]+km1). `(ext, wins, slots, committed, batch,
+    /// Ragged spec commit, conv half: window(slots\[b\]) = ext\[b\] rows
+    /// [committed\[b\], committed\[b\]+km1). `(ext, wins, slots, committed, batch,
     /// km1, r, conv_dim, stream)`.
     pub conv_commit_slots: Option<ConvCommitSlotsFn>,
     /// Advance staged per-row positions on device: pos[0..r] += 1 and
@@ -1409,8 +1409,8 @@ pub struct KernelTableV1 {
     /// `(down_data, down_scale, down_bias, idx, topk_w, fused_q, fused_s,
     /// residual, ff, embd, n_active, batch, stream)`.
     pub mxfp4_moe_down_dp4a_b: Option<Mxfp4MoeDownDp4aBatchFn>,
-    /// f32 batched matvec for tiny GEMMs (the MoE router): out[t][o] =
-    /// dot(w[o], x[t]), one launch, grid (out_dim, batch). Replaces the
+    /// f32 batched matvec for tiny GEMMs (the MoE router): out\[t\]\[o\] =
+    /// dot(w\[o\], x\[t\]), one launch, grid (out_dim, batch). Replaces the
     /// cuBLAS gemmSN + splitKreduce pair at serving batch (two launches,
     /// ~19 us/layer of latency on a 368 KB weight).
     /// `(w, x, out, in_dim, out_dim, batch, stream)`; w is [out_dim, in_dim]
@@ -1457,14 +1457,14 @@ pub struct KernelTableV1 {
     /// idx, xq, xs, out, in_dim, ff, n_active, batch, stream)`;
     /// out [batch, n_active, ff], in_dim % 32 == 0.
     pub q8_0_moe_gate_up_dp4a: Option<Q8MoeGateUpDp4aFn>,
-    /// Companion down + weighted combine: out[b][o] = sum_slot topk_w *
-    /// dot(down[e][o], fused_q[b][slot]). Plain write; the caller folds the
+    /// Companion down + weighted combine: out\[b\]\[o\] = sum_slot topk_w *
+    /// dot(down\[e\]\[o\], fused_q\[b\]\[slot\]). Plain write; the caller folds the
     /// shared expert and residual. `(down_data, down_scale, idx, topk_w, fq,
     /// fs, out, ff, embd, n_active, batch, stream)`; ff % 32 == 0,
     /// n_active <= 8.
     pub q8_0_moe_down_dp4a: Option<Q8MoeDownDp4aFn>,
-    /// Shared-expert scalar sigmoid gate fold: dst[b][i] +=
-    /// sigmoid(dot(x[b], w)) * src[b][i] (w = ffn_gate_inp_shexp [n_in]).
+    /// Shared-expert scalar sigmoid gate fold: dst\[b\]\[i\] +=
+    /// sigmoid(dot(x\[b\], w)) * src\[b\]\[i\] (w = ffn_gate_inp_shexp \[n_in\]).
     /// `(dst, src, x, w, n_out, n_in, batch, stream)`.
     pub shexp_gate_add: Option<ShexpGateAddFn>,
     /// Sorted Q8_0 MoE gate+up+SwiGLU over the moe_align layout: each
@@ -1612,12 +1612,12 @@ pub struct KernelTableV1 {
     /// the SmoothQuant balance. `(data, scale, out, in_dim, out_dim,
     /// stream)`; in_dim % 32 == 0.
     pub q8_0_col_absmax: Option<Q8ColAbsmaxFn>,
-    /// nvf4 activation quantize with the SmoothQuant fold: v[c] * sinv[c]
+    /// nvf4 activation quantize with the SmoothQuant fold: v\[c\] * sinv\[c\]
     /// before the per-16 quantize. `(x, sinv, q, scale, n, in_dim,
     /// stream)`; n % 32 == 0, in_dim % 8 == 0.
     pub quantize_nvf4_smooth: Option<QuantizeNvf4SmoothFn>,
-    /// Q8_0 -> nvf4 weight requant with the SmoothQuant fold: w[r][c] *
-    /// svec[c] before the per-16 quantize. Pair only with
+    /// Q8_0 -> nvf4 weight requant with the SmoothQuant fold: w\[r\]\[c\] *
+    /// svec\[c\] before the per-16 quantize. Pair only with
     /// `quantize_nvf4_smooth` activations using the inverse vector. NULL
     /// off sm_120a. `(q8_data, q8_scale, svec, mx_data, mx_scale, n_blocks,
     /// in_dim, stream)`.
@@ -1805,7 +1805,7 @@ pub struct KernelTableV1 {
     /// (dataA, scaleA, dataB, scaleB, x, yA, yB, in_dim, outA, outB, batch, stream)
     pub q8_0_gemm_repacked_x2: Option<Q8GemmRepackedX2Fn>,
     /// DeltaNet decay gate over the FUSED alpha||beta activation layout
-    /// (x2-v3): `ab` is [n_tokens] rows of 2*n_heads floats (alpha cols
+    /// (x2-v3): `ab` is \[n_tokens\] rows of 2*n_heads floats (alpha cols
     /// 0..h, beta h..2h) from the one-call f32-plane decay GEMM. Same
     /// per-element math as `delta_gate`.
     /// (ab, ssm_a, dt_bias, g, beta, n_tokens, n_heads, stream)
@@ -1818,7 +1818,7 @@ pub struct KernelTableV1 {
     /// exactly ggml_gelu_f32 (gemma4 FFN). (gate, up, n, stream)
     pub geglu: Option<GegluFn>,
     /// `rope_yarn_batch` with ggml `freq_factors`: pair k's theta is divided
-    /// by factors[k] (null = all 1.0). gemma4 global layers pass rope_freqs
+    /// by factors\[k\] (null = all 1.0). gemma4 global layers pass rope_freqs
     /// whose 1e30 entries freeze those pairs (partial rotary).
     /// (x, positions, factors, n_heads, head_dim, theta_scale, freq_scale,
     ///  corr_low, corr_high, ext_factor, mscale, batch, stream)
@@ -1899,7 +1899,7 @@ pub struct KernelTableV1 {
     /// stream) - xq must be a >=64-row buffer (64-row TMA boxes); part is the
     /// K-split partial-plane scratch (out*batch*8 floats worst case).
     pub f8t_gemm: Option<F8TGemmFn>,
-    /// fused-plane GEGLU quantize: (gu [rows][2*n_ff], q, scale, n_ff, rows)
+    /// fused-plane GEGLU quantize: (gu \[rows\]\[2*n_ff\], q, scale, n_ff, rows)
     pub quantize_e4m3_geglu2: Option<
         unsafe extern "C" fn(
             *const core::ffi::c_void,
@@ -1939,7 +1939,7 @@ pub struct KernelTableV1 {
             *mut core::ffi::c_void,
         ) -> i32,
     >,
-    /// Fused-plane GEGLU + per-ROW e4m3 quant with COMPACT [rows][n_ff]
+    /// Fused-plane GEGLU + per-ROW e4m3 quant with COMPACT \[rows\]\[n_ff\]
     /// output (the f8t gu decode epilogue): (gu, q, rscale, n_ff, rows).
     pub quantize_e4m3_geglu2_row: Option<QuantizeE4m3Geglu2RowFn>,
     /// fused batched rmsnorm -> e4m3 quantize: (x, w, q, scale, n, batch, eps)
@@ -2202,7 +2202,7 @@ pub struct KernelTableV1 {
         ) -> i32,
     >,
     /// unconditionally-tiled f32 GEMM (k-quant interim compute stage):
-    /// (w [out,in], x [batch,in], out [batch,out], in_dim, out_dim, batch, stream).
+    /// (w \[out,in\], x \[batch,in\], out \[batch,out\], in_dim, out_dim, batch, stream).
     pub gemm_f32: Option<
         unsafe extern "C" fn(
             *const core::ffi::c_void,
@@ -2215,7 +2215,7 @@ pub struct KernelTableV1 {
         ) -> i32,
     >,
     /// per-32-block activation sums off the mmq layout (W4A8 min-term operand):
-    /// (yq, sums [chunk][col_pad][4] f32, in_dim, batch, stream).
+    /// (yq, sums \[chunk\]\[col_pad\]\[4\] f32, in_dim, batch, stream).
     pub mmq_sums: Option<
         unsafe extern "C" fn(
             *const core::ffi::c_void,
@@ -2226,7 +2226,7 @@ pub struct KernelTableV1 {
         ) -> i32,
     >,
     /// stage-2 W4A8 GEMM off the k-quant repacked streams (int8 tensor cores):
-    /// (data, scales, yq mmq-layout, xsums (Q4K/Q5K, else null), y [batch,out],
+    /// (data, scales, yq mmq-layout, xsums (Q4K/Q5K, else null), y \[batch,out\],
     /// in_dim, out_dim, batch, dtype, stream).
     pub kquant_gemm_w4a8: Option<
         unsafe extern "C" fn(
@@ -2243,7 +2243,7 @@ pub struct KernelTableV1 {
         ) -> i32,
     >,
     /// per-16 activation sums off the STRIDED int8 layout (dp4a decode ladder):
-    /// (xq, sums [batch][in/16] f32, in_dim, batch, stream).
+    /// (xq, sums \[batch\]\[in/16\] f32, in_dim, batch, stream).
     pub q8_sums_strided: Option<
         unsafe extern "C" fn(
             *const core::ffi::c_void,
@@ -2254,7 +2254,7 @@ pub struct KernelTableV1 {
         ) -> i32,
     >,
     /// W4A8 dp4a batch GEMM (decode-batch shape, strided int8 activations):
-    /// (data, scales, xq, xs, xsums (Q4K/Q5K, else null), y [batch,out],
+    /// (data, scales, xq, xs, xsums (Q4K/Q5K, else null), y \[batch,out\],
     /// in_dim, out_dim, batch, dtype, stream).
     pub kquant_gemm_dp4a: Option<
         unsafe extern "C" fn(
@@ -2273,7 +2273,7 @@ pub struct KernelTableV1 {
     >,
     /// K-split W4A8 mma GEMM (17..64 decode-batch rung; strided int8 activations,
     /// partial planes + fixed-order combine): (data, scales, xq, xs, xsums
-    /// (Q4K/Q5K, else null), part (>= 8*out*batch f32), y [batch,out], in_dim,
+    /// (Q4K/Q5K, else null), part (>= 8*out*batch f32), y \[batch,out\], in_dim,
     /// out_dim, batch, dtype, stream).
     pub kquant_gemm_mma_ks: Option<
         unsafe extern "C" fn(
@@ -2293,7 +2293,7 @@ pub struct KernelTableV1 {
     >,
     /// k-quant routed-expert MoE gate+up+SwiGLU, token-batched (decode class):
     /// (gate_data, gate_scales, up_data, up_scales, idx, xq, xs, xsums (mu
-    /// types, else null), out [B,n_active,ff], in_dim, ff, n_active, batch,
+    /// types, else null), out \[B,n_active,ff\], in_dim, ff, n_active, batch,
     /// gate_dtype, up_dtype, stream).
     pub kquant_moe_gate_up: Option<
         unsafe extern "C" fn(
@@ -2316,7 +2316,7 @@ pub struct KernelTableV1 {
         ) -> i32,
     >,
     /// k-quant routed-expert down + weighted combine: (down_data, down_scales,
-    /// idx, topk_w, fq, fs, fsums (mu, else null), out [B,embd], ff, embd,
+    /// idx, topk_w, fq, fs, fsums (mu, else null), out \[B,embd\], ff, embd,
     /// n_active, batch, down_dtype, stream).
     pub kquant_moe_down: Option<
         unsafe extern "C" fn(
@@ -2425,7 +2425,7 @@ pub struct KernelTableV1 {
     /// constants - the routed branch stays in the dense gemma4 FFN's
     /// numeric class.
     pub q8_0_moe_gate_up_geglu: Option<Q8MoeGateUpDp4aFn>,
-    /// Fold per-expert scalars into routed top-k weights: w[i] *= scale[idx[i]]
+    /// Fold per-expert scalars into routed top-k weights: w\[i\] *= scale[idx\[i\]]
     /// (gemma4-A4B `ffn_down_exps.scale`, folded before the down combine).
     pub moe_scale_w: Option<MoeScaleWFn>,
     /// GEGLU twin of `q8_0_moe_gate_up_mma` (same signature/sorted layout,
@@ -2532,7 +2532,7 @@ pub struct KernelTableV1 {
     pub quantize_e4m3_geglu2_pad_b: Option<QuantizeE4m3Geglu2PadBFn>,
     ///  uniq-routing diagnostic: one tiny block ORs the routed pair
     /// ids into a 128-bit presence bitmap and bumps a persistent device
-    /// accumulator (hist[uniq]++, pairs_sum[uniq] += pairs, plus totals;
+    /// accumulator (hist\[uniq\]++, pairs_sum\[uniq\] += pairs, plus totals;
     /// four 260-u32 regions banded device-side by the pair count:
     /// <=64 / <=256 / <=1024 / >1024). Launch-only work, so captured
     /// decode graphs bake it in and accumulation stays live on replays.
@@ -2540,7 +2540,7 @@ pub struct KernelTableV1 {
     /// allocation (see the gemma4 Scratch notes /).
     /// (idx, pairs, n_expert (<= 128), out_accum, stream)
     pub moe_uniq_hist: Option<MoeUniqHistFn>,
-    /// SwiGLU over a FUSED gate|up GEMM output ([tok][gate(ff)|up(ff)] rows,
+    /// SwiGLU over a FUSED gate|up GEMM output (\[tok\]\[gate(ff)|up(ff)\] rows,
     /// the merged gate_up plane's layout): out[t*ff+j] = silu(f[t*2ff+j]) *
     /// f[t*2ff+ff+j], packed for the down GEMM. Same silu expression as
     /// `swiglu` - bit-identical values. (fused, out, ff, n_rows, stream)
@@ -2600,11 +2600,11 @@ pub struct KernelTableV1 {
     /// (data, dst, in_dim, out_dim, stream)
     pub f8w_repack_lin_bs: Option<F8wRepackLinBsFn>,
     /// block-scale tile-linear decode GEMM: data-only boxes + f32
-    /// [out/128][in/128] scale plane. (wlin, wsc, xq, xs, part, y, in_dim,
+    /// \[out/128\]\[in/128\] scale plane. (wlin, wsc, xq, xs, part, y, in_dim,
     /// out_dim, batch, stream)
     pub f8_gemm_lin_bs: Option<F8GemmLinBsFn>,
     /// fused gate|up-layout bf16 swiglu + e4m3 quant (single-GEMM prefill
-    /// FFN epilogue): one [rows][2*ff] bf16 buffer, gate cols [0,ff), up
+    /// FFN epilogue): one \[rows\]\[2*ff\] bf16 buffer, gate cols [0,ff), up
     /// [ff,2ff). (gu, q, scale, n, ff, stream)
     pub quantize_e4m3_swiglu_b16_gu: Option<QuantSwigluB16GuFn>,
     /// fused conv1d+SiLU+split+GQA+q/k-norm (DN prefill glue; the caller
@@ -2681,7 +2681,7 @@ pub struct KernelTableV1 {
         ) -> i32,
     >,
     /// Fused gu GEMM + geglu + per-32 e4m3 quant on the interleaved lin
-    /// plane: q gets [batch][out_dim/2] e4m3 bytes, qs the ue8m0 scales -
+    /// plane: q gets \[batch\]\[out_dim/2\] e4m3 bytes, qs the ue8m0 scales -
     /// bit-identical to lin_kt -> geglu2i. Returns -2 when the route can't
     /// engage (caller keeps the 2-launch chain).
     /// (wlin, xq, xs, q, qs, in_dim, out_dim, batch, stream)
@@ -2738,7 +2738,7 @@ pub struct KernelTableV1 {
     >,
     /// Per-channel gu GEMM (kt4a scale-free mainloop): as_row =
     /// f32 per-token scales (row quantizer), ws = f32 per-channel scales
-    /// [out_dim] (gate half at 0, up half at out_dim/2). Serves the pc plane
+    /// \[out_dim\] (gate half at 0, up half at out_dim/2). Serves the pc plane
     /// whose per-row pow2 exponents also fill the per-32 strip (all bands
     /// dequantize identically). -2 = route not covered.
     #[allow(clippy::type_complexity)]
@@ -4669,7 +4669,7 @@ pub struct KernelTableV1 {
     /// planes into one M=n_layer*d GEMM and this stores every layer's slot
     /// plane in one launch. `dsts` is a device array of n_layer plane base
     /// pointers (uploaded once at pool alloc - capture-safe); `bias` the
-    /// concatenated [n_layer*d] plane (V) or null (K).
+    /// concatenated \[n_layer*d\] plane (V) or null (K).
     /// (src, bias|null, dsts, slots, rows, d, n_layer, stride, kv_dtype, stream)
     pub whisper_kv_store_batch: Option<
         unsafe extern "C" fn(
@@ -5847,7 +5847,7 @@ pub struct KernelTableV1 {
     /// (x, proj, w, xn, q, rscale, n, eps, pscale, batch, stream); 100 = declined
     pub add_rmsnorm_scaled_quant_e4m3_row: Option<AddRmsnormScaledQuantE4m3RowFn>,
     /// Slot 523 (granite NVFP4 fused qkv): the f4c split GEMM
-    /// leaving RAW K-split partials in `part` ([sk][batch][out] f32) -- no
+    /// leaving RAW K-split partials in `part` (\[sk\]\[batch\]\[out\] f32) -- no
     /// fold, no epilogue; the consumer folds. (data, scale, xq, xs, part,
     /// in_dim, out_dim, batch, sk >= 2, stream). in_dim % 256 == 0.
     pub nvf4_gemm_f4c_raw: Option<Nvf4GemmF4cRawFn>,
@@ -5960,7 +5960,7 @@ pub struct KernelTableV1 {
             *mut core::ffi::c_void,
         ) -> i32,
     >,
-    /// slot 540: strided-gate twin of q4x_add_gated_row (gate at s[r*rs]).
+    /// slot 540: strided-gate twin of q4x_add_gated_row (gate at s\[r*rs\]).
     pub q4x_add_gated_row_s: Option<
         unsafe extern "C" fn(
             *mut core::ffi::c_void,
@@ -6210,14 +6210,14 @@ pub struct KernelTableV1 {
     >,
     /// Slot 575: MoE expert-offload cache resolve - routed expert ids to
     /// VRAM slot ids with device-side LRU bookkeeping; writes the miss jobs.
-    /// (idx, rows, n_slots, slot_of[n_expert], expert_in[S], last_use[S],
-    /// tick, idx_slot[rows], jobs[2*rows], n_jobs, stats[2] (rows, misses
+    /// (idx, rows, n_slots, slot_of\[n_expert\], expert_in\[S\], last_use\[S\],
+    /// tick, idx_slot\[rows\], jobs\[2*rows\], n_jobs, stats\[2\] (rows, misses
     /// accumulators), stream); rows <= n_slots.
     pub moe_cache_resolve: Option<MoeCacheResolveFn>,
     /// Slot 576: MoE expert-offload cache fill - copies the resolve's miss
     /// jobs from the host-mapped mirror into their slots over six streams
     /// (gate/up/down x data/scales). (jobs, n_jobs (device), max_jobs,
-    /// src[6], dst[6], bytes[6] (host u64 arrays), stream).
+    /// src\[6\], dst\[6\], bytes\[6\] (host u64 arrays), stream).
     pub moe_cache_fill: Option<MoeCacheFillFn>,
     /// Slot 577: capability marker - present iff the k-quant repack, dequant
     /// and token-batched MoE pair serve the ggml i-quant family (IQ1_S/M,
@@ -6236,15 +6236,15 @@ pub struct KernelTableV1 {
     pub q4x_gdn_split_widen_tiled: Option<Q4xGdnSplitWidenFn>,
     /// 580: expert-major prefill plan over the offload cache - marks the
     /// experts a launch routes and enumerates them into waves of `n_slots`.
-    /// (idx, rows, n_expert, n_slots, n_waves, wave_of[n_expert],
-    /// wave_ids[n_waves*n_slots], wave_cnt[n_waves], stream).
+    /// (idx, rows, n_expert, n_slots, n_waves, wave_of\[n_expert\],
+    /// wave_ids\[n_waves*n_slots\], wave_cnt\[n_waves\], stream).
     pub moe_wave_plan: Option<MoeWavePlanFn>,
     /// 581: cache resolve over a device id list with a device count (one
     /// wave): (ids, n_ids, n_slots, slot_of, expert_in, last_use, tick, jobs,
     /// n_jobs, stats, stream). Same LRU as slot 575, writes no idx_slot.
     pub moe_cache_resolve_dev: Option<MoeCacheResolveDevFn>,
     /// 582: the wave's remapped routing + compaction: (idx, rows, n_active,
-    /// wave_of, slot_of, wave, absent, idx_slot[rows], pairs[rows], n_pairs,
+    /// wave_of, slot_of, wave, absent, idx_slot\[rows\], pairs\[rows\], n_pairs,
     /// rows_list, n_rows, stream) - out-of-wave pairs take `absent`; the two
     /// lists are the in-wave pair indices and the tokens holding one,
     /// device-counted, for the LIST pair kernels.
@@ -6504,8 +6504,8 @@ pub struct KernelTableV1 {
     >,
     /// Slot 605: `pd_q8_0_gemm_mmq_pipe_hcmix` - the Q8_0 pipe tile over a
     /// [in -> 4 * hidden] hyper-connection up plane with the gated mix folded
-    /// into its epilogue: out[rows][hidden] = (1/4) sum_s sigmoid(gate[s,d]) *
-    /// xn[s,d], byte-identical to pipe + q4x_hc_mix. (data, scale, yq, xn, out,
+    /// into its epilogue: out\[rows\]\[hidden\] = (1/4) sum_s sigmoid(gate\[s,d\]) *
+    /// xn\[s,d\], byte-identical to pipe + q4x_hc_mix. (data, scale, yq, xn, out,
     /// in_dim, hidden, batch, stream).
     pub q8_0_gemm_mmq_pipe_hcmix: Option<
         unsafe extern "C" fn(
@@ -6522,7 +6522,7 @@ pub struct KernelTableV1 {
     >,
     /// Slot 606: `pd_q4x_combine_norm_q8mmq_ns` - slot 602 without the stored
     /// normalized state: h, the next hc down's mmq rows and the per-(row,
-    /// stream) 1/rms ([rows][hc]). (h, block_out, inj, norm_w, nscale, yq,
+    /// stream) 1/rms (\[rows\]\[hc\]). (h, block_out, inj, norm_w, nscale, yq,
     /// rows, hc, hidden, eps, group_rows, stream).
     pub q4x_combine_norm_q8mmq_ns: Option<
         unsafe extern "C" fn(
@@ -6577,8 +6577,8 @@ pub struct KernelTableV1 {
     >,
     /// Slot 609: `pd_q4x_combine_norm_q8mmq_nsi` - slot 606 that also folds
     /// the next mix's inject ([4][hc * hidden] f32) from its norm pass:
-    /// (row, stream) partials into ip [rows][hc][hc], summed over streams into
-    /// inj_out [rows][hc] (inj may alias inj_out). hc 4; a class change
+    /// (row, stream) partials into ip \[rows\]\[hc\]\[hc\], summed over streams into
+    /// inj_out \[rows\]\[hc\] (inj may alias inj_out). hc 4; a class change
     /// against the matvec. (h, block_out, inj, norm_w, nscale, yq, w_inj, ip,
     /// inj_out, rows, hc, hidden, eps, group_rows, stream).
     pub q4x_combine_norm_q8mmq_nsi: Option<
@@ -6626,7 +6626,7 @@ pub struct KernelTableV1 {
         ) -> i32,
     >,
     /// Slot 611: `pd_dp_qkv_split_rope` - fused q|k|v landing to q, k, v with
-    /// the q/v biases folded and a cos/sin TABLE rope ([n_rope][hd/2],
+    /// the q/v biases folded and a cos/sin TABLE rope (\[n_rope\]\[hd/2\],
     /// rotate_half pairs) on the first `n_rope` rows of every `chip_rows`-row
     /// chip. (qkv, bq, bv, cos, sin, q, k, v, d, hd, rows, chip_rows, n_rope,
     /// stream).
@@ -6719,7 +6719,7 @@ pub struct KernelTableV1 {
         ) -> i32,
     >,
     /// Slot 616: `pd_dp_convt2_skip` - depth-to-space of a 2x2/stride-2
-    /// transposed conv's GEMM landing [chips][h*w][4*C], + bias, + the hs x hs
+    /// transposed conv's GEMM landing \[chips\]\[h*w\]\[4*C\], + bias, + the hs x hs
     /// skip grid sampled bilinearly (align_corners=False) at the 2h x 2w
     /// output. (g, bias, skip, out, chips, h, w, C, hs, skip_chip_rows, stream).
     pub dp_convt2_skip: Option<
@@ -6738,7 +6738,7 @@ pub struct KernelTableV1 {
         ) -> i32,
     >,
     /// Slot 617: `pd_dp_seg_heads` - the stacked class + height 1x1 landing
-    /// [rows][ncls+1] to a u8 argmax raster, an f32 regression raster and
+    /// \[rows\]\[ncls+1\] to a u8 argmax raster, an f32 regression raster and
     /// optional biased f16 logits. (o, bias, cls, height, logits|NULL, rows,
     /// ncls, stream).
     pub dp_seg_heads: Option<
@@ -6754,7 +6754,7 @@ pub struct KernelTableV1 {
         ) -> i32,
     >,
     /// Slot 618: `pd_f16_gemm_h` - the f16 x f16 GEMM with the landing narrowed
-    /// to f16: y is [batch][out_dim] halves, beta 0, in_dim a multiple of 8.
+    /// to f16: y is \[batch\]\[out_dim\] halves, beta 0, in_dim a multiple of 8.
     /// Same ring and K order as `f16_gemm`, so the result is that landing
     /// rounded to nearest. (w, x, y, in_dim, out_dim, batch, stream).
     pub f16_gemm_h: Option<
@@ -6842,7 +6842,7 @@ pub struct KernelTableV1 {
     >,
     /// Slot 624: `pd_f16_gemm_h_gelu` - slot 618 with a per-output-row bias
     /// and the exact GELU folded into the landing before its one round:
-    /// y = f16(gelu(acc + bias[m])). Retires slot 623's pass over the plane.
+    /// y = f16(gelu(acc + bias\[m\])). Retires slot 623's pass over the plane.
     /// (w, x, y, bias, in_dim, out_dim, batch, stream).
     pub f16_gemm_h_gelu: Option<
         unsafe extern "C" fn(
@@ -6888,7 +6888,7 @@ pub struct KernelTableV1 {
     /// Slot 627: `pd_quantize_q8_b128` - int8 activations with one scale per
     /// 128, the class slot 628 eats. Coarser than the per-32 lanes, and sound
     /// only on Hadamard-rotated rows (outlier-poor by construction). (x f32
-    /// [n], q int8 [n], scale f32 [n / 128], n, stream).
+    /// \[n\], q int8 \[n\], scale f32 \[n / 128\], n, stream).
     pub quantize_q8_b128: Option<
         unsafe extern "C" fn(
             *const core::ffi::c_void,
@@ -7432,7 +7432,7 @@ pub struct KernelTableV1 {
     /// Slot 677: `pd_laya_rowdot` - one output per row: `g[i] . w + b`.
     pub laya_rowdot: Option<LayaRowdotFn>,
     /// Slot 678: `pd_laya_act_head` - the Laya act/escalate head, one block a
-    /// question, off its [CLS] row and its option distribution.
+    /// question, off its \[CLS\] row and its option distribution.
     pub laya_act_head: Option<LayaActHeadFn>,
     /// Slot 679: `pd_attn_rows_partial` - split-K decode attention over groups
     /// of one slot's consecutive query rows (a spec verify chunk, each row
@@ -7447,7 +7447,7 @@ pub struct KernelTableV1 {
     /// the shared expert over every row; bf16 activations out.
     pub nvf4_moe_up_relu2_w16: Option<Nvf4MoeUpRelu2W16Fn>,
     /// Slot 681: `pd_nvf4_moe_down_part_w16` - the matching down into
-    /// [rows][k + 1][embd] pre-weighted partials for `moe_slot_combine`.
+    /// \[rows\]\[k + 1\]\[embd\] pre-weighted partials for `moe_slot_combine`.
     pub nvf4_moe_down_part_w16: Option<Nvf4MoeDownPartW16Fn>,
     /// Slot 682: `pd_dense_w16` - the class's dense half: bf16 (dtype 0),
     /// e4m3-with-row-scale (dtype 1) or f16 (dtype 2) weights against 16-bit
@@ -7472,7 +7472,7 @@ pub struct KernelTableV1 {
     /// (decode rows sharing a tick, a verify round, a short prefill) on the
     /// int8 tensor cores: one weight read, and per column the same bits as
     /// slots 628 / 630 (the ternary class's fixed fold). `xq` int8
-    /// [cols][in_dim], `xs` f32 [cols][in_dim / 128], `y_p` [cols][o_p];
+    /// \[cols\]\[in_dim\], `xs` f32 \[cols\]\[in_dim / 128\], `y_p` \[cols\]\[o_p\];
     /// every `o_p` a multiple of 16.
     pub ternary_gemm_nb: Option<TernaryGemmNbFn>,
     /// Slot 687: `pd_matvec_f32_winv` - [`Self::matvec_f32_batch`]'s batch
@@ -7599,7 +7599,7 @@ pub struct KernelTableV1 {
     /// Slot 721: `pd_diar_act` - ReLU (op 0) or sigmoid (op 1) in place.
     pub diar_act: Option<DiarActFn>,
     /// Slot 722: `pd_diar_gemm` - an F32-class GEMM on the stored weights
-    /// (BF16 rows, or Q8_0 repacked to int8 rows + [K/32][N] F32 scales): the
+    /// (BF16 rows, or Q8_0 repacked to int8 rows + \[K/32\]\[N\] F32 scales): the
     /// activation split three ways in bf16 against the exact bf16 weight;
     /// mode 3 is the qkv projection with the rope in its epilogue.
     pub diar_gemm: Option<DiarGemmFn>,
@@ -7730,7 +7730,7 @@ pub struct KernelTableV1 {
         ) -> i32,
     >,
     /// Slot 752: `pd_sam3_qkv_split_rope_h` - slot 621 with k's bias and the
-    /// rope on every row, row t of a chip_rows-row cos/sin table [.][hd/2];
+    /// rope on every row, row t of a chip_rows-row cos/sin table \[.\]\[hd/2\];
     /// q scaled by qscale before its round. (qkv, bq, bk, bv, cos, sin, q, k,
     /// v, d, hd, rows, chip_rows, qscale, stream).
     pub sam3_qkv_split_rope_h: Option<
@@ -7767,8 +7767,8 @@ pub struct KernelTableV1 {
         ) -> i32,
     >,
     /// Slot 754: `pd_sam3_convt2_bias_h` - a 2x2 / stride-2 transposed conv's
-    /// depth-to-space off its GEMM's f32 landing [pics][h*w][4*C] (tap-major
-    /// rows) + bias, erf GELU when `gelu` != 0, f16 raster out [pics][2h][2w][C].
+    /// depth-to-space off its GEMM's f32 landing \[pics\]\[h*w\]\[4*C\] (tap-major
+    /// rows) + bias, erf GELU when `gelu` != 0, f16 raster out \[pics\]\[2h\]\[2w\]\[C\].
     /// (g, bias, out, pics, h, w, C, gelu, stream).
     pub sam3_convt2_bias_h: Option<
         unsafe extern "C" fn(
@@ -7816,7 +7816,7 @@ pub struct KernelTableV1 {
     /// elsewhere - the caller keeps the f32 entry).
     pub nvf4_moe_down_bs_b16: Option<Nvf4MoeDownBsFn>,
     /// Slot 759: `pd_sam3_text_attn_h` - causal self-attention over SAM 3's
-    /// 32-token CLIP prompts: f16 planes [prompts][T][H][hd] (q pre-scaled),
+    /// 32-token CLIP prompts: f16 planes \[prompts\]\[T\]\[H\]\[hd\] (q pre-scaled),
     /// one block a (prompt, head), f32 softmax in key order. T <= 64, hd <= 64.
     /// (q, k, v, out, prompts, T, H, hd, stream).
     pub sam3_text_attn_h: Option<
@@ -7853,7 +7853,7 @@ pub struct KernelTableV1 {
             *mut core::ffi::c_void,
         ) -> i32,
     >,
-    /// Slot 761: `pd_sam3_box_attn_h` - the decoder's image cross-attention with the factorized box bias by[q][y][h] + bx[q][x][h] on its scores; rows past nbias unbiased.
+    /// Slot 761: `pd_sam3_box_attn_h` - the decoder's image cross-attention with the factorized box bias by\[q\]\[y\]\[h\] + bx\[q\]\[x\]\[h\] on its scores; rows past nbias unbiased.
     /// (q, k, v, bx, by, out, nq, nk, H, hd, gh, gw, nbias, stream).
     pub sam3_box_attn_h: Option<
         unsafe extern "C" fn(
@@ -7922,7 +7922,7 @@ pub struct KernelTableV1 {
             *mut core::ffi::c_void,
         ) -> i32,
     >,
-    /// Slot 765: `pd_sam3_roi_align` - torchvision roi_align, aligned=False, adaptive sampling, NHWC f32 in, [n][C][p][p] f16 out.
+    /// Slot 765: `pd_sam3_roi_align` - torchvision roi_align, aligned=False, adaptive sampling, NHWC f32 in, \[n\]\[C\]\[p\]\[p\] f16 out.
     /// (feat, boxes, out, n, H, W, C, pooled, stream).
     pub sam3_roi_align: Option<
         unsafe extern "C" fn(
@@ -8016,7 +8016,7 @@ pub struct KernelTableV1 {
         ) -> i32,
     >,
     /// Slot 771: `pd_sam3_mask_up` - query q's 288^2 mask logits bilinear to the picture, sigmoid >
-    /// 0.5, u8 0/1 column-major [W][H]. (logits, out, side, nq, q, H, W, stream).
+    /// 0.5, u8 0/1 column-major \[W\]\[H\]. (logits, out, side, nq, q, H, W, stream).
     pub sam3_mask_up: Option<
         unsafe extern "C" fn(
             *const core::ffi::c_void,
@@ -9015,7 +9015,7 @@ pub struct KernelTableV1 {
     /// `y16 = f16(gelu(W x + bias))` in `gelu_bias_f16`'s tanh form: the f32
     /// up plane never lands. Bit-identical to `f16_gemm` + `gelu_bias_f16`,
     /// which it runs through the f32 `scratch` plane at shapes the fused
-    /// landing cannot reproduce. bias [out_dim]; in_dim, out_dim, batch as
+    /// landing cannot reproduce. bias \[out_dim\]; in_dim, out_dim, batch as
     /// `f16_gemm`.
     pub f16_gemm_h_gelu_tanhf: Option<F16GemmEpiScratchFn>,
     /// Slot 835: `pd_f16_gemm_bias_res` - a projection onto an f32 residual
@@ -9063,8 +9063,8 @@ pub struct KernelTableV1 {
     /// Slot 848: `pd_dl_ref_step` - `ref = sigmoid(delta + inverse_sigmoid(ref))`
     /// (delta optional), and `ref16 [q][8]` halves zero-padded for the query-pos head.
     pub dl_ref_step: Option<DlRefStepFn>,
-    /// Slot 849: `pd_dl_order_votes` - `votes[j] = sum_{i != j} sigmoid(s[i][j]
-    /// - s[j][i])` over the global pointer's `[q][q]` scores.
+    /// Slot 849: `pd_dl_order_votes` - `votes[j] = sum_{i != j} sigmoid(s[i][j]`
+    /// `- s[j][i])` over the global pointer's `[q][q]` scores.
     pub dl_order_votes: Option<DlOrderVotesFn>,
     /// Slot 850: `pd_stop_mask_rows` - the reasoning stop mask: rows whose
     /// `par` (8 u32: active, inv_t bits, n_stops, 4 stop ids, pad) is active
@@ -9507,8 +9507,8 @@ pub struct KernelTableV1 {
     /// Slot 904: `pd_nvl_resample` (src, dst, src_u8, lines, in, out, horiz,
     /// xmin, xsize, w, taps, ch, stream): one separable pass of torch's float
     /// antialiased bicubic over interleaved rows - `horiz` walks the taps
-    /// along a row ([lines][in][ch] -> [lines][out][ch]), else down a column
-    /// ([in][lines][ch] -> [out][lines][ch]); the per-output taps and f32
+    /// along a row (\[lines\]\[in\]\[ch\] -> \[lines\]\[out\]\[ch\]), else down a column
+    /// (\[in\]\[lines\]\[ch\] -> \[out\]\[lines\]\[ch\]); the per-output taps and f32
     /// weights come with the call. Nemotron 3.5 Super VL's processor.
     pub nvl_resample: Option<
         unsafe extern "C" fn(
@@ -9567,7 +9567,7 @@ pub struct KernelTableV1 {
         Option<unsafe extern "C" fn(*mut core::ffi::c_void, u64, *mut core::ffi::c_void) -> i32>,
     /// Slot 908: `pd_ph_linear` (x, ln_w, ln_b, mod, w, w_bf16, bias, res, gate, y, rows, in, out, eps, pro, epi, kc, vc, pos_dev, pos0, cap, esplit, hint, stream): Phonon's one-row-class linear (GEMV): y = epi(W prologue(x) + b) over BF16 or F32 weights, F32 math; prologue none / LayerNorm / LayerNorm (+affine) with adaLN modulation, epilogue none / +res / GELU-erf / SiLU / res + gate * v / the qkv rope with K/V cache writes; outputs from esplit on take no epilogue; hint = the weights' L2 policy.
     pub ph_linear: Option<PhLinearFn>,
-    /// Slot 909: `pd_ph_rope_kv` (qkv, q, kc, vc, pos_dev, pos0, rows, cap, stream): Phonon's RoPE (interleaved pairs, theta 1e4, 8 heads x 64) on q/k, k/v into ring caches [cap][512] at the device-held position.
+    /// Slot 909: `pd_ph_rope_kv` (qkv, q, kc, vc, pos_dev, pos0, rows, cap, stream): Phonon's RoPE (interleaved pairs, theta 1e4, 8 heads x 64) on q/k, k/v into ring caches \[cap\]\[512\] at the device-held position.
     pub ph_rope_kv: Option<
         unsafe extern "C" fn(
             *const core::ffi::c_void,
@@ -9916,7 +9916,7 @@ pub struct KernelTableV1 {
     /// transcribe.cuh). `tr_ctc_qk_norm_rope(qkv, qn_w, qn_b, kn_w, kn_b,
     /// rope, rows, heads, hd, rot, eps, stream)`: per-head LayerNorm on q and
     /// k of fused [q|k|v] f32 rows and NeoX rope on each head's first `rot`
-    /// dims from a [rows][rot/2][2] (cos, sin) table. `tr_ctc_attention(qkv,
+    /// dims from a \[rows\]\[rot/2\]\[2\] (cos, sin) table. `tr_ctc_attention(qkv,
     /// out, rows, heads, hd 80, stream)`: unmasked f32 attention over the
     /// rows. `tr_ctc_lse_gather(logits, bias, rows, classes, cols, n_cols,
     /// out, stream)`: each row's log-softmax (with bias) at `cols` only.
@@ -15857,7 +15857,7 @@ pub type GatedDeltaRecurrentV2Fn = unsafe extern "C" fn(
 
 /// Slot-indexed gated delta recurrence - B sequences each advance their own
 /// state by one token (continuous-batching decode). q/k/v [B, n_heads, D],
-/// g/beta [B, n_heads], states [n_slots, n_heads, D, D], slots [B].
+/// g/beta \[B, n_heads\], states \[n_slots, n_heads, D, D\], slots \[B\].
 pub type GatedDeltaRecurrentSlotsFn = unsafe extern "C" fn(
     q: *const core::ffi::c_void,
     k: *const core::ffi::c_void,
@@ -15874,7 +15874,7 @@ pub type GatedDeltaRecurrentSlotsFn = unsafe extern "C" fn(
 ) -> KernelStatus;
 
 /// Slot-indexed single-token conv+silu: B sequences advance their own persistent
-/// window. wins [n_slots, k-1, conv_dim], x_new/out [B, conv_dim], slots [B].
+/// window. wins \[n_slots, k-1, conv_dim\], x_new/out \[B, conv_dim\], slots \[B\].
 pub type ConvStepSlotsFn = unsafe extern "C" fn(
     wins: *mut core::ffi::c_void,
     x_new: *const core::ffi::c_void,

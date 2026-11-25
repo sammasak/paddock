@@ -594,12 +594,12 @@ impl<T: XferSink> PoolTier<T> {
     /// Shutdown, before the device goes: everything the GPU still holds -
     /// every live checkpoint with the runs it resumes over, every cached
     /// chain - copied into T1, then every tip written to disk within
-    /// [`EXIT_BUDGET`]. The exit flush alone wrote only what T1 already
+    /// `EXIT_BUDGET`. The exit flush alone wrote only what T1 already
     /// held, and a session's newest state usually is not there yet: the
     /// slack mirror ships one checkpoint a pass, so a session whose last
     /// turn ended just before shutdown lost it and recomputed every token
     /// when it came back. The copy is the same gather the mirror runs,
-    /// bounded by [`FLUSH_WAIT`] for the stores to land.
+    /// bounded by `FLUSH_WAIT` for the stores to land.
     pub fn flush_live(
         &mut self,
         radix: &mut PagedRadix,

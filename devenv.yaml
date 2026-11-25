@@ -1,0 +1,21 @@
+# devenv owns locked development inputs and the shared Rust tasks.
+# This fork preserves upstream formatting/lints; see devenv.nix.
+inputs:
+  nixpkgs:
+    url: github:NixOS/nixpkgs/6774f7bc253789b113a4f39285dc0fa100abeacc
+  platform:
+    url: git+ssh://git@github.com/sammasak/devenv-platform?rev=9079b22b471ca1461dea527baf60150d802e4785
+    flake: false
+  git-hooks:
+    url: github:cachix/git-hooks.nix/27555e2624241fb116b49095df4caaee85a25691
+    inputs:
+      nixpkgs:
+        follows: nixpkgs
+  rust-overlay:
+    url: github:oxalica/rust-overlay/b88764907c1b2de6c0e206d8d9d9634d91c81334
+    inputs:
+      nixpkgs:
+        follows: nixpkgs
+
+imports:
+  - platform

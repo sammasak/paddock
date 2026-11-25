@@ -21,7 +21,7 @@
 //! (`upsample_gen2d_aa_out_frame`), the x-then-y accumulation order, and the
 //! multiply-adds nvcc contracts into FMAs in both kernels (`mul_add` below
 //! marks each one); the antialias WEIGHTS are the one place it is not literal
-//! (see [`aa_axis`]). The elementwise ops
+//! (see `aa_axis`). The elementwise ops
 //! that build the sampling grid are separate eager kernels in the reference,
 //! so they are NOT fused here. A field depends only on (content, canvas)
 //! shape, so pages of one document share it - the tower caches by shape.

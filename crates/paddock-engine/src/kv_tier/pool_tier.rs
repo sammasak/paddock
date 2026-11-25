@@ -37,7 +37,7 @@
 //! [`PoolTier::begin_restore`] allocates fresh pool blocks per run (the
 //! reservation, charged against the same pool `kv_plan` granted), starts one
 //! load per run - joining any in-flight promotion of the same content
-//! single-flight - and [`PoolTier::pump`] resolves tickets: each landed run
+//! single-flight - and [`PoolTier::pump_completions`] resolves tickets: each landed run
 //! is PUBLISHED into the radix (`insert_extension`, which refuses to attach
 //! across a hole if the prefix was evicted mid-flight), so every waiting
 //! slot adopts the restored blocks zero-copy exactly like any other prefix
@@ -458,7 +458,7 @@ pub struct AuxHit {
     pub nvme_bytes: u64,
 }
 
-/// Ticket for an in-flight restore. Resolved by [`PoolTier::pump`].
+/// Ticket for an in-flight restore. Resolved by [`PoolTier::pump_completions`].
 pub type TicketId = u64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

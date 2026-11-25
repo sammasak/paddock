@@ -7,7 +7,7 @@ use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 impl GpuExecutor {
     /// Re-quantize a repacked Q8_0 weight to packed-ADJACENT e2m1 planes -
     /// the mxf4 (m16n8k64) A format. Not interchangeable with the GGUF
-    /// split-order planes [`q8_0_to_mxfp4`] emits.
+    /// split-order planes [`Self::q8_0_to_mxfp4`] emits.
     pub fn q8_0_to_fp4p(&self, w: &RepackedQ8) -> Result<RepackedMxfp4, GpuError> {
         let f = self
             .kernels
@@ -96,9 +96,9 @@ impl GpuExecutor {
 
     /// sm_120a mxf4 dense GEMM (m16n8k64, fp4 x fp4): the full Blackwell fp4
     /// rate - 2x the mxf8f6f4 issue rate, half the activation bytes. Weights
-    /// from [`q8_0_to_fp4p`], activations from [`quantize_e2m1`]. NUMERIC
+    /// from [`Self::q8_0_to_fp4p`], activations from [`Self::quantize_e2m1`]. NUMERIC
     /// CLASS: fp4 weights AND activations (lossiest rung, retrieval-quality
-    /// gated; [`mxfp4_gemm_bs`] is the e4m3 fallback).
+    /// gated; [`Self::mxfp4_gemm_bs`] is the e4m3 fallback).
     #[allow(clippy::too_many_arguments)]
     pub fn mxfp4_gemm_f4(
         &self,
@@ -498,7 +498,7 @@ impl GpuExecutor {
     /// Fused dense FFN front half: gate+up mxf8f6f4 GEMMs over one e4m3
     /// activation staging + in-register silu(g)*u + nvf4 quantize straight
     /// into the down GEMM's `fq`/`fs` planes. Bit-identical to the unfused
-    /// [`mxfp4_gemm_bs`] x2 + [`quantize_nvf4_swiglu`] chain.
+    /// [`Self::mxfp4_gemm_bs`] x2 + [`Self::quantize_nvf4_swiglu`] chain.
     #[allow(clippy::too_many_arguments)]
     pub fn mxfp4_gemm_bs_gu(
         &self,
@@ -860,7 +860,7 @@ impl GpuExecutor {
     }
 
     /// Re-quantize a repacked Q8_0 weight to H128-ROTATED nvf4 planes: pair
-    /// only with [`quantize_nvf4_rot`] activations (the rotations cancel in
+    /// only with [`Self::quantize_nvf4_rot`] activations (the rotations cancel in
     /// the GEMM). The QuaRot treatment for outlier-channel inputs.
     pub fn q8_0_to_nvf4_rot(&self, w: &RepackedQ8) -> Result<RepackedMxfp4, GpuError> {
         let f = self
@@ -920,7 +920,7 @@ impl GpuExecutor {
 
     /// sm_120a nvf4 dense GEMM: mxf4's m16n8k64 issue rate with E4M3-per-16
     /// scaling (the outlier-tolerant fp4 x fp4 class). Weights from
-    /// [`q8_0_to_nvf4`], activations from [`quantize_nvf4`].
+    /// [`Self::q8_0_to_nvf4`], activations from [`Self::quantize_nvf4`].
     #[allow(clippy::too_many_arguments)]
     pub fn mxfp4_gemm_nv4(
         &self,
@@ -962,7 +962,7 @@ impl GpuExecutor {
     /// dense block-scale ffn_down input, computed in registers (the f32
     /// swiglu product never lands in memory).
     /// Fused GEGLU (gelu_tanh) + e4m3 quantize - the gemma4 twin of
-    /// [`quantize_e4m3_swiglu`]; bit-identical to geglu -> quantize_e4m3
+    /// [`Self::quantize_e4m3_swiglu`]; bit-identical to geglu -> quantize_e4m3
     /// (same formula, same scale pick), the f32 activation never lands.
     pub fn quantize_e4m3_geglu(
         &self,
@@ -994,8 +994,8 @@ impl GpuExecutor {
     }
 
     /// Whether the pack ships the fused GEGLU e4m3 quantize.
-    /// Fused-plane GEGLU quantize: gate|up in one [rows][2*n_ff] buffer
-    /// (per-row [gate|up]) -> e4m3 q/scale [rows][n_ff]. Values identical to
+    /// Fused-plane GEGLU quantize: gate|up in one \[rows\]\[2*n_ff\] buffer
+    /// (per-row [gate|up]) -> e4m3 q/scale \[rows\]\[n_ff\]. Values identical to
     /// quantize_e4m3_geglu on split buffers.
     pub fn quantize_e4m3_glu2(
         &self,
@@ -1037,7 +1037,7 @@ impl GpuExecutor {
 
     /// Interleaved-plane twin of [`Self::quantize_e4m3_glu2`]: gu came
     /// from a GEMM over a `f8w_repack_lin_gui` plane, so pair p sits at row
-    /// offsets (p>>3)*16+(p&7) / +8 inside each [2*n_ff] row. Byte-identical
+    /// offsets (p>>3)*16+(p&7) / +8 inside each \[2*n_ff\] row. Byte-identical
     /// outputs to glu2 on the unpermuted plane.
     pub fn quantize_e4m3_glu2i(
         &self,
@@ -1098,7 +1098,7 @@ impl GpuExecutor {
             && self.nvf4_ckpt_arch()
     }
 
-    /// The arch half of [`has_nvf4_ckpt`], separately callable so a caller can
+    /// The arch half of [`Self::has_nvf4_ckpt`], separately callable so a caller can
     /// tell "this GPU cannot" from "this pack was not built for it".
     ///
     /// Floor is 8.9, and it must stay equal to the pack's `PD_NV4_OK`
@@ -1766,7 +1766,7 @@ impl GpuExecutor {
     /// split (down 45% -> 86% of the wall, o 38% -> 50%) and sk4 is their best
     /// depth at every K probed (12800, 32768). The old `const SK: usize = 4`
     /// was that small-shape verdict applied to gate|up on both sizes.
-    /// PADDOCK_NV4_SK=<n> pins one depth for every shape (the A/B; 4 = the
+    /// `PADDOCK_NV4_SK=<n>` pins one depth for every shape (the A/B; 4 = the
     /// shipped constant). Unsplit also means no partials, so the consumer
     /// takes the plain-y path (nvf4_gemm_f4_raw_parts returns None).
     pub fn nv4_decode_sk(&self, out_dim: usize) -> usize {
@@ -2756,7 +2756,7 @@ impl GpuExecutor {
         Ok(())
     }
 
-    /// Token-batched expert up GEMV + fused squared-relu: `idx` [batch*k]
+    /// Token-batched expert up GEMV + fused squared-relu: `idx` \[batch*k\]
     /// expert picks, `x` [batch, in_dim], `y` [batch*k, ff]. The shared
     /// expert rides k=1 with a constant-zero idx over its 1-expert plane.
     #[allow(clippy::too_many_arguments)]
@@ -2814,7 +2814,7 @@ impl GpuExecutor {
 
     /// Token-batched expert down GEMV + weighted combine (deterministic
     /// ascending-slot order): `xr` [batch*k, ff] the up outputs, `topk_w`
-    /// [batch*k], `y` [batch, embd]. `accumulate` adds onto y (the
+    /// \[batch*k\], `y` [batch, embd]. `accumulate` adds onto y (the
     /// shared-expert pass); the routed pass runs with `accumulate = false`.
     #[allow(clippy::too_many_arguments)]
     pub fn nvf4_moe_down_acc(
@@ -3837,7 +3837,7 @@ impl GpuExecutor {
     }
 
     /// [`Self::nvf4_moe_down_part_tt`] without a shared expert: `part`
-    /// [k + 1][down.ff], slot k written as zeros (the zero-width shared
+    /// [k + 1]\[down.ff\], slot k written as zeros (the zero-width shared
     /// slot), so the fold over k + 1 slots is the routed sum exactly.
     pub fn nvf4_moe_down_part_tt_solo(
         &self,

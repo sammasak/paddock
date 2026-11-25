@@ -357,7 +357,7 @@ impl EventRing {
         (dropped, next, out)
     }
 
-    /// Long-poll form of [`since`]: waits up to `wait` for at least one record
+    /// Long-poll form of [`Self::since`]: waits up to `wait` for at least one record
     /// past `from` before returning (immediately when records already exist).
     pub async fn wait_since(
         &self,

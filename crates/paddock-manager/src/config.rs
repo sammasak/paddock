@@ -30,7 +30,7 @@ pub struct Config {
     /// everyone. Off by default: a direct bind, the box's own browser.
     pub trusted_proxy: bool,
     /// Runner binary override (PADDOCK_RUNNER_BIN). Default: the
-    /// `paddock-runner` beside this executable; runners/<version>/ election
+    /// `paddock-runner` beside this executable; `runners/<version>/` election
     /// lands with the artifact scheme (doc §11.1).
     pub runner_bin: Option<PathBuf>,
     /// Device passed to spawned runners. Native platform default; no CPU fallback.

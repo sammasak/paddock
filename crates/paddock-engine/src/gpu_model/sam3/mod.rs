@@ -203,15 +203,15 @@ pub struct GpuSam3Vision {
 /// below copy them out (the gates' view - the heads read them in place).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Sam3Plane {
-    /// the trunk output, f32, window-major rows [5184][1024]
+    /// the trunk output, f32, window-major rows \[5184\]\[1024\]
     Trunk,
-    /// detector neck level 0..3 (x4, x2, x1), f32 raster [side^2][256]
+    /// detector neck level 0..3 (x4, x2, x1), f32 raster [side^2]\[256\]
     Det(usize),
     /// tracker neck level 0..3, same shape
     Trk(usize),
-    /// conv_s0 over the tracker's x4 level, [288^2][32]
+    /// conv_s0 over the tracker's x4 level, [288^2]\[32\]
     TrkS0,
-    /// conv_s1 over the tracker's x2 level, [144^2][64]
+    /// conv_s1 over the tracker's x2 level, [144^2]\[64\]
     TrkS1,
 }
 

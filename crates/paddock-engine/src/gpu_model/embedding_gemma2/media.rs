@@ -113,7 +113,7 @@ impl ImageTower {
         Ok(())
     }
 
-    /// One picture (interleaved RGB8) -> its [tokens][512] input rows: the
+    /// One picture (interleaved RGB8) -> its \[tokens\]\[512\] input rows: the
     /// processor's resize, then the tower from the resized plane where it
     /// lies on the device (the fused tower patchifies it there).
     pub fn encode(&mut self, rgb: &[u8], w: usize, h: usize) -> Result<VisionOutput, GpuError> {

@@ -77,17 +77,17 @@ pub(super) struct Decoder {
 pub struct DecoderOut {
     /// memory rows the selection kept, in rank order
     pub topk: Vec<u32>,
-    /// f32 [300][4] (cx, cy, w, h) in [0, 1], the last layer's boxes
+    /// f32 \[300\]\[4\] (cx, cy, w, h) in [0, 1], the last layer's boxes
     pub boxes: Vec<f32>,
-    /// f32 [300][25] class logits
+    /// f32 \[300\]\[25\] class logits
     pub logits: Vec<f32>,
-    /// f32 [300] reading-order votes (smaller is earlier)
+    /// f32 \[300\] reading-order votes (smaller is earlier)
     pub votes: Vec<f32>,
     /// f32 [300][200 * 200] mask logits, on the device
     pub masks: CudaSlice<f32>,
-    /// the initial reference boxes, f32 [300][4]
+    /// the initial reference boxes, f32 \[300\]\[4\]
     pub init_ref: Vec<f32>,
-    /// each layer's output hidden states, f32 [300][256]
+    /// each layer's output hidden states, f32 \[300\]\[256\]
     pub layers: Vec<Vec<f32>>,
 }
 
