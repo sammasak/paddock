@@ -37,6 +37,19 @@ Serving tuning (8G cap, `w/serve/ab.sh`: artifact page cache dropped before each
 
 So `vram_budget = 7500` (+6%) is in the serve config; the host tier does not pay under an 8 GiB cap (it takes the page cache's room).
 
+Decode-miss cost (Fable consult, read-only): the per-read BLAKE3 check of each 1.9 MB miss sits on the critical path. `[moe_offload] verify_once = true` (default off; the owner's call) checks a record on its first read in the process only. Serve A/B (`ab.sh`, 30 slots, cache dropped): off 10.21 / 11.35 / 11.35 / 11.68 tok/s, on 12.02 / 14.32 / 15.08 / 15.12 tok/s. Gate with it on (R26): parity bit-exact as before, 9246 of 54545 reads checked a digest, gate decode 11.20 / 11.55 tok/s (9.7 before). The consult ranked page-cache prefetch from the previous token's routing as no gain (a miss is by construction an expert not routed recently) and a frequency-aware VRAM policy as +5-10%, uncertain.
+
+Final serve config (`w/serve/paddock.toml`: the block above plus `vram_budget = 7500` and `verify_once = true`), artifact page cache dropped, fresh start, 8G cap:
+
+| request | result | TTFT | decode |
+|---|---|---|---|
+| chat, sky blue (23 in, 53 out) | the correct two-sentence answer | 3.62 s | 9.36 tok/s |
+| tool call `get_weather` (302 in, 27 out) | `finish_reason=tool_calls`, `{"city":"Stockholm"}` | 12.28 s | 8.71 tok/s |
+| hash map paragraph (31 in, 194 out) | coherent | 3.18 s | 11.86 tok/s |
+| B-tree paragraph (32 in, 199 out) | coherent | 3.22 s | 13.56 tok/s |
+
+Limits seen: max_ctx 8192 does not fit (prefill scratch for the whole prompt, 3.96 GB); a cold prompt of a few hundred tokens reads most of the artifact (TTFT about 12 s at 300 tokens).
+
 ## Current state (head of asus/ssd-expert-backing), against the PR 2 checklist
 
 Each line points at the run below that proves it; logs are in `~/paddock-runs/w/logs` on asus.
