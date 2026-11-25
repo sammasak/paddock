@@ -68,6 +68,13 @@
       formatter.${system} = pkgs.nixfmt-tree;
       devShells.${system}.default = pkgs.mkShell {
         packages = [ support.toolchain ] ++ support.nativeBuildInputs;
+        # cudarc dlopens libcuda.so by name. On NixOS the driver lives only in
+        # /run/opengl-driver/lib, and without it every GPU gate reports SKIP.
+        shellHook = ''
+          if [ -d /run/opengl-driver/lib ]; then
+            export LD_LIBRARY_PATH=/run/opengl-driver/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+          fi
+        '';
       };
       checks.${system} = {
         inherit runner;
