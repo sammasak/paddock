@@ -182,7 +182,7 @@ impl SlotLru {
 }
 
 /// Rows a block of the sorted MoE pair holds (`PD_MOE_BM` in the pack).
-const PD_MOE_BM: usize = 32;
+pub(crate) const PD_MOE_BM: usize = 32;
 
 /// The layout `pd_moe_align` writes, for the pairs of one wave: `pairs`
 /// (`token * n_active + k`, ascending) routed to `slots` (one each, under
@@ -199,10 +199,12 @@ pub(super) fn sorted_layout(
     srow: &mut Vec<u32>,
     sslot: &mut Vec<u32>,
     bexp: &mut Vec<u32>,
-) -> usize {
+) -> Result<usize, GpuError> {
     let mut count = vec![0usize; n_slots];
     for &s in slots {
-        count[s as usize] += 1;
+        *count.get_mut(s as usize).ok_or_else(|| {
+            GpuError::Driver(format!("expert disk backing: slot {s} of {n_slots}"))
+        })? += 1;
     }
     let mut first = vec![0usize; n_slots];
     let mut blocks = 0;
@@ -223,7 +225,7 @@ pub(super) fn sorted_layout(
         sslot[*at] = p % n_active as u32;
         *at += 1;
     }
-    blocks
+    Ok(blocks)
 }
 
 /// Assign a launch's distinct routed experts (`n_active` rows per token) to
@@ -973,6 +975,8 @@ pub(crate) struct DiskRouting {
     pub(crate) n_tokens: CudaSlice<u32>,
     /// Pinned sources for the uploads, so they never sync the stream.
     host: Mutex<HostRouting>,
+    /// The slot count the pinned buffers were sized for.
+    max_slots: usize,
 }
 
 /// Two pinned upload buffers, used in turn: one is written while the
@@ -1010,6 +1014,7 @@ impl DiskRouting {
             n_pairs: exec.to_device_u32(&[0])?,
             tokens: exec.to_device_u32(&vec![0; max_tokens])?,
             n_tokens: exec.to_device_u32(&[0])?,
+            max_slots,
             host: Mutex::new(HostRouting {
                 bufs: [pinned()?, pinned()?],
                 done: [None, None],
@@ -1162,10 +1167,16 @@ impl MoeDiskBacking {
         }
         let max_rows = max_tokens * n_active;
         match self.routing.get() {
-            Some(r) if r.slots.len() < max_rows || r.tokens.len() < max_tokens => {
+            Some(r)
+                if r.slots.len() < max_rows
+                    || r.tokens.len() < max_tokens
+                    || r.max_slots < slots =>
+            {
                 return Err(GpuError::Driver(format!(
-                    "expert disk backing: seated for {} routed rows, asked for {max_rows}",
-                    r.slots.len()
+                    "expert disk backing: seated for {} routed rows and {} slots, asked for \
+                     {max_rows} and {slots}",
+                    r.slots.len(),
+                    r.max_slots
                 )));
             }
             Some(_) => {}
@@ -1320,7 +1331,7 @@ impl MoeDiskBacking {
                 &mut sc.srow,
                 &mut sc.sslot,
                 &mut sc.bexp,
-            );
+            )?;
             dr.upload_to(
                 exec,
                 &[(srow, &sc.srow), (sslot, &sc.sslot), (bexp, &sc.bexp)],
@@ -1652,6 +1663,40 @@ mod tests {
         assert!(
             plan_waves(&[0, 1, 2], 2, N_EXPERT, 4, &mut w).is_err(),
             "ragged"
+        );
+    }
+
+    #[test]
+    fn sorted_layout_groups_pairs_by_slot_in_whole_blocks() {
+        let (mut srow, mut sslot, mut bexp) = (Vec::new(), Vec::new(), Vec::new());
+        // top-2: pairs 1 (token 0, k 1), 2 (token 1, k 0) and 35 more on slot 2
+        let mut pairs = vec![1, 2];
+        let mut slots = vec![2, 0];
+        for p in 4..39 {
+            pairs.push(p);
+            slots.push(2);
+        }
+        let blocks =
+            sorted_layout(&pairs, &slots, 2, 3, &mut srow, &mut sslot, &mut bexp).expect("layout");
+        // slot 0 one block, slot 1 none, slot 2 (36 pairs) two
+        assert_eq!(blocks, 3);
+        assert_eq!(bexp, vec![0, 2, 2]);
+        assert_eq!(srow.len(), blocks * PD_MOE_BM);
+        assert_eq!((srow[0], sslot[0]), (1, 0));
+        assert!(srow[1..PD_MOE_BM].iter().all(|&r| r == MOE_CACHE_NONE));
+        assert_eq!((srow[PD_MOE_BM], sslot[PD_MOE_BM]), (0, 1));
+        assert_eq!((srow[PD_MOE_BM + 1], sslot[PD_MOE_BM + 1]), (2, 0));
+        assert_eq!(srow[2 * PD_MOE_BM + 3], 19, "pair 38 is token 19");
+        assert!(
+            srow[2 * PD_MOE_BM + 4..]
+                .iter()
+                .all(|&r| r == MOE_CACHE_NONE)
+        );
+        // the bound the device scratch is sized by
+        assert!(blocks <= (pairs.len() + 3 * (PD_MOE_BM - 1)).div_ceil(PD_MOE_BM));
+        assert!(
+            sorted_layout(&[0], &[3], 2, 3, &mut srow, &mut sslot, &mut bexp).is_err(),
+            "slot out of range"
         );
     }
 

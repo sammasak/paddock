@@ -3267,7 +3267,7 @@ fn moe_routed_disk(
                 blocks,
             )?;
             if d_sums {
-                exec.q8_sums_strided(fq, ssums, ff, blocks * 32)?;
+                exec.q8_sums_strided(fq, ssums, ff, blocks * crate::gpu::PD_MOE_BM)?;
             }
             exec.kquant_moe_down_mma(
                 d,
