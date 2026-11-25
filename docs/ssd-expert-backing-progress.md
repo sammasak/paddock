@@ -27,6 +27,16 @@ Requests (`w/serve/stream.py`, streaming, temperature 0, thinking off via `chat_
 - Chat, "In two sentences, explain why the sky is blue.": "Sunlight reaches Earth's atmosphere and is scattered in all directions by all the gases and particles in the air. Blue light is scattered more than other colors because it travels as shorter, smaller waves, which is why we see a blue sky most of the time." 23 prompt tokens, 53 out, TTFT 2.29 s, decode 8.54 tok/s. (With thinking on, the same prompt gives a correct Rayleigh-scattering reasoning trace.)
 - Tool call, one function `get_weather(city, unit?)`, "What is the weather in Stockholm right now? Use the tool.": `finish_reason=tool_calls`, `get_weather {"city":"Stockholm"}` (streamed and non-streamed, id `call_...`), 302 prompt tokens, TTFT 11.97 s, decode 7.38 tok/s. A cold prefill of a few hundred tokens touches most of each layer's experts, so it reads a large part of the artifact (1.3 GB/s device).
 
+Serving tuning (8G cap, `w/serve/ab.sh`: artifact page cache dropped before each start, then 4 requests of ~195 tokens out, thinking off). Without the drop, page cache left by earlier processes is served past the new cgroup's cap and inflates decode (one such run read 16.9-19.4 tok/s).
+
+| config | slots | decode, 4 requests | TTFT |
+|---|---|---|---|
+| default VRAM budget (90% of the card) | 24 | 9.42 / 10.63 / 10.73 / 10.98 tok/s | 4.39, then 3.2-3.4 s |
+| `vram_budget = 7500` | 30 | 10.14 / 11.34 / 11.34 / 11.64 | 4.30, then 3.3-3.5 s |
+| `vram_budget = 7500`, `host_cache_gb = 3` | 30 | 9.40 / 11.08 / 11.63 / 8.31 | 4.25, then 3.2-3.6 s |
+
+So `vram_budget = 7500` (+6%) is in the serve config; the host tier does not pay under an 8 GiB cap (it takes the page cache's room).
+
 ## Current state (head of asus/ssd-expert-backing), against the PR 2 checklist
 
 Each line points at the run below that proves it; logs are in `~/paddock-runs/w/logs` on asus.
