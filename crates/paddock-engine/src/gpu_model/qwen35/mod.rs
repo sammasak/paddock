@@ -1476,9 +1476,10 @@ impl GpuQwen35 {
     /// Cache counters summed over the layers: `(rows resolved, misses)` since
     /// load; `None` without a cache. Syncs the stream - for gates and logs.
     pub fn moe_cache_stats(&self) -> Result<Option<(u64, u64)>, GpuModelError> {
-        // the disk backing resolves on the host; the device counters stay 0
+        // the disk backing resolves on the host; the device counters stay 0.
+        // A slot miss is a disk read or a host tier hit.
         if let Some(s) = self.moe_disk_stats() {
-            return Ok(Some((s.rows, s.misses)));
+            return Ok(Some((s.rows, s.misses + s.tier_hits)));
         }
         let mut acc: Option<(u64, u64)> = None;
         for l in &self.layers {

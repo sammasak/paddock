@@ -246,7 +246,9 @@ struct HostTier<B> {
     at: Vec<Vec<u32>>,
     /// Per layer, the routed rows of each expert since load.
     count: Vec<Vec<u32>>,
-    pending: Vec<bool>,
+    /// Per buffer, the in-flight batches that copy out of it: written again
+    /// only at zero.
+    pending: Vec<u32>,
 }
 
 impl<B: AsRef<[u8]> + AsMut<[u8]>> HostTier<B> {
@@ -255,7 +257,7 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>> HostTier<B> {
         Self {
             quota,
             held: vec![MOE_CACHE_NONE; bufs.len()],
-            pending: vec![false; bufs.len()],
+            pending: vec![0; bufs.len()],
             at: n_expert.iter().map(|&n| vec![MOE_CACHE_NONE; n]).collect(),
             count: n_expert.iter().map(|&n| vec![0; n]).collect(),
             bufs,
@@ -284,7 +286,7 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>> HostTier<B> {
         let count = &self.count[layer];
         let held = &self.held;
         let b = (layer * self.quota..(layer + 1) * self.quota)
-            .filter(|&b| !self.pending[b])
+            .filter(|&b| self.pending[b] == 0)
             .min_by_key(|&b| match held[b] {
                 MOE_CACHE_NONE => (0, 0),
                 h => (1, count[h as usize]),
@@ -501,7 +503,7 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>, M> DiskExperts<B, M> {
                 };
                 if let Src::Hit(b) | Src::Tier(b) = src {
                     // never written again until this batch's mark is waited for
-                    self.tier.pending[b] = true;
+                    self.tier.pending[b] += 1;
                     tiered.push(b);
                 }
                 srcs.push(src);
@@ -559,7 +561,7 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>, M> DiskExperts<B, M> {
                     }
                 }
                 for &b in &tiered {
-                    self.tier.pending[b] = false;
+                    self.tier.pending[b] -= 1;
                 }
                 return Err(GpuError::ExpertIo(e));
             }
@@ -645,7 +647,7 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>, M> DiskExperts<B, M> {
                 self.pool.release(l);
             }
             for b in tiered {
-                self.tier.pending[b] = false;
+                self.tier.pending[b] -= 1;
             }
         }
         Ok(())
@@ -668,7 +670,7 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>, M> DiskExperts<B, M> {
             self.pool.release(l);
         }
         for b in tiered {
-            self.tier.pending[b] = false;
+            self.tier.pending[b] -= 1;
         }
         Ok(())
     }
@@ -1144,7 +1146,9 @@ impl MoeDiskBacking {
         // The host tier: PADDOCK_MOE_DISK_HOST_MB of pinned records
         // (development instrument; none by default).
         let tier_mb = dev_count(paddock_models::dev_var!("PADDOCK_MOE_DISK_HOST_MB"), 0);
-        let tier = (0..(tier_mb << 20) / len)
+        // whole buffers a layer only
+        let per_layer = (tier_mb << 20) / len / store.n_layers();
+        let tier = (0..per_layer * store.n_layers())
             .map(|_| PinnedBuf::new(stream.clone(), len))
             .collect::<std::io::Result<Vec<_>>>()
             .map_err(|e| GpuError::Driver(format!("expert host tier: {e}")))?;
@@ -1285,8 +1289,9 @@ impl Drop for MoeDiskBacking {
         if s.rows > 0 {
             tracing::info!(
                 rows = s.rows,
-                misses = s.misses,
-                hit_pct = 100.0 * (1.0 - s.misses as f64 / s.rows as f64),
+                misses = s.misses + s.tier_hits,
+                tier_hits = s.tier_hits,
+                hit_pct = 100.0 * (1.0 - (s.misses + s.tier_hits) as f64 / s.rows as f64),
                 read_mib = s.bytes_read >> 20,
                 read_mib_s = (s.bytes_read >> 20) as f64 / s.read_time.as_secs_f64().max(1e-9),
                 read_s = s.read_time.as_secs_f64(),
@@ -1635,7 +1640,34 @@ mod tests {
         let ls = layouts();
         assert_eq!(dev.slot(slots[0]), record(&ls, 0, 2));
         x.settle(&mut dev).expect("settle");
-        assert!(x.tier.pending.iter().all(|&p| !p));
+        assert!(x.tier.pending.iter().all(|&p| p == 0));
+    }
+
+    #[test]
+    fn a_tier_buffer_in_two_batches_waits_for_both() {
+        let path = artifact("tier-twice");
+        // one slot and one tier buffer a layer, no settle between fills:
+        // 1 is admitted, evicted from the slot by 2, then hit again while
+        // its first copy is still queued
+        let mut x = tiered(&path, 1, 1, 2);
+        let mut dev = FakeDevice::new(1);
+        let mut slot = [MOE_CACHE_NONE; 1];
+        x.fill(0, &[1], &mut slot, &mut dev).expect("fill");
+        x.fill(0, &[2], &mut slot, &mut dev).expect("fill");
+        x.fill(0, &[1], &mut slot, &mut dev).expect("fill");
+        assert_eq!(x.stats().tier_hits, 1);
+        assert_eq!(x.tier.pending[0], 2, "two batches copy out of it");
+        // 3, routed twice (as often as 1), needs staging: the oldest batch is
+        // waited for, but the buffer still serves the third fill's copy and
+        // must not take 3
+        let mut two = [MOE_CACHE_NONE; 2];
+        x.fill(0, &[3, 3], &mut two, &mut dev).expect("fill");
+        assert_eq!(x.tier.lookup(0, 1), Some(0));
+        dev.flush();
+        let ls = layouts();
+        assert_eq!(dev.slot(two[0]), record(&ls, 0, 3));
+        x.settle(&mut dev).expect("settle");
+        assert!(x.tier.pending.iter().all(|&p| p == 0));
     }
 
     #[test]
