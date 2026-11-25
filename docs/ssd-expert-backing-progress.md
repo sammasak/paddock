@@ -51,7 +51,7 @@ Reading: token-range prefill thrashes the 32 slots (each range holds at most 32 
 
 ### Environment
 
-- Dev shell: `asus/devshell-driver-lib` (one commit, 355df36, on top of PR 1's codex/hpc-research) adds a shellHook that puts /run/opengl-driver/lib on LD_LIBRARY_PATH. Checked: `env -u LD_LIBRARY_PATH nix develop . --command` prints `LD=/run/opengl-driver/lib`; nixfmt and statix pass. To be folded into PR 1.
+- Dev shell: `asus/devshell-driver-lib` (one commit, 355df36, on top of PR 1's codex/hpc-research) adds a shellHook that puts /run/opengl-driver/lib on LD_LIBRARY_PATH. Checked: `env -u LD_LIBRARY_PATH nix develop . --command` prints `LD=/run/opengl-driver/lib`; nixfmt, statix and deadnix pass on flake.nix. To be folded into PR 1.
 - Disk gates fail loudly: with PADDOCK_HEAVY_TESTS set, `gpu_qwen36_moe_disk` sets PADDOCK_STRICT_GATES, so a missing driver, pack or model fails the test; a missing artifact variable panics (105a0ba).
 
 ### Expert-major prefill (waves), 44b8475 + 36c068e
