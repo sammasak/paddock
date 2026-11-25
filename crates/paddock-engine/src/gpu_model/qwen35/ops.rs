@@ -1652,7 +1652,24 @@ pub(super) fn moe_ffn(
         && paddock_models::dev_var_os!("PADDOCK_NO_SORTED_QMOE").is_none();
     if let Some((backing, layer)) = &w.disk {
         moe_routed_disk(
-            exec, w, backing, *layer, dims, embd, batch, xq, xs, ssums, idx, topk_w, fused, fq, fs,
+            exec,
+            w,
+            backing,
+            *layer,
+            dims,
+            embd,
+            batch,
+            sorted,
+            xq,
+            xs,
+            ssums,
+            idx,
+            topk_w,
+            fused,
+            fq,
+            fs,
+            (srow, sslot, bexp),
+            part,
             proj,
         )?;
     } else if sorted {
@@ -3185,13 +3202,17 @@ pub(super) fn prefill_ffn_f8w(
 }
 
 /// The routed experts of a disk-backed layer (`PADDOCK_MOE_DISK`) over the
-/// slot cache. When the launch's experts fit the slots (decode), the
-/// token-batched k-quant pair runs once, as on the pinned cache. Otherwise
-/// (prefill) it runs expert-major, as qwen4exp's `kq_moe_routed_waves`: per
-/// wave of at most `slots` experts, fill them, then the LIST pair over just
-/// the wave's pairs, down accumulating into a zeroed `proj`. A token's
-/// experts are then summed in wave order, the reassociation class the
-/// sorted and wave paths carry.
+/// slot cache, in the class the pinned backing picks for the launch:
+/// - `sorted` (prefill, the pinned path's sorted tensor-core pair): per wave
+///   of at most `slots` experts, fill them, upload the wave's `pd_moe_align`
+///   layout over the slot planes, run the sorted pair, which writes each
+///   pair's partial once; then the slot combine folds them in pair order,
+///   as on the pinned path, so the result is the pinned one bit for bit;
+/// - else, when the launch's experts fit the slots (decode), the
+///   token-batched k-quant pair once, as on the pinned cache;
+/// - else (short prompts with more experts than slots) expert-major over
+///   the LIST pair, as qwen4exp's `kq_moe_routed_waves`, down accumulating
+///   into a zeroed `proj`: a token's experts are summed in wave order there.
 #[allow(clippy::too_many_arguments)]
 fn moe_routed_disk(
     exec: &GpuExecutor,
@@ -3201,6 +3222,7 @@ fn moe_routed_disk(
     dims: MoeDims,
     embd: usize,
     batch: usize,
+    sorted: bool,
     xq: &CudaSlice<i8>,
     xs: &CudaSlice<f32>,
     ssums: &mut CudaSlice<f32>,
@@ -3209,6 +3231,8 @@ fn moe_routed_disk(
     fused: &mut CudaSlice<f32>,
     fq: &mut CudaSlice<i8>,
     fs: &mut CudaSlice<f32>,
+    (srow, sslot, bexp): (&CudaSlice<u32>, &CudaSlice<u32>, &CudaSlice<u32>),
+    part: &mut CudaSlice<f32>,
     proj: &mut CudaSlice<f32>,
 ) -> Result<(), GpuModelError> {
     let c = w.cache.as_ref().ok_or_else(|| {
@@ -3218,6 +3242,53 @@ fn moe_routed_disk(
     let rows = batch * na;
     let n_waves = backing.plan(exec, c, idx, rows, na)?;
     let (g, u, d) = (&c.gate, &c.up, &c.down);
+    // the pinned path's k-quant sorted pair, under its own conditions: one
+    // gate/up type, no i-quant seat
+    let iq = [g, u, d].iter().any(|p| crate::gpu::kq_is_iq(p.ty));
+    if sorted && g.ty == u.ty && !iq {
+        let g_sums = crate::gpu::kq_needs_sums(g.ty);
+        let d_sums = crate::gpu::kq_needs_sums(d.ty);
+        for wave in 0..n_waves {
+            let blocks = backing.fill_wave_sorted(exec, c, layer, na, wave, srow, sslot, bexp)?;
+            // ssums holds the down sums after a wave: the input's again
+            if g_sums {
+                exec.q8_sums_strided(xq, ssums, embd, batch)?;
+            }
+            exec.kquant_moe_gate_up_mma(
+                g,
+                u,
+                srow,
+                bexp,
+                xq,
+                xs,
+                g_sums.then_some(&*ssums),
+                fq,
+                fs,
+                blocks,
+            )?;
+            if d_sums {
+                exec.q8_sums_strided(fq, ssums, ff, blocks * 32)?;
+            }
+            exec.kquant_moe_down_mma(
+                d,
+                srow,
+                sslot,
+                bexp,
+                topk_w,
+                fq,
+                fs,
+                d_sums.then_some(&*ssums),
+                part,
+                na,
+                blocks,
+            )?;
+        }
+        exec.stream
+            .memset_zeros(proj)
+            .map_err(|e| GpuError::Driver(e.to_string()))?;
+        exec.moe_slot_combine(part, proj, embd, na, batch)?;
+        return Ok(());
+    }
     let gu_sums = crate::gpu::kq_needs_sums(g.ty) || crate::gpu::kq_needs_sums(u.ty);
     let d_sums = crate::gpu::kq_needs_sums(d.ty);
     if n_waves == 1 {

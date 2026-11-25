@@ -181,6 +181,51 @@ impl SlotLru {
     }
 }
 
+/// Rows a block of the sorted MoE pair holds (`PD_MOE_BM` in the pack).
+const PD_MOE_BM: usize = 32;
+
+/// The layout `pd_moe_align` writes, for the pairs of one wave: `pairs`
+/// (`token * n_active + k`, ascending) routed to `slots` (one each, under
+/// `n_slots`) are grouped by slot in slot order into blocks of `PD_MOE_BM`
+/// rows. `srow` gets each row's token (`MOE_CACHE_NONE` pads a block),
+/// `sslot` its `k`, `bexp` each block's slot. Returns the block count. A row's
+/// output in the sorted pair does not depend on the rows it shares a block
+/// with, so only the grouping matters, not the order within a slot.
+pub(super) fn sorted_layout(
+    pairs: &[u32],
+    slots: &[u32],
+    n_active: usize,
+    n_slots: usize,
+    srow: &mut Vec<u32>,
+    sslot: &mut Vec<u32>,
+    bexp: &mut Vec<u32>,
+) -> usize {
+    let mut count = vec![0usize; n_slots];
+    for &s in slots {
+        count[s as usize] += 1;
+    }
+    let mut first = vec![0usize; n_slots];
+    let mut blocks = 0;
+    bexp.clear();
+    for (s, &c) in count.iter().enumerate() {
+        first[s] = blocks * PD_MOE_BM;
+        let nb = c.div_ceil(PD_MOE_BM);
+        bexp.extend(std::iter::repeat_n(s as u32, nb));
+        blocks += nb;
+    }
+    srow.clear();
+    srow.resize(blocks * PD_MOE_BM, MOE_CACHE_NONE);
+    sslot.clear();
+    sslot.resize(blocks * PD_MOE_BM, 0);
+    for (&p, &s) in pairs.iter().zip(slots) {
+        let at = &mut first[s as usize];
+        srow[*at] = p / n_active as u32;
+        sslot[*at] = p % n_active as u32;
+        *at += 1;
+    }
+    blocks
+}
+
 /// Assign a launch's distinct routed experts (`n_active` rows per token) to
 /// waves of at most `slots` each, into `wave_of` (one entry per expert,
 /// `MOE_CACHE_NONE` for an expert the launch does not route to), in id
@@ -944,8 +989,17 @@ struct HostRouting {
 }
 
 impl DiskRouting {
-    fn new(exec: &GpuExecutor, max_rows: usize, max_tokens: usize) -> Result<Self, GpuError> {
-        let words = 2 * max_rows + max_tokens + 2;
+    fn new(
+        exec: &GpuExecutor,
+        max_rows: usize,
+        max_tokens: usize,
+        max_slots: usize,
+    ) -> Result<Self, GpuError> {
+        // the token-batched or LIST routing, or a sorted layout (rows and
+        // slots padded to whole blocks, and one expert a block)
+        let sorted =
+            2 * (max_rows + PD_MOE_BM * max_slots) + max_rows.div_ceil(PD_MOE_BM) + max_slots;
+        let words = (2 * max_rows + max_tokens + 2).max(sorted);
         let pinned = || {
             PinnedBuf::new(exec.stream.clone(), 4 * words)
                 .map_err(|e| GpuError::Driver(format!("expert routing: {e}")))
@@ -973,6 +1027,27 @@ impl DiskRouting {
         slots: &[u32],
         wave: Option<(&[u32], &[u32])>,
     ) -> Result<(), GpuError> {
+        let (pairs, tokens) = wave.unwrap_or((&[], &[]));
+        let counts = [pairs.len() as u32, tokens.len() as u32];
+        let mut parts: Vec<(&CudaSlice<u32>, &[u32])> = vec![(&self.slots, slots)];
+        if wave.is_some() {
+            parts.extend([
+                (&self.pairs, pairs),
+                (&self.tokens, tokens),
+                (&self.n_pairs, &counts[..1]),
+                (&self.n_tokens, &counts[1..]),
+            ]);
+        }
+        self.upload_to(exec, &parts)
+    }
+
+    /// Copy each `(dst, src)` to the head of `dst`, in stream order, from
+    /// the next pinned buffer.
+    fn upload_to(
+        &self,
+        exec: &GpuExecutor,
+        parts: &[(&CudaSlice<u32>, &[u32])],
+    ) -> Result<(), GpuError> {
         let mut h = lock(&self.host);
         if h.broken {
             return Err(broken());
@@ -987,24 +1062,13 @@ impl DiskRouting {
         }
         h.done[i] = None;
         h.next ^= 1;
-        let (pairs, tokens) = wave.unwrap_or((&[], &[]));
-        let counts = [pairs.len() as u32, tokens.len() as u32];
-        let mut parts: Vec<(&CudaSlice<u32>, &[u32])> = vec![(&self.slots, slots)];
-        if wave.is_some() {
-            parts.extend([
-                (&self.pairs, pairs),
-                (&self.tokens, tokens),
-                (&self.n_pairs, &counts[..1]),
-                (&self.n_tokens, &counts[1..]),
-            ]);
-        }
         let HostRouting {
             bufs, done, broken, ..
         } = &mut *h;
         let buf = bufs[i].as_mut();
         let mut at = 0;
         let mut r = Ok(());
-        for (dst, src) in parts {
+        for &(dst, src) in parts {
             let n = 4 * src.len();
             if src.len() > dst.len() || at + n > buf.len() {
                 r = Err(GpuError::Driver(format!(
@@ -1108,7 +1172,7 @@ impl MoeDiskBacking {
             None => {
                 let _ = self
                     .routing
-                    .set(DiskRouting::new(exec, max_rows, max_tokens)?);
+                    .set(DiskRouting::new(exec, max_rows, max_tokens, slots)?);
             }
         }
         let mut caches = Vec::with_capacity(self.layouts.len());
@@ -1205,6 +1269,79 @@ impl MoeDiskBacking {
         wave: usize,
     ) -> Result<&DiskRouting, GpuError> {
         let dr = self.routing.get().ok_or(MoeDiskRefusal::NoCache)?;
+        self.fill_pairs(exec, cache, layer, n_active, wave, |sc| {
+            let Scratch {
+                ids,
+                n_waves,
+                slots,
+                routing,
+                pairs,
+                tokens,
+                ..
+            } = sc;
+            if *n_waves == 1 {
+                return dr.upload(exec, slots, None);
+            }
+            routing.clear();
+            routing.resize(ids.len(), MOE_CACHE_NONE);
+            for (&p, &s) in pairs.iter().zip(slots.iter()) {
+                routing[p as usize] = s;
+            }
+            dr.upload(exec, routing, Some((pairs, tokens)))
+        })?;
+        Ok(dr)
+    }
+
+    /// [`fill_wave`] for the sorted pair: uploads the wave's `pd_moe_align`
+    /// layout (see [`sorted_layout`]) into `srow`, `sslot` and `bexp`, and
+    /// returns its block count.
+    ///
+    /// [`fill_wave`]: MoeDiskBacking::fill_wave
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn fill_wave_sorted(
+        &self,
+        exec: &GpuExecutor,
+        cache: &ExpertCache,
+        layer: usize,
+        n_active: usize,
+        wave: usize,
+        srow: &CudaSlice<u32>,
+        sslot: &CudaSlice<u32>,
+        bexp: &CudaSlice<u32>,
+    ) -> Result<usize, GpuError> {
+        let dr = self.routing.get().ok_or(MoeDiskRefusal::NoCache)?;
+        let mut blocks = 0;
+        self.fill_pairs(exec, cache, layer, n_active, wave, |sc| {
+            blocks = sorted_layout(
+                &sc.pairs,
+                &sc.slots,
+                n_active,
+                cache.slots,
+                &mut sc.srow,
+                &mut sc.sslot,
+                &mut sc.bexp,
+            );
+            dr.upload_to(
+                exec,
+                &[(srow, &sc.srow), (sslot, &sc.sslot), (bexp, &sc.bexp)],
+            )
+        })?;
+        Ok(blocks)
+    }
+
+    /// Fill the experts of wave `wave` (from the last `plan`) of `layer`
+    /// into `cache`: `pairs` gets the wave's pairs in order (every pair when
+    /// the launch has one wave), `slots` their slots and `tokens` the tokens
+    /// holding one; then `upload` sends what the kernels take.
+    fn fill_pairs(
+        &self,
+        exec: &GpuExecutor,
+        cache: &ExpertCache,
+        layer: usize,
+        n_active: usize,
+        wave: usize,
+        upload: impl FnOnce(&mut Scratch) -> Result<(), GpuError>,
+    ) -> Result<(), GpuError> {
         let mut state = lock(&self.state);
         let Some(Seat::Seated(x)) = &mut *state else {
             return Err(MoeDiskRefusal::NoCache.into());
@@ -1216,24 +1353,15 @@ impl MoeDiskBacking {
                 sc.n_waves
             )));
         }
-        let mut dev = CacheCopier { exec, cache };
         let Scratch {
             ids,
             wave_of,
-            n_waves,
             rows,
             slots,
-            routing,
             pairs,
             tokens,
+            ..
         } = &mut *sc;
-        if *n_waves == 1 {
-            slots.clear();
-            slots.resize(ids.len(), MOE_CACHE_NONE);
-            x.fill(layer, ids, slots, &mut dev)?;
-            dr.upload(exec, slots, None)?;
-            return Ok(dr);
-        }
         let w = wave as u32;
         pairs.clear();
         rows.clear();
@@ -1250,14 +1378,8 @@ impl MoeDiskBacking {
         }
         slots.clear();
         slots.resize(rows.len(), MOE_CACHE_NONE);
-        x.fill(layer, rows, slots, &mut dev)?;
-        routing.clear();
-        routing.resize(ids.len(), MOE_CACHE_NONE);
-        for (&p, &s) in pairs.iter().zip(slots.iter()) {
-            routing[p as usize] = s;
-        }
-        dr.upload(exec, routing, Some((pairs, tokens)))?;
-        Ok(dr)
+        x.fill(layer, rows, slots, &mut CacheCopier { exec, cache })?;
+        upload(&mut sc)
     }
 }
 
@@ -1276,6 +1398,10 @@ struct Scratch {
     routing: Vec<u32>,
     pairs: Vec<u32>,
     tokens: Vec<u32>,
+    /// The wave's sorted layout (`sorted_layout`).
+    srow: Vec<u32>,
+    sslot: Vec<u32>,
+    bexp: Vec<u32>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
