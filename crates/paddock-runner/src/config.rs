@@ -170,7 +170,8 @@ pub struct Config {
     /// The prefill chunk (rows) qwen35's serving lane asks for; it still
     /// steps down when the chunk's scratch does not fit. Smaller prefills
     /// slower but leaves VRAM for KV and the `[moe_offload]` slot cache (an
-    /// 8 GB card serving a 35B with offload: 1024). None = 8192.
+    /// 8 GB card serving a 35B with offload: 1024). 512-16384; None = 8192.
+    /// qwen35 only.
     pub prefill_chunk_rows: Option<usize>,
     /// Default max output tokens per reply when a request doesn't specify.
     /// None = the context window (what an omitted cap means on every other
@@ -948,6 +949,14 @@ mod tests {
         let cfg = Config::default();
         assert!(cfg.host.is_unspecified(), "default must serve the network");
     }
+    #[test]
+    fn prefill_chunk_rows_parses_and_defaults_to_none() {
+        let c: Config = toml::from_str("").expect("parse");
+        assert!(c.prefill_chunk_rows.is_none());
+        let c: Config = toml::from_str("prefill_chunk_rows = 1024").expect("parse");
+        assert_eq!(c.prefill_chunk_rows, Some(1024));
+    }
+
     #[test]
     fn graph_scratch_mib_parses_and_defaults_to_none() {
         // absent -> None (each family's engine default stands)

@@ -375,7 +375,18 @@ pub async fn run(
         );
     }
     if let Some(rows) = cfg.prefill_chunk_rows {
+        if !(512..=16384).contains(&rows) {
+            return Err(format!(
+                "prefill_chunk_rows = {rows} is outside 512-16384 (qwen35's serving lane steps \
+                 the chunk down from it, never below 512)"
+            )
+            .into());
+        }
         paddock_engine::kv_plan::set_prefill_chunk_rows(rows);
+        tracing::info!(
+            prefill_chunk_rows = rows,
+            "qwen35 prefill chunk set by the config"
+        );
     }
     if let Some(mib) = cfg.graph_scratch_mib {
         paddock_engine::kv_plan::set_graph_scratch_mib(mib);
