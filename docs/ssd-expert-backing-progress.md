@@ -4,6 +4,29 @@ Host: i9-10900K, 32 GiB RAM, RTX 3070 8 GiB (46 SMs, sm_86, PCIe 3.0 x16), Kings
 Model: Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf. Pack: paddock-cuda-sm86-0.1.21 (nix store). Branch: asus/ssd-expert-backing.
 Run helper: ~/paddock-runs/w/run.sh (systemd-run MemoryMax cap, swap off, nvidia-smi every 200 ms); logs in ~/paddock-runs/w/logs.
 
+## HTTP serving on asus (queue item 6, nixos-config#508)
+
+Config only, no dev variables (`~/paddock-runs/w/serve/paddock.toml`; started by `w/serve/start.sh` under `systemd-run --user -p MemoryMax=8G -p MemorySwapMax=0`):
+
+```toml
+host = "127.0.0.1"
+port = 11540
+model = "/home/lukas/paddock-runs/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"
+max_ctx = 4096
+max_batch = 1
+
+[moe_offload]
+enabled = true
+disk_artifact = "/home/lukas/paddock-runs/paddock-ssd-art/qwen36-35b-a3b-ud-q4kxl.pdxa"
+# host_cache_gb = 4   # optional pinned tier of hot experts
+```
+
+Startup log: `disk-backed slot cache seated slots=24`, then `serving SERIAL by design - disk-backed MoE experts ([moe_offload] disk_artifact) serve one sequence on the eager serial loop`. With max_ctx 8192 the start refused cleanly: the 8192-row prefill scratch is 3.96 GB and `the budget buys 0` slots (needs 8). `max_batch > 1` keeps the startup refusal "batched serving (enable_batch) is not supported with them yet - serve this model with pinned backing for it".
+
+Requests (`w/serve/stream.py`, streaming, temperature 0, thinking off via `chat_template_kwargs`):
+- Chat, "In two sentences, explain why the sky is blue.": "Sunlight reaches Earth's atmosphere and is scattered in all directions by all the gases and particles in the air. Blue light is scattered more than other colors because it travels as shorter, smaller waves, which is why we see a blue sky most of the time." 23 prompt tokens, 53 out, TTFT 2.29 s, decode 8.54 tok/s. (With thinking on, the same prompt gives a correct Rayleigh-scattering reasoning trace.)
+- Tool call, one function `get_weather(city, unit?)`, "What is the weather in Stockholm right now? Use the tool.": `finish_reason=tool_calls`, `get_weather {"city":"Stockholm"}` (streamed and non-streamed, id `call_...`), 302 prompt tokens, TTFT 11.97 s, decode 7.38 tok/s. A cold prefill of a few hundred tokens touches most of each layer's experts, so it reads a large part of the artifact (1.3 GB/s device).
+
 ## Current state (head of asus/ssd-expert-backing), against the PR 2 checklist
 
 Each line points at the run below that proves it; logs are in `~/paddock-runs/w/logs` on asus.
