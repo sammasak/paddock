@@ -178,6 +178,17 @@ Pinned on the same harness in its default class (R22, 28G cap, graphs): TTFT 13.
 
 So disk-backed prefill now runs at the pinned speed (warm within 0.1 s, cold +1.2 s) under an 8 GiB cap, bit for bit equal; decode is 3.5x slower (read bound). The earlier pinned baseline (R8, 149 s TTFT) ran the token-batched class the old harness forced.
 
+### Full R7 at 2bc49a9 (5 processes x 1 cold + 4 warm, 4000-token prompt, 64 decode tokens, 32 slots, swap off)
+
+| cap | cold TTFT (n=5) | warm TTFT (n=20) | decode cold run (n=5) | decode warm (n=20) | prefill read |
+|---|---|---|---|---|---|
+| 8G | median 14.40 s (14.33-22.48) | median 13.26 s (12.92-21.21) | 9.50 tok/s (9.45-9.63) | 9.72 tok/s (9.58-9.90) | median 1420 MiB/s (766-1471) |
+| 2G | median 14.35 s (14.31-22.50) | median 14.12 s (13.97-22.53) | 5.43 tok/s (5.41-5.44) | 5.45 tok/s (3.24-5.48) | median 1304 MiB/s (765-1324) |
+
+All 10 processes: one-token, text and synthetic prompts bit for bit equal to pinned, the five-token prompt (LIST waves) teacher-forced 32/32, exit 0. RssAnon 287 MB, VmHWM 3.05 GiB (mmapped GGUF), no swap, no Xid/NVRM/oom in `journalctl -k`, NVMe peak 45.9 C. The maxima near 22 s are the intermittent slow-read runs (about 765 MiB/s). Review of the sorted waves (subagent): no critical finding; its re-seat capacity check and `sorted_layout` test are in the commit after 2bc49a9.
+
+Decode ceiling: about 90 slot misses a token at 32 slots (71.5% hit), about 2 MB each, so decode is bound by the device (1.3-1.4 GB/s) plus page cache; without speculative prefetch (out of scope per the RFC) only more host memory (page cache or the host tier) or more VRAM slots raise it. The sorted prefill now uses the `part` scratch, so reclaiming it for slots is no longer possible.
+
 ## Next
 
 1. Decide whether the host tier (e6f4d75 + af00dbb, +11-12% decode, off by default) belongs in the upstream stack or stays a fork experiment; it is the top of the stack and can be dropped as one unit.
