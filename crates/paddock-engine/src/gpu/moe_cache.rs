@@ -585,6 +585,8 @@ pub(super) struct CacheCopier<'a> {
 }
 
 impl super::moe_disk::SlotCopier for CacheCopier<'_> {
+    type Mark = cudarc::driver::CudaEvent;
+
     unsafe fn enqueue(&mut self, stream: usize, slot: u32, src: &[u8]) -> Result<(), GpuError> {
         let c = self.cache;
         if stream >= 6 || slot as usize >= c.slots || src.len() as u64 != c.bytes[stream] {
@@ -596,16 +598,18 @@ impl super::moe_disk::SlotCopier for CacheCopier<'_> {
         }
         let dst = c.dst[stream] + slot as u64 * c.bytes[stream];
         // SAFETY: `dst..dst + len` lies inside the slot plane (checked
-        // above); the caller keeps `src` alive and unmodified until `wait`.
+        // above); the caller keeps `src` alive and unmodified until a wait on
+        // a later mark.
         unsafe { cudarc::driver::result::memcpy_htod_async(dst, src, self.exec.stream.cu_stream()) }
             .map_err(super::error::from_driver)
     }
 
-    fn wait(&mut self) -> Result<(), GpuError> {
-        self.exec
-            .stream
-            .synchronize()
-            .map_err(super::error::from_driver)
+    fn mark(&mut self) -> Result<Self::Mark, GpuError> {
+        self.exec.record_event()
+    }
+
+    fn wait(&mut self, mark: &Self::Mark) -> Result<(), GpuError> {
+        mark.synchronize().map_err(super::error::from_driver)
     }
 }
 

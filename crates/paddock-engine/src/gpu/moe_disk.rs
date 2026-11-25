@@ -21,9 +21,13 @@
 //! returns. A failed wait breaks the backing for good: the device may still
 //! be reading the staging buffers, so they are never handed out again.
 //!
-//! The device is behind [`SlotCopier`] (enqueue a host-to-slot copy, wait for
-//! every enqueued copy); the tests drive it with a recording fake.
+//! The device is behind [`SlotCopier`] (enqueue a host-to-slot copy, mark the
+//! copies so far, wait for a mark); the tests drive it with a recording
+//! fake. A fill waits only for the copies whose staging buffers it needs,
+//! and the routing goes up from pinned memory, so a wave's disk reads
+//! overlap the kernels of the waves before it.
 
+use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -39,12 +43,6 @@ use super::moe_cache::{
 };
 use super::{GpuError, GpuExecutor};
 
-/// Staging buffers a disk backing pins: one expert record each, so this
-/// bounds the host memory the miss path holds (about 2 MB a record on the
-/// 35B-A3B UD file) and the reads in flight before a fill waits.
-/// PADDOCK_MOE_DISK_STAGING overrides it (development instrument).
-const STAGING_RECORDS: usize = 8;
-
 /// Threads a fill reads its misses on. PADDOCK_MOE_DISK_READERS overrides
 /// it (development instrument).
 const READERS: usize = 4;
@@ -59,19 +57,27 @@ fn dev_count(v: Result<String, std::env::VarError>, default: usize) -> usize {
 /// The device half of a fill: copies from host staging memory into one
 /// layer's slot planes, on the stream the expert kernels run on.
 pub(super) trait SlotCopier {
+    /// A point in the copy order (a CUDA event on the device).
+    type Mark;
+
     /// Enqueue a copy of `src` into stream `stream` (fill-descriptor order:
     /// gate data, gate scales, up data, up scales, down data, down scales)
     /// of `slot`.
     ///
     /// # Safety
-    /// `src` must stay allocated and unmodified until the next [`wait`]
-    /// returns `Ok`; the copy may still be reading it until then.
+    /// `src` must stay allocated and unmodified until a [`wait`] on a
+    /// [`mark`] taken after this call returns `Ok`; the copy may still be
+    /// reading it until then.
     ///
     /// [`wait`]: SlotCopier::wait
+    /// [`mark`]: SlotCopier::mark
     unsafe fn enqueue(&mut self, stream: usize, slot: u32, src: &[u8]) -> Result<(), GpuError>;
 
-    /// Block until every enqueued copy has completed.
-    fn wait(&mut self) -> Result<(), GpuError>;
+    /// Mark every copy enqueued so far.
+    fn mark(&mut self) -> Result<Self::Mark, GpuError>;
+
+    /// Block until every copy enqueued before `mark` has completed.
+    fn wait(&mut self, mark: &Self::Mark) -> Result<(), GpuError>;
 }
 
 /// Counters for the disk backing since load, summed over layers.
@@ -208,13 +214,15 @@ pub(super) fn plan_waves(
 }
 
 /// The disk backing of one model: the artifact, the staging pool every layer
-/// shares (layers run one at a time), and each MoE layer's slot LRU.
-pub(super) struct DiskExperts<B> {
+/// shares (layers run one at a time), and each MoE layer's slot LRU. `M` is
+/// the device's copy mark.
+pub(super) struct DiskExperts<B, M> {
     store: DiskExpertStore,
     pool: StagingPool<B>,
     lru: Vec<SlotLru>,
-    /// Leases whose copies were enqueued and not yet waited for.
-    in_flight: Vec<StagingLease>,
+    /// Leases whose copies were enqueued and not yet waited for, oldest
+    /// first, each batch behind the mark taken after its copies.
+    in_flight: VecDeque<(M, Vec<StagingLease>)>,
     jobs: Vec<MissJob>,
     /// Threads a fill reads its misses on.
     readers: usize,
@@ -222,7 +230,7 @@ pub(super) struct DiskExperts<B> {
     stats: MoeDiskStats,
 }
 
-impl<B: AsRef<[u8]> + AsMut<[u8]>> DiskExperts<B> {
+impl<B: AsRef<[u8]> + AsMut<[u8]>, M> DiskExperts<B, M> {
     /// `slots` per layer over every layer of `store`. The pool's buffers must
     /// each hold one record of the largest layer.
     pub(super) fn new(
@@ -250,7 +258,7 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>> DiskExperts<B> {
             store,
             pool,
             lru,
-            in_flight: Vec::new(),
+            in_flight: VecDeque::new(),
             jobs: Vec::new(),
             readers,
             broken: false,
@@ -277,7 +285,7 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>> DiskExperts<B> {
         layer: usize,
         rows: &[u32],
         slot_rows: &mut [u32],
-        dev: &mut impl SlotCopier,
+        dev: &mut impl SlotCopier<Mark = M>,
     ) -> Result<(), GpuError> {
         if self.broken {
             return Err(broken());
@@ -310,9 +318,6 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>> DiskExperts<B> {
                 lru.expert_in.len()
             )));
         }
-        // the previous fill's copies are done by now in practice (the caller
-        // synced to read this launch's routing); waiting makes it certain
-        self.drain(dev)?;
         let mut jobs = std::mem::take(&mut self.jobs);
         jobs.clear();
         self.lru[layer].resolve(rows, slot_rows, &mut jobs);
@@ -329,7 +334,7 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>> DiskExperts<B> {
         &mut self,
         layer: usize,
         jobs: &[MissJob],
-        dev: &mut impl SlotCopier,
+        dev: &mut impl SlotCopier<Mark = M>,
     ) -> Result<(), GpuError> {
         let len = self
             .store
@@ -343,12 +348,19 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>> DiskExperts<B> {
         let mut todo = jobs;
         let mut leases = Vec::new();
         while !todo.is_empty() {
-            // as many misses as there are free buffers, read side by side
+            // as many misses as there are free buffers, read side by side;
+            // with none free, wait for the oldest batch's copies only, so the
+            // reads overlap whatever the stream still runs
             if self.pool.available() == 0 {
                 self.stats.staging_waits += 1;
-                self.drain(dev)?;
+                self.drain_oldest(dev)?;
             }
             let n = todo.len().min(self.pool.available());
+            if n == 0 {
+                return Err(GpuError::Driver(
+                    "expert disk backing: no staging buffer is free or in flight".into(),
+                ));
+            }
             let (batch, rest) = todo.split_at(n);
             todo = rest;
             leases.clear();
@@ -370,26 +382,41 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>> DiskExperts<B> {
             self.stats.misses += n as u64;
             self.stats.bytes_read += (n * len) as u64;
             let mut held = leases.drain(..);
-            for j in batch {
+            let mut sent = Vec::with_capacity(n);
+            let mut failed = None;
+            'batch: for j in batch {
                 let lease = held.next().expect("one lease a miss");
                 let buf = self.pool.buf(&lease);
                 let mut off = 0;
                 for (k, &n) in streams.iter().enumerate() {
-                    // SAFETY: the lease joins `in_flight` below, or on error
-                    // is held until a wait; a buffer is released only by
-                    // `drain`, after `wait` returned Ok.
+                    // SAFETY: the lease joins `in_flight` behind a mark taken
+                    // below, or is stranded with the backing broken; a buffer
+                    // is released only after a wait on its mark returned Ok.
                     let r = unsafe { dev.enqueue(k, j.slot, &buf[off..off + n]) };
                     if let Err(e) = r {
-                        self.in_flight.push(lease);
-                        // nothing was enqueued from the batch's later buffers
-                        for l in held {
-                            self.pool.release(l);
-                        }
-                        return Err(e);
+                        sent.push(lease);
+                        failed = Some(e);
+                        break 'batch;
                     }
                     off += n;
                 }
-                self.in_flight.push(lease);
+                sent.push(lease);
+            }
+            // nothing was enqueued from the batch's later buffers
+            for l in held {
+                self.pool.release(l);
+            }
+            match dev.mark() {
+                Ok(m) => self.in_flight.push_back((m, sent)),
+                Err(e) => {
+                    // copies the device may still run, with no way to wait
+                    // for them: strand their buffers
+                    self.broken = true;
+                    return Err(failed.unwrap_or(e));
+                }
+            }
+            if let Some(e) = failed {
+                return Err(e);
             }
         }
         Ok(())
@@ -398,7 +425,7 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>> DiskExperts<B> {
     /// Wait for the copies of earlier fills. A failed wait breaks the backing
     /// here rather than in whatever sync the caller would otherwise hit
     /// first.
-    pub(super) fn settle(&mut self, dev: &mut impl SlotCopier) -> Result<(), GpuError> {
+    pub(super) fn settle(&mut self, dev: &mut impl SlotCopier<Mark = M>) -> Result<(), GpuError> {
         if self.broken {
             return Err(broken());
         }
@@ -406,19 +433,40 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>> DiskExperts<B> {
     }
 
     /// Wait for every enqueued copy and release its staging buffer.
-    fn drain(&mut self, dev: &mut impl SlotCopier) -> Result<(), GpuError> {
-        if self.in_flight.is_empty() {
+    fn drain(&mut self, dev: &mut impl SlotCopier<Mark = M>) -> Result<(), GpuError> {
+        let Some((last, _)) = self.in_flight.back() else {
             return Ok(());
-        }
+        };
         let t0 = Instant::now();
-        let r = dev.wait();
+        let r = dev.wait(last);
         self.stats.wait_time += t0.elapsed();
         if let Err(e) = r {
             // the device may still read these buffers: never reuse them
             self.broken = true;
             return Err(e);
         }
-        for l in self.in_flight.drain(..) {
+        for (_, leases) in self.in_flight.drain(..) {
+            for l in leases {
+                self.pool.release(l);
+            }
+        }
+        Ok(())
+    }
+
+    /// Wait for the oldest batch's copies and release its staging buffers.
+    fn drain_oldest(&mut self, dev: &mut impl SlotCopier<Mark = M>) -> Result<(), GpuError> {
+        let Some((mark, _)) = self.in_flight.front() else {
+            return Ok(());
+        };
+        let t0 = Instant::now();
+        let r = dev.wait(mark);
+        self.stats.wait_time += t0.elapsed();
+        if let Err(e) = r {
+            self.broken = true;
+            return Err(e);
+        }
+        let (_, leases) = self.in_flight.pop_front().expect("front checked above");
+        for l in leases {
             self.pool.release(l);
         }
         Ok(())
@@ -673,53 +721,114 @@ pub(crate) struct DiskRouting {
     pub(crate) n_pairs: CudaSlice<u32>,
     pub(crate) tokens: CudaSlice<u32>,
     pub(crate) n_tokens: CudaSlice<u32>,
+    /// Pinned sources for the uploads, so they never sync the stream.
+    host: Mutex<HostRouting>,
+}
+
+/// Two pinned upload buffers, used in turn: one is written while the
+/// other's copies may still be pending. Each holds every routing word of
+/// one upload.
+struct HostRouting {
+    bufs: [PinnedBuf; 2],
+    /// Recorded after the copies out of each buffer.
+    done: [Option<cudarc::driver::CudaEvent>; 2],
+    next: usize,
 }
 
 impl DiskRouting {
     fn new(exec: &GpuExecutor, max_rows: usize, max_tokens: usize) -> Result<Self, GpuError> {
+        let words = 2 * max_rows + max_tokens + 2;
+        let pinned = || {
+            PinnedBuf::new(exec.stream.clone(), 4 * words)
+                .map_err(|e| GpuError::Driver(format!("expert routing: {e}")))
+        };
         Ok(Self {
             slots: exec.to_device_u32(&vec![MOE_CACHE_NONE; max_rows])?,
             pairs: exec.to_device_u32(&vec![0; max_rows])?,
             n_pairs: exec.to_device_u32(&[0])?,
             tokens: exec.to_device_u32(&vec![0; max_tokens])?,
             n_tokens: exec.to_device_u32(&[0])?,
+            host: Mutex::new(HostRouting {
+                bufs: [pinned()?, pinned()?],
+                done: [None, None],
+                next: 0,
+            }),
         })
     }
 
-    /// Upload `slots`, and a wave's `pairs` and `tokens` with their counts.
+    /// Upload `slots`, and a wave's `pairs` and `tokens` with their counts,
+    /// in stream order.
     fn upload(
         &self,
         exec: &GpuExecutor,
         slots: &[u32],
         wave: Option<(&[u32], &[u32])>,
     ) -> Result<(), GpuError> {
-        htod(exec, &self.slots, slots)?;
-        if let Some((pairs, tokens)) = wave {
-            htod(exec, &self.pairs, pairs)?;
-            htod(exec, &self.tokens, tokens)?;
-            htod(exec, &self.n_pairs, &[pairs.len() as u32])?;
-            htod(exec, &self.n_tokens, &[tokens.len() as u32])?;
+        let mut h = lock(&self.host);
+        let i = h.next;
+        h.next ^= 1;
+        // the copies out of this buffer, two uploads back
+        if let Some(ev) = h.done[i].take() {
+            ev.synchronize().map_err(super::error::from_driver)?;
         }
-        Ok(())
+        let (pairs, tokens) = wave.unwrap_or((&[], &[]));
+        let counts = [pairs.len() as u32, tokens.len() as u32];
+        let mut parts: Vec<(&CudaSlice<u32>, &[u32])> = vec![(&self.slots, slots)];
+        if wave.is_some() {
+            parts.extend([
+                (&self.pairs, pairs),
+                (&self.tokens, tokens),
+                (&self.n_pairs, &counts[..1]),
+                (&self.n_tokens, &counts[1..]),
+            ]);
+        }
+        let HostRouting { bufs, done, .. } = &mut *h;
+        let buf = bufs[i].as_mut();
+        let mut at = 0;
+        let mut r = Ok(());
+        for (dst, src) in parts {
+            let n = 4 * src.len();
+            if src.len() > dst.len() || at + n > buf.len() {
+                r = Err(GpuError::Driver(format!(
+                    "expert disk backing: {} routing words over a {}-word buffer",
+                    src.len(),
+                    dst.len()
+                )));
+                break;
+            }
+            for (b, w) in buf[at..at + n].as_chunks_mut::<4>().0.iter_mut().zip(src) {
+                b.copy_from_slice(&w.to_ne_bytes());
+            }
+            let (p, _g) = dst.device_ptr(&exec.stream);
+            // SAFETY: `dst` holds at least `src.len()` u32s (checked above),
+            // and the copy is ordered on the stream after every kernel
+            // already reading it. Its pinned source is not written again
+            // until the event recorded below has completed.
+            r = unsafe {
+                cudarc::driver::result::memcpy_htod_async(
+                    p,
+                    &buf[at..at + n],
+                    exec.stream.cu_stream(),
+                )
+            }
+            .map_err(super::error::from_driver);
+            if r.is_err() {
+                break;
+            }
+            at += n;
+        }
+        match exec.record_event() {
+            Ok(ev) => done[i] = Some(ev),
+            // no event to wait on before the next write: wait now
+            Err(e) => {
+                exec.stream
+                    .synchronize()
+                    .map_err(super::error::from_driver)?;
+                r = r.and(Err(e));
+            }
+        }
+        r
     }
-}
-
-/// Copy `src` to the head of `dst` in stream order.
-fn htod(exec: &GpuExecutor, dst: &CudaSlice<u32>, src: &[u32]) -> Result<(), GpuError> {
-    if src.len() > dst.len() {
-        return Err(GpuError::Driver(format!(
-            "expert disk backing: {} routing words over a {}-word buffer",
-            src.len(),
-            dst.len()
-        )));
-    }
-    let (p, _g) = dst.device_ptr(&exec.stream);
-    // SAFETY: `dst` holds at least `src.len()` u32s (checked above), and the
-    // copy is ordered on the stream after every kernel already reading it.
-    // `src` is pageable memory, which the driver stages before returning, so
-    // the caller may reuse or free it at once.
-    unsafe { cudarc::driver::result::memcpy_htod_async(p, src, exec.stream.cu_stream()) }
-        .map_err(super::error::from_driver)
 }
 
 impl MoeDiskBacking {
@@ -797,17 +906,22 @@ impl MoeDiskBacking {
             .max()
             .expect("an artifact has at least one layer");
         let stream = exec.stream.clone();
-        let records = dev_count(
-            paddock_models::dev_var!("PADDOCK_MOE_DISK_STAGING"),
-            STAGING_RECORDS,
-        );
+        // Staging buffers, one expert record each (about 2 MB on the 35B-A3B
+        // UD file), bound the host memory the miss path pins. One wave's
+        // misses at most, so a wave's reads overlap the previous wave's
+        // kernels (cold TTFT at 4000 tokens and 32 slots: 8 buffers 26.6 s,
+        // 32 20.5 s, 64 20.2 s). PADDOCK_MOE_DISK_STAGING overrides it
+        // (development instrument).
+        let records = dev_count(paddock_models::dev_var!("PADDOCK_MOE_DISK_STAGING"), slots);
         let readers = dev_count(
             paddock_models::dev_var!("PADDOCK_MOE_DISK_READERS"),
             READERS,
         );
         let pool = StagingPool::new(records, len, |n| PinnedBuf::new(stream.clone(), n))
             .map_err(|e| GpuError::Driver(format!("expert staging: {e}")))?;
-        *state = Some(Seat::Seated(DiskExperts::new(store, pool, slots, readers)?));
+        *state = Some(Seat::Seated(Box::new(DiskExperts::new(
+            store, pool, slots, readers,
+        )?)));
         Ok(caches)
     }
 
@@ -957,7 +1071,7 @@ impl Drop for MoeDiskBacking {
 
 enum Seat {
     Open(DiskExpertStore),
-    Seated(DiskExperts<PinnedBuf>),
+    Seated(Box<DiskExperts<PinnedBuf, cudarc::driver::CudaEvent>>),
 }
 
 fn broken() -> GpuError {
@@ -1018,7 +1132,7 @@ mod tests {
         path
     }
 
-    fn experts(path: &Path, slots: usize, staging: usize) -> DiskExperts<Vec<u8>> {
+    fn experts(path: &Path, slots: usize, staging: usize) -> DiskExperts<Vec<u8>, usize> {
         let store = DiskExpertStore::open(path, &ID, &layouts()).expect("open");
         let len = (0..store.n_layers())
             .filter_map(|l| store.record_bytes(l))
@@ -1028,14 +1142,16 @@ mod tests {
         DiskExperts::new(store, pool, slots, 2).expect("experts")
     }
 
-    /// A device that applies each copy only at `wait`, reading the source
-    /// then - as a DMA would - so a staging buffer reused before the wait
-    /// lands the wrong bytes in a slot.
+    /// A device that applies each copy only at a `wait` on a later mark,
+    /// reading the source then - as a DMA would - so a staging buffer reused
+    /// before its wait lands the wrong bytes in a slot. A mark is the count
+    /// of copies enqueued before it.
     #[derive(Default)]
     struct FakeDevice {
         /// `[stream][slot]` contents.
         slots: Vec<Vec<Vec<u8>>>,
-        pending: Vec<(usize, u32, *const u8, usize)>,
+        /// `(copy number, stream, slot, source)` not yet applied.
+        pending: Vec<(usize, usize, u32, *const u8, usize)>,
         copies: usize,
         waits: usize,
         fail_enqueue_at: Option<usize>,
@@ -1050,6 +1166,11 @@ mod tests {
             }
         }
 
+        /// Apply every pending copy, as a stream sync would.
+        fn flush(&mut self) {
+            self.wait(&self.copies.clone()).expect("wait");
+        }
+
         /// The six streams of `slot`, concatenated.
         fn slot(&self, slot: u32) -> Vec<u8> {
             (0..6)
@@ -1059,23 +1180,35 @@ mod tests {
     }
 
     impl SlotCopier for FakeDevice {
+        type Mark = usize;
+
         unsafe fn enqueue(&mut self, stream: usize, slot: u32, src: &[u8]) -> Result<(), GpuError> {
             if self.fail_enqueue_at == Some(self.copies) {
                 return Err(GpuError::Driver("injected enqueue failure".into()));
             }
+            self.pending
+                .push((self.copies, stream, slot, src.as_ptr(), src.len()));
             self.copies += 1;
-            self.pending.push((stream, slot, src.as_ptr(), src.len()));
             Ok(())
         }
 
-        fn wait(&mut self) -> Result<(), GpuError> {
+        fn mark(&mut self) -> Result<usize, GpuError> {
+            Ok(self.copies)
+        }
+
+        fn wait(&mut self, mark: &usize) -> Result<(), GpuError> {
             self.waits += 1;
             if self.fail_wait {
                 return Err(GpuError::Driver("injected wait failure".into()));
             }
-            for (k, slot, p, n) in self.pending.drain(..) {
+            let (done, left) = std::mem::take(&mut self.pending)
+                .into_iter()
+                .partition(|c| c.0 < *mark);
+            self.pending = left;
+            let done: Vec<_> = done;
+            for (_, k, slot, p, n) in done {
                 // SAFETY: the SlotCopier contract keeps `p..p+n` alive and
-                // unmodified until this wait returns.
+                // unmodified until a wait on a later mark returns.
                 let src = unsafe { std::slice::from_raw_parts(p, n) };
                 self.slots[k][slot as usize] = src.to_vec();
             }
@@ -1086,14 +1219,14 @@ mod tests {
     /// Fill `rows` and check every row's slot holds its expert's record once
     /// the copies land.
     fn fill_and_check(
-        x: &mut DiskExperts<Vec<u8>>,
+        x: &mut DiskExperts<Vec<u8>, usize>,
         dev: &mut FakeDevice,
         layer: usize,
         rows: &[u32],
     ) -> Vec<u32> {
         let mut slot_rows = vec![MOE_CACHE_NONE; rows.len()];
         x.fill(layer, rows, &mut slot_rows, dev).expect("fill");
-        dev.wait().expect("wait");
+        dev.flush();
         let ls = layouts();
         for (&e, &s) in rows.iter().zip(&slot_rows) {
             assert_eq!(
@@ -1195,9 +1328,12 @@ mod tests {
         let mut dev = FakeDevice::new(6);
         fill_and_check(&mut x, &mut dev, 0, &[0, 1, 2, 3, 4]);
         assert_eq!(x.stats().staging_waits, 2);
-        // the fifth miss's lease waits for the next fill's drain
+        // the fifth miss's lease waits for a drain: a fill does not wait for
+        // earlier copies it does not need buffers from
         assert_eq!(x.pool.available(), 1);
         fill_and_check(&mut x, &mut dev, 0, &[4]);
+        assert_eq!(x.pool.available(), 1);
+        x.settle(&mut dev).expect("settle");
         assert_eq!(x.pool.available(), 2);
     }
 
@@ -1223,7 +1359,8 @@ mod tests {
         let misses = x.stats().misses;
         fill_and_check(&mut x, &mut dev, 0, &[1, 6]);
         assert_eq!(x.stats().misses, misses + 2);
-        assert_eq!(x.pool.available() + x.in_flight.len(), 4, "no lease lost");
+        let held: usize = x.in_flight.iter().map(|(_, l)| l.len()).sum();
+        assert_eq!(x.pool.available() + held, 4, "no lease lost");
     }
 
     #[test]
@@ -1289,15 +1426,15 @@ mod tests {
             .max()
             .expect("layers");
         assert!(
-            DiskExperts::new(store(), pool(big), 0, 1).is_err(),
+            DiskExperts::<_, usize>::new(store(), pool(big), 0, 1).is_err(),
             "no slots"
         );
         assert!(
-            DiskExperts::new(store(), pool(big), N_EXPERT + 1, 1).is_err(),
+            DiskExperts::<_, usize>::new(store(), pool(big), N_EXPERT + 1, 1).is_err(),
             "slots"
         );
         assert!(
-            DiskExperts::new(store(), pool(big - 1), 4, 1).is_err(),
+            DiskExperts::<_, usize>::new(store(), pool(big - 1), 4, 1).is_err(),
             "staging too small"
         );
     }
