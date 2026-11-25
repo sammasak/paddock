@@ -62,16 +62,17 @@ Keep a dedicated feature branch based on upstream main, separate from packaging 
 
 ## Implementation status
 
-Steps 1 to 4 exist for qwen35; nothing has run on a GPU yet.
+Steps 1 to 4 exist for qwen35. On an 8 GiB sm_86 card with the 35B-A3B UD file and 32 slots, the pinned path after the seam matched resident bit for bit and main's tokens and decode rate; disk-mode parity and measurements have not run yet.
 
 - `gpu/expert_store.rs`: the artifact (sealed header, per-record BLAKE3, exact positioned reads, exclusive temp-then-rename writer) and the fixed staging pool. CPU tests.
 - `gpu/moe_disk.rs`: the host miss path (the resolve kernel's LRU walk on the host, token ranges whose experts fit the slots, invalidation of every slot a failed fill assigned, a broken state after a failed wait) behind a two-call device seam; CPU tests drive it with a fake device that applies copies at wait time. The CUDA side (`CacheCopier`, `PinnedBuf`, routing upload, row views) is compile-checked only.
 - qwen35: `PADDOCK_MOE_DISK=<artifact>` seats layout-only experts, requires a slot cache of at least top-k slots, runs prefill and decode eagerly, launches each token range over its own rows, and refuses CUDA graph capture, batched serving (a startup config error), DFlash and MTP speculation. qwen4exp refuses the switch.
-- `tests/gpu_qwen36_moe_disk.rs`: writes the artifact and a pinned reference, then checks bit-exact parity (prefill logits and greedy tokens, token-batched class on both sides) and reports TTFT, decode, misses, read rate, staging waits, device reads and peak RSS, plus the same runs pinned.
+- The artifact is written straight from the GGUF, without loading the model: one layer's experts are repacked in VRAM at a time and copied down one expert record at a time, so host memory holds one record.
+- `tests/gpu_qwen36_moe_disk.rs`: writes the artifact, then a pinned reference, then checks bit-exact parity (prefill logits and greedy tokens, token-batched class on both sides) and reports TTFT, decode, misses, read rate, staging waits, device reads and peak RSS, plus the same runs pinned.
 
 Known gaps, in order of what blocks the 180B target:
 
-- The artifact is written from a pinned load, so it needs the experts to fit page-locked RAM once. A bounded per-expert repack writer is the next step for models that never fit.
+- The writer needs one layer's repacked experts (plus its raw upload) to fit in VRAM.
 - Only the single-sequence eager path serves; the runner's batched lane refuses at startup.
 - Prefill syncs the host once per token range and layer; reads are buffered and synchronous (no prefetch, no direct I/O) until measured.
 - The identity hashes the kernel pack version and each expert tensor's name, type, shape, length and first and last 64 KiB, not every byte.
