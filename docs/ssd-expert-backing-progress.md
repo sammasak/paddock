@@ -212,7 +212,7 @@ Decode ceiling: about 90 slot misses a token at 32 slots (71.5% hit), about 2 MB
 ## Open questions
 
 - Host tier: worth +11-12% decode for about 250 lines (with tests)? Owner's call for the upstream stack.
-- Intermittent slow reads (about 800 MiB/s instead of 1.4 GB/s for a whole prefill or decode, a few runs per half hour, in pairs about 10 minutes apart in R16): not thermal (NVMe peak 43.9 C); cause not established.
+- Intermittent slow reads (about 800 MiB/s instead of 1.4 GB/s for a whole prefill or decode, a few runs per half hour): the drive itself. A 12-minute fio soak on the artifact with nothing else running (`~/paddock-runs/w/fio-soak.sh`: 2 MiB random direct reads, 4 jobs, per-second log) averaged 1174 MiB/s, median second 1279 MiB/s, with 98 of 720 seconds under 1000 MiB/s: stretches of 13-14 s at about 530 MiB/s starting at t = 23, 89, 328, 423 and 531 s. NVMe peak 46.9 C, so not thermal; likely the DRAM-less A2000's firmware. Not a backing defect; it sets the spread of cold numbers on this host.
 
 - Upstream pack bug: K-split router arm returns error 2 under capture with no partials plane. Draft an issue for truespar/paddock (owner decision to file).
 - Why the 4000-token pinned capture does not hit it.
