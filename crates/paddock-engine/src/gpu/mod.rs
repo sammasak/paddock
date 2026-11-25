@@ -51,11 +51,23 @@ mod spec_ops;
 pub use attention::PfQ;
 pub use canvas::CanvasStatus;
 pub use hadamard::HadamardGdnHeads;
+// The disk expert backing; a MoE family seats it once its host-assisted
+// cache fill lands. Until then only its tests use it.
+#[allow(dead_code)]
+mod expert_store;
+mod moe_disk;
+pub(crate) use moe_cache::{ExpertLayerLayout, ExpertPlaneLayout};
+pub use moe_disk::MoeDiskStats;
+pub(crate) use moe_disk::{
+    DISK_CHUNK_ROWS, MoeDiskBacking, MoeDiskRefusal, RowsView, RowsViewMut, disk_slots,
+    expert_identity, write_expert_artifact,
+};
 mod host_plane;
 pub use host_plane::{HostMappedKq, HostMirror};
 mod moe_cache;
 pub use moe_cache::{
-    ExpertCache, MOE_CACHE_NONE, MoeOffloadCfg, moe_cache_slots_pin, moe_offload, set_moe_offload,
+    ExpertCache, MOE_CACHE_NONE, MoeOffloadCfg, moe_cache_slots_pin, moe_disk_artifact,
+    moe_offload, set_moe_offload,
 };
 mod kquant;
 mod kumo;

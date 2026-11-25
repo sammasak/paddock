@@ -1786,6 +1786,7 @@ impl GpuQwen35 {
         record: fn(&mut Self) -> Result<(), GpuModelError>,
         what: &'static str,
     ) -> Result<SendGraph, GpuModelError> {
+        self.refuse_on_disk("CUDA graph capture")?;
         let exec = self.exec.clone();
         exec.stream
             .synchronize()

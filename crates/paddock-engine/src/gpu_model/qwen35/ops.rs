@@ -1650,7 +1650,12 @@ pub(super) fn moe_ffn(
         && kq_sorted_ok
         && batch * dims.n_active >= sorted_min.max(kq_floor)
         && paddock_models::dev_var_os!("PADDOCK_NO_SORTED_QMOE").is_none();
-    if sorted {
+    if let Some((backing, layer)) = &w.disk {
+        moe_routed_disk(
+            exec, w, backing, *layer, dims, embd, batch, xq, xs, ssums, idx, topk_w, fused, fq, fs,
+            proj,
+        )?;
+    } else if sorted {
         // b2: fp4 W4A8 grouped MoE (mmq, BM=32) - routed-expert weights at ~half
         // the Q8_0 DRAM, the lever for this weight-bandwidth-bound MoE. Engages
         // only when planes are loaded (PADDOCK_QWEN35_MOE_FP4) and the batch is
@@ -3177,4 +3182,81 @@ pub(super) fn prefill_ffn_f8w(
         exec.f8_gemm_w8(&d8.0, 0, xq, xs, proj, d8.1, d8.2, r)?;
         Ok(false)
     }
+}
+
+/// The routed experts of a disk-backed layer (`PADDOCK_MOE_DISK`): the
+/// token-batched k-quant pair over the slot cache, once per token range
+/// whose experts fit the slots, each launched over just that range's rows.
+/// The pair computes every row on its own, so a range's rows are
+/// bit-identical to the same rows of one token-batched launch. Activation
+/// inputs and `proj` are viewed at the range's rows; the pair's scratch
+/// (`fused`, `fq`, `fs`, `ssums`) is reused from its head.
+#[allow(clippy::too_many_arguments)]
+fn moe_routed_disk(
+    exec: &GpuExecutor,
+    w: &MoeFfnWeights,
+    backing: &crate::gpu::MoeDiskBacking,
+    layer: usize,
+    dims: MoeDims,
+    embd: usize,
+    batch: usize,
+    xq: &CudaSlice<i8>,
+    xs: &CudaSlice<f32>,
+    ssums: &mut CudaSlice<f32>,
+    idx: &CudaSlice<u32>,
+    topk_w: &CudaSlice<f32>,
+    fused: &mut CudaSlice<f32>,
+    fq: &mut CudaSlice<i8>,
+    fs: &mut CudaSlice<f32>,
+    proj: &mut CudaSlice<f32>,
+) -> Result<(), GpuModelError> {
+    use crate::gpu::{RowsView, RowsViewMut};
+    let c = w.cache.as_ref().ok_or_else(|| {
+        GpuModelError::Unsupported(crate::gpu::MoeDiskRefusal::NoCache.to_string())
+    })?;
+    let na = dims.n_active;
+    let mut chunks = Vec::new();
+    backing.plan(exec, c, idx, batch * na, na, &mut chunks)?;
+    let (g, u, d) = (&c.gate, &c.up, &c.down);
+    let gu_sums = crate::gpu::kq_needs_sums(g.ty) || crate::gpu::kq_needs_sums(u.ty);
+    let d_sums = crate::gpu::kq_needs_sums(d.ty);
+    for tokens in chunks {
+        let (t0, nt) = (tokens.start, tokens.len());
+        backing.fill_chunk(exec, c, layer, na, tokens)?;
+        let routing = c.idx_slot();
+        let xq_r = RowsView::new(exec, xq, t0 * embd, nt * embd)?;
+        let xs_r = RowsView::new(exec, xs, t0 * embd / 32, nt * embd / 32)?;
+        let tw_r = RowsView::new(exec, topk_w, t0 * na, nt * na)?;
+        if gu_sums {
+            exec.q8_sums_strided(&xq_r, ssums, embd, nt)?;
+        }
+        exec.kquant_moe_gate_up(
+            g,
+            u,
+            routing,
+            &xq_r,
+            &xs_r,
+            gu_sums.then_some(&*ssums),
+            fused,
+            na,
+            nt,
+        )?;
+        exec.quantize_q8(fused, fq, fs, nt * na * dims.moe_ff)?;
+        if d_sums {
+            exec.q8_sums_strided(fq, ssums, dims.moe_ff, nt * na)?;
+        }
+        let mut out = RowsViewMut::new(exec, proj, t0 * embd, nt * embd)?;
+        exec.kquant_moe_down(
+            d,
+            routing,
+            &tw_r,
+            fq,
+            fs,
+            d_sums.then_some(&*ssums),
+            &mut out,
+            na,
+            nt,
+        )?;
+    }
+    Ok(())
 }

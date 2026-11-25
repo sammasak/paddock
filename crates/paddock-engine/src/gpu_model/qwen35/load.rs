@@ -1,7 +1,9 @@
 //! Qwen3.5/3.6 weight load, residency planes, VRAM sizing.
 
 use super::*;
-use crate::gpu::{DeviceTensor, GpuError, GpuExecutor, KvDtype, QuantW, RepackedMxfp4};
+use crate::gpu::{
+    DeviceTensor, ExpertLayerLayout, GpuError, GpuExecutor, KvDtype, QuantW, RepackedMxfp4,
+};
 use crate::gpu_model::gpt_oss::GpuModelError;
 use crate::gpu_model::prefix_cache::BLOCK_TOKENS;
 use paddock_kernels::reference::ops::YarnRope;
@@ -30,16 +32,31 @@ fn e4m3_to_f32(b: u8) -> f32 {
 /// (gpu/host_plane.rs) for the slot cache to serve. `None` when the tensor
 /// is not k-quant (the caller's Q8 path) or the pack lacks the k-quant MoE
 /// pair (PADDOCK_NO_MOE_KQ=1 restores the old load error for A/B).
+/// Under `PADDOCK_MOE_DISK` the seat is geometry only and anything that is
+/// not a servable k-quant plane is refused: the disk backing has no Q8 arm.
 fn kq_expert_seat(
     exec: &GpuExecutor,
     map: &MappedGguf,
     i: usize,
     name: &str,
 ) -> Result<Option<ExpW>, GpuError> {
+    let full = format!("blk.{i}.{name}");
+    let disk = crate::gpu::moe_disk_artifact().is_some();
     if paddock_models::dev_var_os!("PADDOCK_NO_MOE_KQ").is_some() || !exec.has_kquant_moe() {
+        if disk {
+            return Err(GpuError::Unsupported(
+                MoeDiskRefusal::Mode("serving MoE experts without the pack's k-quant pair")
+                    .to_string(),
+            ));
+        }
         return Ok(None);
     }
-    let full = format!("blk.{i}.{name}");
+    if disk {
+        return match exec.kq_expert_layout(map, &full)? {
+            Some(l) => Ok(Some(ExpW::KqDisk(l))),
+            None => Err(MoeDiskRefusal::Quant(map.tensor_bytes(&full)?.0.ggml_type).into()),
+        };
+    }
     Ok(if crate::gpu::moe_offload().enabled {
         exec.try_repack_kquant_host_mapped(map, &full)?
             .map(ExpW::KqHost)
@@ -327,7 +344,7 @@ impl GpuQwen35 {
         } else {
             0
         };
-        if host_bytes > 0 {
+        if host_bytes > 0 && crate::gpu::moe_disk_artifact().is_none() {
             tracing::info!(
                 host_gib = host_bytes as f64 / (1u64 << 30) as f64,
                 "qwen35 MoE expert offload: routed-expert planes will be host-mapped (PADDOCK_MOE_HOST)"
@@ -1024,6 +1041,7 @@ impl GpuQwen35 {
                     down_exps_fp4: None,
                     moe_zero_bias: None,
                     cache: None,
+                    disk: None,
                 })
             } else if let Some(nv) = (|| -> Option<Ffn> {
                 // Checkpoint-exact NVFP4 dense FFN (the qwen3.8
@@ -1931,7 +1949,9 @@ impl GpuQwen35 {
         // the W4A8 rungs (mmq's k-quant arm - dp4a + K-split mma), and the
         // nextn block's own weights go through the same per-tensor QuantW
         // dispatch below. MoE-FFN nextn blocks still need Q8 expert seats.
-        let spec_wanted = std::env::var_os("PADDOCK_NO_SPEC").is_none();
+        // disk-backed experts serve no speculative path (MoeDiskRefusal)
+        let spec_wanted = std::env::var_os("PADDOCK_NO_SPEC").is_none()
+            && crate::gpu::moe_disk_artifact().is_none();
         let mtp = if n_nextn > 0 && spec_wanted {
             assert_eq!(n_nextn, 1, "only a single nextn/MTP block is supported");
             let i = n_layers; // blk.<n_layers>.*
@@ -1987,6 +2007,7 @@ impl GpuQwen35 {
                         down_exps_fp4: None,
                         moe_zero_bias: None,
                         cache: None,
+                        disk: None,
                     })
                 } else {
                     Ffn::Dense {
@@ -2904,6 +2925,11 @@ impl GpuQwen35 {
         // -0.09%). A runner on a die that cannot store fp8 KV overrides this
         // back to f16 (serving.rs), and an explicit kv_cache_dtype wins.
         let kv_dtype = KvDtype::Fp8E4m3;
+        let mut layers = layers;
+        let moe_disk = match crate::gpu::moe_disk_artifact() {
+            Some(path) => Some(open_moe_disk(&exec, map, &path, &mut layers)?),
+            None => None,
+        };
         Ok(Self {
             exec,
             n_layers,
@@ -2947,6 +2973,7 @@ impl GpuQwen35 {
             kq_resident,
             kq_max_elems,
             mtp,
+            moe_disk,
             weights_bytes,
             content_id: (
                 crate::kv_tier::fingerprint::weights(map),
@@ -3175,4 +3202,40 @@ impl GpuQwen35 {
         }
         (mb, if live < live_pref { Some(live) } else { None })
     }
+}
+
+/// Open the disk artifact at `path` against the layers' `KqDisk` seats and
+/// hand every MoE layer the backing and its artifact index.
+fn open_moe_disk(
+    exec: &GpuExecutor,
+    map: &MappedGguf,
+    path: &std::path::Path,
+    layers: &mut [Qwen35Layer],
+) -> Result<Arc<MoeDiskBacking>, GpuModelError> {
+    let mut layouts = Vec::new();
+    for l in layers.iter() {
+        if let Ffn::Moe(m) = &l.ffn {
+            let (ExpW::KqDisk(g), ExpW::KqDisk(u), ExpW::KqDisk(d)) =
+                (&m.gate_exps, &m.up_exps, &m.down_exps)
+            else {
+                unreachable!("kq_expert_seat seats every expert on disk under PADDOCK_MOE_DISK");
+            };
+            layouts.push(ExpertLayerLayout::new([g.clone(), u.clone(), d.clone()])?);
+        }
+    }
+    let id = crate::gpu::expert_identity(map, &expert_tensor_names(map)?, exec.pack_version())?;
+    let backing = Arc::new(MoeDiskBacking::open(path, &id, layouts)?);
+    let mut next = 0;
+    for l in layers.iter_mut() {
+        if let Ffn::Moe(m) = &mut l.ffn {
+            m.disk = Some((backing.clone(), next));
+            next += 1;
+        }
+    }
+    tracing::info!(
+        artifact = %path.display(),
+        layers = next,
+        "qwen35 MoE expert offload: routed experts disk-backed (PADDOCK_MOE_DISK)"
+    );
+    Ok(backing)
 }

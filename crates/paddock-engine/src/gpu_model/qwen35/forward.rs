@@ -229,18 +229,24 @@ impl GpuQwen35 {
         // loop bound - which the kernel reads from `d_pos` on device, so the grid is
         // position-independent and one capture is valid at every position. Replaying
         // the graph collapses ~480 per-token kernel launches into a single submit.
-        if self.decode.as_ref().expect("decode").graph.is_none() {
-            self.capture_graph()?;
+        // Disk-backed experts sync the host mid-step (moe_routed_disk), which
+        // no graph can hold: the same launches run eagerly.
+        if self.moe_disk.is_some() {
+            self.record_step()?;
+        } else {
+            if self.decode.as_ref().expect("decode").graph.is_none() {
+                self.capture_graph()?;
+            }
+            self.decode
+                .as_ref()
+                .expect("decode")
+                .graph
+                .as_ref()
+                .expect("graph captured above")
+                .0
+                .launch()
+                .map_err(|e| GpuError::Driver(format!("graph launch: {e}")))?;
         }
-        self.decode
-            .as_ref()
-            .expect("decode")
-            .graph
-            .as_ref()
-            .expect("graph captured above")
-            .0
-            .launch()
-            .map_err(|e| GpuError::Driver(format!("graph launch: {e}")))?;
 
         let logits = exec.to_host(&self.scratch.as_ref().expect("scratch").d_logits)?;
         debug_assert_eq!(logits.len(), vocab);
@@ -258,6 +264,7 @@ impl GpuQwen35 {
     /// graph to run this first token. Invalidated (recaptured) after `reset` or any
     /// scratch reallocation, since those move the buffer addresses the graph baked in.
     fn capture_graph(&mut self) -> Result<(), GpuModelError> {
+        self.refuse_on_disk("CUDA graph capture")?;
         let exec = self.exec.clone();
         // Quiesce the stream so no in-flight work is folded into the capture.
         exec.stream
@@ -283,6 +290,7 @@ impl GpuQwen35 {
     /// `d_out[d_step++]`, and advances `d_pos`/`d_mrope`, so the host can replay it
     /// back-to-back with zero per-token round-trip.
     pub(super) fn capture_graph_gen(&mut self) -> Result<(), GpuModelError> {
+        self.refuse_on_disk("CUDA graph capture")?;
         let exec = self.exec.clone();
         exec.stream
             .synchronize()
@@ -400,7 +408,8 @@ impl GpuQwen35 {
         // llama replays one graph). PADDOCK_NO_PREFILL_GRAPH=1 pins eager; the
         // numerics-pinning A/B envs also force eager - a cached graph baked the
         // DEFAULT dispatch at record time and would silently ignore them.
-        let eager = paddock_models::dev_var_os!("PADDOCK_NO_PREFILL_GRAPH").is_some()
+        let eager = self.moe_disk.is_some()
+            || paddock_models::dev_var_os!("PADDOCK_NO_PREFILL_GRAPH").is_some()
             || paddock_models::dev_var_os!("PADDOCK_NO_CHUNKED_DN").is_some()
             || paddock_models::dev_var!("PADDOCK_PREFILL_ATTN").is_ok_and(|v| !v.is_empty());
         if eager {
@@ -434,6 +443,7 @@ impl GpuQwen35 {
     /// length (the launch grids bake in t_len). Same contract as
     /// `capture_graph`: the capture only records, the caller launches.
     fn capture_prefill_graph(&mut self, t_len: usize) -> Result<(), GpuModelError> {
+        self.refuse_on_disk("CUDA graph capture")?;
         let exec = self.exec.clone();
         exec.stream
             .synchronize()
@@ -2050,7 +2060,7 @@ impl GpuQwen35 {
                 .memcpy_htod(&[mp; 4], &mut ds.d_mrope)
                 .map_err(e)?;
         }
-        if self.decode.as_ref().expect("decode").graph_gen.is_none() {
+        if self.moe_disk.is_none() && self.decode.as_ref().expect("decode").graph_gen.is_none() {
             self.capture_graph_gen()?;
         }
 
@@ -2066,10 +2076,19 @@ impl GpuQwen35 {
                 exec.stream
                     .memcpy_htod(&[0u32], &mut ds.d_step)
                     .map_err(e)?; // reset ring
-                let g = ds.graph_gen.as_ref().expect("gen graph captured above");
+                if self.moe_disk.is_none() {
+                    let g = ds.graph_gen.as_ref().expect("gen graph captured above");
+                    for _ in 0..k {
+                        g.0.launch()
+                            .map_err(|x| GpuError::Driver(format!("gen launch: {x}")))?;
+                    }
+                }
+            }
+            // disk-backed experts: the graph's launches, eagerly
+            if self.moe_disk.is_some() {
                 for _ in 0..k {
-                    g.0.launch()
-                        .map_err(|x| GpuError::Driver(format!("gen launch: {x}")))?;
+                    self.record_step()?;
+                    self.record_advance()?;
                 }
             }
             let ids = exec.to_host_u32(&self.decode.as_ref().expect("decode").d_out)?;
@@ -2099,6 +2118,7 @@ impl GpuQwen35 {
         iters: usize,
     ) -> Result<f64, GpuModelError> {
         assert!(!prompt.is_empty(), "empty prompt");
+        self.refuse_on_disk("bench_decode_ms (CUDA graph replay)")?;
         self.reset();
         for &t in prompt {
             self.step(t)?; // prefill: captures the base graph + fills state

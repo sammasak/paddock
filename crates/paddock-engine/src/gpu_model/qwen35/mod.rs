@@ -19,8 +19,9 @@
 //! Split into gemma4-shaped submodules.
 
 use crate::gpu::{
-    DeviceTensor, ExpertCache, GpuExecutor, HostMappedKq, KvDtype, QuantTensor, QuantW, RepackedKQ,
-    RepackedMxfp4, RepackedQ8,
+    DeviceTensor, ExpertCache, ExpertPlaneLayout, GpuExecutor, HostMappedKq, KvDtype,
+    MoeDiskBacking, MoeDiskRefusal, MoeDiskStats, QuantTensor, QuantW, RepackedKQ, RepackedMxfp4,
+    RepackedQ8,
 };
 use crate::gpu_model::gpt_oss::GpuModelError;
 use crate::gpu_model::prefix_cache::BLOCK_TOKENS;
@@ -1288,6 +1289,9 @@ impl GpuQwen35 {
     /// slots seated; 0 when nothing is host-mapped or the budget buys too few
     /// to matter, in which case the experts keep serving zero-copy.
     pub fn enable_moe_cache(&mut self, budget: u64) -> Result<usize, GpuModelError> {
+        if let Some(b) = self.moe_disk.clone() {
+            return self.enable_moe_disk_cache(&b, budget);
+        }
         fn host_seats(m: &MoeFfnWeights) -> Option<(&HostMappedKq, &HostMappedKq, &HostMappedKq)> {
             match (&m.gate_exps, &m.up_exps, &m.down_exps) {
                 (ExpW::KqHost(g), ExpW::KqHost(u), ExpW::KqHost(d)) => Some((g, u, d)),
@@ -1344,6 +1348,93 @@ impl GpuQwen35 {
         Ok(seated)
     }
 
+    /// The disk backing's slot caches: same budget rule as the pinned one,
+    /// but there is no zero-copy fallback, so a budget that buys fewer slots
+    /// than a token routes to is a load error.
+    fn enable_moe_disk_cache(
+        &mut self,
+        b: &MoeDiskBacking,
+        budget: u64,
+    ) -> Result<usize, GpuModelError> {
+        let dims = self
+            .moe
+            .as_ref()
+            .ok_or_else(|| GpuModelError::Unsupported("disk backing on a dense model".into()))?;
+        let budget = crate::gpu::moe_offload()
+            .vram_bytes
+            .map_or(budget, |cap| budget.min(cap));
+        let slots = crate::gpu::disk_slots(
+            budget,
+            b.slot_price(),
+            crate::gpu::moe_cache_slots_pin(),
+            dims.n_active,
+            dims.n_expert,
+        )
+        .map_err(|r| GpuModelError::Unsupported(r.to_string()))?;
+        // prompts are served in ranges of at most DISK_CHUNK_ROWS rows
+        let mut caches = b
+            .seat(&self.exec, slots, crate::gpu::DISK_CHUNK_ROWS)?
+            .into_iter();
+        for l in &mut self.layers {
+            if let Ffn::Moe(m) = &mut l.ffn
+                && m.disk.is_some()
+            {
+                m.cache = Some(caches.next().expect("one cache per disk-backed layer"));
+            }
+        }
+        let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+        tracing::info!(
+            slots,
+            cache_gib = gib(slots as u64 * b.slot_price()),
+            budget_gib = gib(budget),
+            "qwen35 MoE expert offload: disk-backed slot cache seated (eager path, no graphs)"
+        );
+        Ok(slots)
+    }
+
+    /// Refuse `what` when the experts are disk-backed (see `MoeDiskRefusal`).
+    /// A config error, so serving startup fails with the reason instead of
+    /// falling back to a lane that cannot serve either.
+    pub(super) fn refuse_on_disk(&self, what: &'static str) -> Result<(), GpuModelError> {
+        match self.moe_disk {
+            Some(_) => Err(GpuModelError::Config(
+                MoeDiskRefusal::Mode(what).to_string(),
+            )),
+            None => Ok(()),
+        }
+    }
+
+    /// The disk backing's counters since load; `None` when pinned or resident.
+    pub fn moe_disk_stats(&self) -> Option<MoeDiskStats> {
+        self.moe_disk.as_ref().map(|b| b.stats())
+    }
+
+    /// Write the disk artifact for the routed experts of `map` to `path`,
+    /// without loading the model: one layer's experts are repacked in VRAM
+    /// at a time and written one expert at a time, so neither page-locked
+    /// nor ordinary host memory has to hold the experts. A
+    /// `PADDOCK_MOE_DISK` load of the same file then opens it.
+    pub fn write_expert_artifact(
+        exec: &GpuExecutor,
+        map: &paddock_models::mapped::MappedGguf,
+        path: &std::path::Path,
+    ) -> Result<(), GpuModelError> {
+        if !exec.has_kquant_moe() {
+            return Err(GpuModelError::Unsupported(
+                MoeDiskRefusal::Mode("serving MoE experts without the pack's k-quant pair")
+                    .to_string(),
+            ));
+        }
+        let names = expert_tensor_names(map)?;
+        if names.is_empty() {
+            return Err(GpuModelError::Unsupported(
+                "write_expert_artifact: the file has no routed experts".into(),
+            ));
+        }
+        crate::gpu::write_expert_artifact(exec, map, &names, path)?;
+        Ok(())
+    }
+
     /// True when any layer serves its experts through the offload slot cache.
     pub fn moe_cache_active(&self) -> bool {
         self.layers
@@ -1385,6 +1476,10 @@ impl GpuQwen35 {
     /// Cache counters summed over the layers: `(rows resolved, misses)` since
     /// load; `None` without a cache. Syncs the stream - for gates and logs.
     pub fn moe_cache_stats(&self) -> Result<Option<(u64, u64)>, GpuModelError> {
+        // the disk backing resolves on the host; the device counters stay 0
+        if let Some(s) = self.moe_disk_stats() {
+            return Ok(Some((s.rows, s.misses)));
+        }
         let mut acc: Option<(u64, u64)> = None;
         for l in &self.layers {
             if let Ffn::Moe(m) = &l.ffn
@@ -1406,13 +1501,16 @@ enum ExpW {
     /// k-quant plane in device-mapped host memory (`[moe_offload]`): the
     /// kernels read it over PCIe on the same addressing as `Kq`. No VRAM.
     KqHost(HostMappedKq),
+    /// k-quant plane in a disk artifact (`PADDOCK_MOE_DISK`): geometry only.
+    /// Nothing addresses it; the layer serves only through its slot cache.
+    KqDisk(ExpertPlaneLayout),
 }
 
 impl ExpW {
     fn q8(&self) -> Option<&RepackedQ8> {
         match self {
             ExpW::Q8(w) => Some(w),
-            ExpW::Kq(_) | ExpW::KqHost(_) => None,
+            ExpW::Kq(_) | ExpW::KqHost(_) | ExpW::KqDisk(_) => None,
         }
     }
     /// The k-quant plane whichever memory it lives in - every launch takes
@@ -1422,6 +1520,7 @@ impl ExpW {
             ExpW::Q8(_) => None,
             ExpW::Kq(w) => Some(w),
             ExpW::KqHost(w) => Some(w),
+            ExpW::KqDisk(_) => None,
         }
     }
 }
@@ -1459,6 +1558,30 @@ struct MoeFfnWeights {
     /// seated by `enable_moe_cache`; the token-batched class serves through
     /// it when the launch's rows fit its slots.
     cache: Option<ExpertCache>,
+    /// Disk backing (`PADDOCK_MOE_DISK`): the model's backing and this
+    /// layer's index in its artifact. Every launch then serves through
+    /// `cache`, chunked to its slots (ops.rs `moe_routed_disk`).
+    disk: Option<(Arc<MoeDiskBacking>, usize)>,
+}
+
+/// The routed-expert tensor names of the backbone's MoE layers, in artifact
+/// order - what the disk artifact's identity is taken over. A MoE file's
+/// backbone is MoE in every layer; the trailing nextn blocks are not part of
+/// it. Read from the file, so the writer and the loader name the same set.
+fn expert_tensor_names(
+    map: &paddock_models::mapped::MappedGguf,
+) -> Result<Vec<String>, GpuModelError> {
+    use paddock_models::gguf::Value;
+    let field = |k: &str| map.gguf().arch_field(k).and_then(Value::as_u64);
+    if field("expert_count").is_none() {
+        return Ok(Vec::new());
+    }
+    let blocks =
+        field("block_count").ok_or_else(|| GpuModelError::MissingMeta("block_count".into()))?;
+    let n_layers = blocks.saturating_sub(field("nextn_predict_layers").unwrap_or(0));
+    Ok((0..n_layers)
+        .flat_map(|i| ["gate", "up", "down"].map(|p| format!("blk.{i}.ffn_{p}_exps.weight")))
+        .collect())
 }
 
 /// Dense SwiGLU or routed-expert MoE - per-layer FFN. MoE expert weights stay
@@ -1715,6 +1838,9 @@ pub struct GpuQwen35 {
     /// speculative-decoding head. Loaded but not yet driven (P3c wiring).
     #[allow(dead_code)]
     mtp: Option<MtpWeights>,
+    /// `PADDOCK_MOE_DISK`: the disk backing every MoE layer's experts read
+    /// from. Serving is then the eager single-sequence path only.
+    moe_disk: Option<Arc<MoeDiskBacking>>,
     /// Resident weight bytes, sampled at the end of load (weights up - MTP
     /// included, since spec is on unless PADDOCK_NO_SPEC says otherwise - and
     /// no KV/DeltaNet state yet: those live in `batch`/`decode`). This is the
@@ -2542,8 +2668,8 @@ impl AuSum {
         match w {
             ExpW::Q8(x) => self.q8(x),
             ExpW::Kq(x) => self.kq(x),
-            // host-mapped: no VRAM, no device allocation to count
-            ExpW::KqHost(_) => {}
+            // host-mapped or on disk: no VRAM, no device allocation to count
+            ExpW::KqHost(_) | ExpW::KqDisk(_) => {}
         }
     }
     fn fp4(&mut self, w: &RepackedMxfp4) {

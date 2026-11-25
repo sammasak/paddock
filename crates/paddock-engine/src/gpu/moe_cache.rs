@@ -42,13 +42,25 @@ pub fn set_moe_offload(cfg: MoeOffloadCfg) {
 }
 
 /// The armed config; `PADDOCK_MOE_HOST=1` is the development switch that
-/// enables it without a config file (tests, bring-up).
+/// enables it without a config file (tests, bring-up), and
+/// `PADDOCK_MOE_DISK` (see [`moe_disk_artifact`]) implies it.
 pub fn moe_offload() -> MoeOffloadCfg {
     let mut c = MOE_OFFLOAD.get().copied().unwrap_or_default();
-    if paddock_models::dev_var_os!("PADDOCK_MOE_HOST").is_some() {
+    if paddock_models::dev_var_os!("PADDOCK_MOE_HOST").is_some() || moe_disk_artifact().is_some() {
         c.enabled = true;
     }
     c
+}
+
+/// `PADDOCK_MOE_DISK=<artifact>`: development switch for the disk backing -
+/// the routed experts are read on a miss from this artifact (`moe_disk.rs`)
+/// instead of being held in page-locked RAM. qwen35 serves it, qwen4exp
+/// refuses it at load, and families without `[moe_offload]` ignore it as
+/// they ignore `PADDOCK_MOE_HOST`.
+pub fn moe_disk_artifact() -> Option<std::path::PathBuf> {
+    paddock_models::dev_var_os!("PADDOCK_MOE_DISK")
+        .filter(|v| !v.is_empty())
+        .map(Into::into)
 }
 
 /// `PADDOCK_MOE_CACHE_SLOTS=<n>`: development pin for the per-layer slot
@@ -62,15 +74,16 @@ pub fn moe_cache_slots_pin() -> Option<usize> {
 
 /// Geometry of a repacked expert plane, independent of its backing address.
 /// Cache slots need this layout, not ownership of the original weight bytes.
-struct ExpertPlaneLayout {
-    dims: Vec<usize>,
-    ty: GgmlType,
-    data_per_expert: usize,
-    scales_per_expert: usize,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ExpertPlaneLayout {
+    pub(super) dims: Vec<usize>,
+    pub(super) ty: GgmlType,
+    pub(super) data_per_expert: usize,
+    pub(super) scales_per_expert: usize,
 }
 
 impl ExpertPlaneLayout {
-    fn new(
+    pub(super) fn new(
         dims: &[usize],
         ty: GgmlType,
         data_bytes: usize,
@@ -78,12 +91,16 @@ impl ExpertPlaneLayout {
     ) -> Result<Self, GpuError> {
         let n_expert = match dims {
             [_, _, n] if *n > 0 => *n,
-            _ => return Err(GpuError::Driver("expert cache: invalid plane geometry".into())),
+            _ => {
+                return Err(GpuError::Driver(
+                    "expert cache: invalid plane geometry".into(),
+                ));
+            }
         };
         if data_bytes == 0
             || scales_bytes == 0
-            || data_bytes % n_expert != 0
-            || scales_bytes % n_expert != 0
+            || !data_bytes.is_multiple_of(n_expert)
+            || !scales_bytes.is_multiple_of(n_expert)
         {
             return Err(GpuError::Driver(
                 "expert cache: plane bytes are not a whole number of experts".into(),
@@ -99,6 +116,53 @@ impl ExpertPlaneLayout {
 
     fn from_host(p: &HostMappedKq) -> Result<Self, GpuError> {
         Self::new(&p.dims, p.ty, p.data.len(), p.scales.len())
+    }
+}
+
+/// One MoE layer's gate/up/down plane geometry: what a slot holds and what
+/// every backing (pinned mirror or disk artifact) must agree on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ExpertLayerLayout {
+    pub(super) planes: [ExpertPlaneLayout; 3],
+}
+
+impl ExpertLayerLayout {
+    pub(crate) fn new(planes: [ExpertPlaneLayout; 3]) -> Result<Self, GpuError> {
+        let n_expert = planes[0].dims[2];
+        if planes[1].dims[2] != n_expert || planes[2].dims[2] != n_expert {
+            return Err(GpuError::Driver(format!(
+                "expert cache: gate {n_expert} experts, up {}, down {}",
+                planes[1].dims[2], planes[2].dims[2]
+            )));
+        }
+        Ok(Self { planes })
+    }
+
+    pub(super) fn from_pinned(
+        gate: &HostMappedKq,
+        up: &HostMappedKq,
+        down: &HostMappedKq,
+    ) -> Result<Self, GpuError> {
+        Self::new([
+            ExpertPlaneLayout::from_host(gate)?,
+            ExpertPlaneLayout::from_host(up)?,
+            ExpertPlaneLayout::from_host(down)?,
+        ])
+    }
+
+    pub(super) fn n_expert(&self) -> usize {
+        self.planes[0].dims[2]
+    }
+
+    /// Bytes per expert of the six streams, in fill-descriptor order: gate
+    /// data, gate scales, up data, up scales, down data, down scales.
+    pub(super) fn stream_bytes(&self) -> [usize; 6] {
+        let mut b = [0usize; 6];
+        for (i, p) in self.planes.iter().enumerate() {
+            b[2 * i] = p.data_per_expert;
+            b[2 * i + 1] = p.scales_per_expert;
+        }
+        b
     }
 }
 
@@ -142,7 +206,9 @@ pub struct ExpertCache {
     n_rows_w: CudaSlice<u32>,
     /// Fill descriptors: mirror sources, slot destinations, bytes per expert -
     /// gate data, gate scales, up data, up scales, down data, down scales.
-    src: [u64; 6],
+    /// No sources on a disk-backed cache: its misses arrive through
+    /// [`CacheCopier`], never the fill kernel.
+    src: Option<[u64; 6]>,
     dst: [u64; 6],
     bytes: [u64; 6],
 }
@@ -221,11 +287,7 @@ impl GpuExecutor {
         slots: usize,
         max_rows: usize,
     ) -> Result<ExpertCache, GpuError> {
-        let layouts = [
-            ExpertPlaneLayout::from_host(gate)?,
-            ExpertPlaneLayout::from_host(up)?,
-            ExpertPlaneLayout::from_host(down)?,
-        ];
+        let layout = ExpertLayerLayout::from_pinned(gate, up, down)?;
         let mut src = [0u64; 6];
         for (i, p) in [gate, up, down].into_iter().enumerate() {
             let (sp, _g1) = p.data.device_ptr(&self.stream);
@@ -233,33 +295,40 @@ impl GpuExecutor {
             src[2 * i] = sp;
             src[2 * i + 1] = ssp;
         }
-        self.new_expert_cache_from_layout(layouts, src, slots, max_rows)
+        self.new_expert_cache_from_layout(layout, Some(src), slots, max_rows)
+    }
+
+    /// A `slots`-expert cache whose misses the disk backing fills from the
+    /// host (`moe_disk.rs`): same slot planes, no device-side fill sources.
+    /// `max_rows` bounds the routing a launch uploads.
+    pub(super) fn new_expert_cache_for_disk(
+        &self,
+        layout: ExpertLayerLayout,
+        slots: usize,
+        max_rows: usize,
+    ) -> Result<ExpertCache, GpuError> {
+        self.new_expert_cache_from_layout(layout, None, slots, max_rows)
     }
 
     // Keep the existing pinned-host fill descriptors and kernel ABI intact.
     // The cache allocation itself depends only on geometry and slot count.
     fn new_expert_cache_from_layout(
         &self,
-        layouts: [ExpertPlaneLayout; 3],
-        src: [u64; 6],
+        layout: ExpertLayerLayout,
+        src: Option<[u64; 6]>,
         slots: usize,
         max_rows: usize,
     ) -> Result<ExpertCache, GpuError> {
-        let n_expert = layouts[0].dims[2];
-        if slots == 0
-            || slots > n_expert
-            || layouts[1].dims[2] != n_expert
-            || layouts[2].dims[2] != n_expert
-        {
+        let n_expert = layout.n_expert();
+        if slots == 0 || slots > n_expert {
             return Err(GpuError::Driver(format!(
-                "expert cache: {slots} slots over {n_expert} experts (up {}, down {})",
-                layouts[1].dims[2], layouts[2].dims[2]
+                "expert cache: {slots} slots over {n_expert} experts"
             )));
         }
         let mut dst = [0u64; 6];
         let mut bytes = [0u64; 6];
         let mut planes = Vec::with_capacity(3);
-        for (i, p) in layouts.into_iter().enumerate() {
+        for (i, p) in layout.planes.into_iter().enumerate() {
             let per_data = p.data_per_expert;
             let per_scales = p.scales_per_expert;
             let data = self.alloc_u8(per_data * slots)?;
@@ -486,6 +555,9 @@ impl GpuExecutor {
             .kernels
             .moe_cache_fill
             .ok_or(GpuError::MissingOp("moe_cache_fill"))?;
+        let src = c.src.as_ref().ok_or_else(|| {
+            GpuError::Driver("expert cache: a disk-backed cache has no device fill sources".into())
+        })?;
         let (jb, _g1) = c.jobs.device_ptr(&self.stream);
         let (nj, _g2) = c.n_jobs.device_ptr(&self.stream);
         // SAFETY: pack ABI v1 contract; src/dst/bytes are host arrays the
@@ -495,12 +567,65 @@ impl GpuExecutor {
                 jb as *const _,
                 nj as *const _,
                 rows as u32,
-                c.src.as_ptr() as *const _,
+                src.as_ptr() as *const _,
                 c.dst.as_ptr() as *const _,
                 c.bytes.as_ptr() as *const _,
                 self.stream_ptr(),
             )
         })
+    }
+}
+
+impl ExpertCache {
+    /// Upload one launch's slot routing (`rows` ids, `MOE_CACHE_NONE` for an
+    /// absent pair) into `idx_slot`, in stream order. From pageable memory
+    /// the driver stages `rows` before returning, so the caller may reuse it.
+    pub(super) fn upload_routing(&self, exec: &GpuExecutor, rows: &[u32]) -> Result<(), GpuError> {
+        if rows.len() > self.max_rows {
+            return Err(GpuError::Driver(format!(
+                "expert cache: {} routed rows over {} scratch rows",
+                rows.len(),
+                self.max_rows
+            )));
+        }
+        let (ip, _g) = self.idx_slot.device_ptr(&exec.stream);
+        // SAFETY: `idx_slot` holds max_rows >= rows.len() u32s, and the copy
+        // is ordered on the stream after every kernel already reading it.
+        unsafe { cudarc::driver::result::memcpy_htod_async(ip, rows, exec.stream.cu_stream()) }
+            .map_err(super::error::from_driver)
+    }
+}
+
+/// The disk backing's device half (`moe_disk::SlotCopier`) for one layer's
+/// cache: plain host-to-device copies into the slot planes on the engine
+/// stream, so the expert kernels launched after them see the bytes.
+pub(super) struct CacheCopier<'a> {
+    pub(super) exec: &'a GpuExecutor,
+    pub(super) cache: &'a ExpertCache,
+}
+
+impl super::moe_disk::SlotCopier for CacheCopier<'_> {
+    unsafe fn enqueue(&mut self, stream: usize, slot: u32, src: &[u8]) -> Result<(), GpuError> {
+        let c = self.cache;
+        if stream >= 6 || slot as usize >= c.slots || src.len() as u64 != c.bytes[stream] {
+            return Err(GpuError::Driver(format!(
+                "expert cache: copy of {} bytes into stream {stream} slot {slot} of {}",
+                src.len(),
+                c.slots
+            )));
+        }
+        let dst = c.dst[stream] + slot as u64 * c.bytes[stream];
+        // SAFETY: `dst..dst + len` lies inside the slot plane (checked
+        // above); the caller keeps `src` alive and unmodified until `wait`.
+        unsafe { cudarc::driver::result::memcpy_htod_async(dst, src, self.exec.stream.cu_stream()) }
+            .map_err(super::error::from_driver)
+    }
+
+    fn wait(&mut self) -> Result<(), GpuError> {
+        self.exec
+            .stream
+            .synchronize()
+            .map_err(super::error::from_driver)
     }
 }
 
@@ -510,7 +635,7 @@ mod layout_tests {
 
     #[test]
     fn expert_plane_layout_does_not_depend_on_a_device_pointer() {
-        let layout = ExpertPlaneLayout::new(&[256, 640, 8], GgmlType::Q4_K, 4096, 768)
+        let layout = ExpertPlaneLayout::new(&[256, 640, 8], GgmlType::Q4K, 4096, 768)
             .expect("valid expert plane");
         assert_eq!(layout.dims, vec![256, 640, 8]);
         assert_eq!(layout.data_per_expert, 512);
@@ -526,7 +651,22 @@ mod layout_tests {
             (&[256, 640, 8][..], 4096, 769),
             (&[256, 640, 8][..], 0, 768),
         ] {
-            assert!(ExpertPlaneLayout::new(dims, GgmlType::Q4_K, data, scales).is_err());
+            assert!(ExpertPlaneLayout::new(dims, GgmlType::Q4K, data, scales).is_err());
         }
+    }
+
+    #[test]
+    fn expert_layer_layout_orders_streams_like_the_fill_descriptors() {
+        let p = |rows, data, scales| {
+            ExpertPlaneLayout::new(&[256, rows, 8], GgmlType::Q4K, data, scales)
+                .expect("valid expert plane")
+        };
+        let l = ExpertLayerLayout::new([p(640, 4096, 768), p(640, 8192, 1536), p(320, 2048, 384)])
+            .expect("valid layer");
+        assert_eq!(l.n_expert(), 8);
+        assert_eq!(l.stream_bytes(), [512, 96, 1024, 192, 256, 48]);
+        let other = ExpertPlaneLayout::new(&[256, 640, 4], GgmlType::Q4K, 4096, 768)
+            .expect("valid expert plane");
+        assert!(ExpertLayerLayout::new([p(640, 4096, 768), other, p(320, 2048, 384)]).is_err());
     }
 }
