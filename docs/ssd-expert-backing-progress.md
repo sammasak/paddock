@@ -90,11 +90,34 @@ R5 baseline (fio, this morning): 2 MiB random direct reads 1325 MiB/s at QD1, 13
 
 No critical finding on the wave path. Fixed in 36c068e: the per-layer `max_ctx x top-k` routing scratch is now one shared `DiskRouting`; the LIST kernels are checked at seat; `DiskExperts::fill` returns an error instead of panicking when given more distinct experts than slots. Found outside this stack, upstream: qwen4exp `kq_moe_routed_waves` computes the input sums once before its wave loop, but the down sums overwrite `d_ssums` inside it, so waves after the first read down sums when both gate/up and down need them (forward.rs:5939 and 5965). The disk path recomputes them per wave. Not verified on a GPU.
 
+### Overlap and staging (cd590a3, ffdcc30)
+
+Each staging batch's copies are followed by a CUDA event; a fill waits only for the oldest batch when it needs a buffer, and routing goes up from two pinned buffers, so a wave's reads overlap the previous wave's kernels. Staging pool sweep (8G, 32 slots, 4 readers, run 0 cold / run 1 warm TTFT): 8 records 26.6 / 25.9 s, 32 records 20.5 / 20.2 s, 64 records 20.2 / 20.1 s, 128 records 20.1 / 20.1 s. Default is now one wave (the slot count, capped at 64 records; 32 records is about 61 MB pinned). Reviewed by a second code-reviewer subagent: staging path sound; its findings (a failed event wait dropped an upload buffer's guard, no test for two batches in flight or a failed mark, a panicked reader skipped invalidation, uncapped staging default) are fixed in ffdcc30.
+
+### Full R7 at 3fc49a8 (5 processes x 1 cold + 4 warm, 4000-token prompt, 64 decode tokens, 32 slots, swap off)
+
+Command: `~/paddock-runs/w/r7full.sh 3fc49a8 <cap>` (logs `~/paddock-runs/w/logs/R7full-3fc49a8-<cap>-p*.log`), summarized with `w/summ.py`.
+
+| cap | cold TTFT (n=5) | warm TTFT (n=20) | decode cold run (n=5) | decode warm (n=20) | prefill read |
+|---|---|---|---|---|---|
+| 8G | median 20.54 s (20.46-20.58) | median 20.31 s (20.24-28.36) | 9.53 tok/s (9.44-9.54) | 9.60 tok/s (9.51-9.68) | median 1415 MiB/s (803-1430) |
+| 2G | median 20.43 s (20.40-20.48) | median 20.43 s (20.36-20.52) | 5.61 tok/s (5.59-5.63) | 5.55 tok/s (3.30-5.60) | median 1309 MiB/s (1278-1333) |
+
+- Parity passed in all 10 processes (one-token bit exact; text and synthetic teacher-forced 32/32, free-running equal).
+- Bounded RAM: cgroup memory.peak equals the cap (page cache is charged); at 2G the process holds RssAnon 286 MB and RssFile 2.7 GB (mmapped GGUF, reclaimable) at the end, against a 19.25 GiB artifact. No swap (MemorySwapMax=0), no OOM kill, no Xid (`journalctl -k --since -2h` has no NVRM/Xid/oom lines).
+- GPU peak 7271 MiB of 8192.
+- Outliers: at 8G two warm runs (p1 and p2, run 1) took 27.9 and 28.4 s with reads at 818 and 803 MiB/s; one 2G warm decode at 3.30 tok/s. Cause not established (nothing else of mine ran then).
+- Against pinned on the same harness (R8: TTFT 149.1 s, decode 34.3 tok/s at 28G): disk prefill is 7x faster (pinned prefill reads experts zero-copy over PCIe per token), disk decode is 3.6x slower at 8G and 6x at 2G (read bound).
+- R4c (pinned path at 3fc49a8): tokens byte-equal to main in 10 of 10 runs; decode median 31.11 on both (main 31.08-31.13, branch 31.10-31.13); R3 bitwise true.
+
 ## Next
 
-1. Overlap a wave's reads with the previous wave's kernels: every fill starts with a full stream sync, and each pageable routing upload syncs the stream too. Warm-from-RAM TTFT is 21.5 s with only 5 s of reads, so most of the remaining time is serialized GPU work.
-2. Full R7 at the chosen config: 5 cold + 20 warm, memory.peak under a tight cap.
-3. Rerun R4 after any change near the pinned path.
+1. Refusal gate on the GPU (fewer slots than top-k, DFlash, graph replay, batched serving).
+2. 30-minute stability run, read-size check with fio, dev-shell check without LD_LIBRARY_PATH.
+3. Decode is read bound; options are more slots (VRAM) or a host tier beyond the page cache.
+4. Rerun R4 after any change near the pinned path.
+
+Consults: none of the designs so far came from a Fable consult (allowed since the brief addition; noted here when used).
 
 ## Open questions
 
@@ -102,3 +125,13 @@ No critical finding on the wave path. Fixed in 36c068e: the per-layer `max_ctx x
 - Why the 4000-token pinned capture does not hit it.
 - Bounded RAM criterion: cgroup memory.peak counts page cache, so with buffered reads it reaches any cap; 4G works (RSS 3.0 GiB). Direct I/O would make the bound exact but loses the page-cache tier that lifts decode from 6.5 (4G) to 11.9 tok/s (16G).
 - The parity prompt is synthetic (random ids) and the greedy output loops ([238, 197, 197, 1, 198, ...]); a real text prompt would make token parity a stronger check.
+
+## Draft upstream report (not filed; filing on truespar/paddock is the owner's decision)
+
+Title: qwen35 serial prefill capture fails with CUDA error 2 on dies under 128 SMs (K-split router scratch)
+
+On an RTX 3070 (46 SMs, sm_86, pack 0.1.21), a 600-token `GpuQwen35::prefill()` with the experts on `PADDOCK_MOE_HOST` and `PADDOCK_NO_SORTED_QMOE=1` fails with `prefill: Gpu(Launch(2))`. `PADDOCK_PANIC_LAUNCH=1` names `batch_ops.rs:612` (`matvec_f32_raw`, through `matvec_f32_batch`).
+
+Cause as read from the source: `pd_matvec_f32_batch` takes the K-split arm on dies under 128 SMs from 256 rows (`ks_small`). `pd_f32nt_ks_go` asks `pd_part_scratch` for a partials plane, which never allocates while the stream is capturing, and then returns `cudaErrorMemoryAllocation` when the stream has no plane big enough (`gemm/f32_qkv.cuh:584`). `prefill()` captures a graph the first time it sees a length, so the first prefill of such a length fails. The part_scratch comment says capture falls back to nz=1, but this arm returns an error instead.
+
+Evidence: GPU memory peaked at 5.8 of 8 GiB. The same prefill passes with `PADDOCK_NO_PREFILL_GRAPH=1` or `PADDOCK_NO_F32NT_KS=1`. A 4000-token prefill on the same harness captures without error; why is not established.
