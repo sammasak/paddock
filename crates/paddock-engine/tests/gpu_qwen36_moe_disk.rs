@@ -206,8 +206,13 @@ fn moe_disk_write_artifact() {
     let Some((model, artifact, exec)) = setup() else {
         return;
     };
-    // SAFETY: as in setup.
-    unsafe { std::env::set_var("PADDOCK_MOE_HOST", "1") };
+    // SAFETY: as in setup. The reference prefill runs eager like the disk
+    // path: a captured prefill cannot seat the pack's split-K router scratch
+    // on a small die and the capture fails with CUDA error 2 (R6, 600 tokens).
+    unsafe {
+        std::env::set_var("PADDOCK_MOE_HOST", "1");
+        std::env::set_var("PADDOCK_NO_PREFILL_GRAPH", "1");
+    }
     let map = MappedGguf::open(&model).expect("open gguf");
     let mut m = GpuQwen35::load(exec, &map, MAX_CTX).expect("load pinned");
     let slots = m.enable_moe_cache(u64::MAX).expect("seat expert cache");
