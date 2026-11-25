@@ -42,6 +42,10 @@ pub enum GpuError {
     /// no-silent-failures principle applied to bring-up.
     #[error("{0}")]
     Unsupported(String),
+    /// The disk expert backing could not read its artifact (missing, short,
+    /// corrupt or produced from different weights).
+    #[error(transparent)]
+    ExpertIo(#[from] std::io::Error),
 }
 
 /// Convert AND CLASSIFY a cudarc driver error - the short name the op modules

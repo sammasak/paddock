@@ -392,14 +392,8 @@ impl DiskExpertStore {
             .and_then(|&(_, len)| usize::try_from(len).ok())
     }
 
-    /// Read `expert` of `layer` into `dst` (exactly one record long) and
-    /// verify it against its digest.
-    pub(super) fn read_expert(
-        &self,
-        layer: usize,
-        expert: usize,
-        dst: &mut [u8],
-    ) -> io::Result<()> {
+    /// File offset of `expert`'s record in `layer`.
+    pub(super) fn record_offset(&self, layer: usize, expert: usize) -> io::Result<u64> {
         let &(first, len) = self
             .extents
             .layers
@@ -411,16 +405,27 @@ impl DiskExpertStore {
                 self.n_expert
             )));
         }
+        len.checked_mul(to_u64(expert)?)
+            .and_then(|v| v.checked_add(first))
+            .ok_or_else(overflow)
+    }
+
+    /// Read `expert` of `layer` into `dst` (exactly one record long) and
+    /// verify it against its digest.
+    pub(super) fn read_expert(
+        &self,
+        layer: usize,
+        expert: usize,
+        dst: &mut [u8],
+    ) -> io::Result<()> {
+        let off = self.record_offset(layer, expert)?;
+        let len = self.extents.layers[layer].1;
         if to_u64(dst.len())? != len {
             return Err(invalid(format!(
                 "expert artifact: {} byte buffer for a {len} byte record",
                 dst.len()
             )));
         }
-        let off = len
-            .checked_mul(to_u64(expert)?)
-            .and_then(|v| v.checked_add(first))
-            .ok_or_else(overflow)?;
         pread_exact(&self.file, dst, off)?;
         let at = (layer * self.n_expert + expert) * DIGEST as usize;
         if blake3::hash(dst).as_bytes()[..] != self.digests[at..at + DIGEST as usize] {
@@ -474,6 +479,11 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>> StagingPool<B> {
             bufs,
             free: (0..count).rev().collect(),
         })
+    }
+
+    /// Bytes in each buffer.
+    pub(super) fn buf_len(&self) -> usize {
+        self.bufs[0].as_ref().len()
     }
 
     pub(super) fn capacity(&self) -> usize {

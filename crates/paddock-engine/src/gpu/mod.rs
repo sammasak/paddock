@@ -55,6 +55,9 @@ pub use hadamard::HadamardGdnHeads;
 // cache fill lands. Until then only its tests use it.
 #[allow(dead_code)]
 mod expert_store;
+#[allow(dead_code)]
+mod moe_disk;
+pub use moe_disk::MoeDiskStats;
 mod host_plane;
 pub use host_plane::{HostMappedKq, HostMirror};
 mod moe_cache;
