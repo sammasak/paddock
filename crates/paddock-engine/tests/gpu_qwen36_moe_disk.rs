@@ -1,6 +1,6 @@
 //! MoE expert offload with disk backing (PADDOCK_MOE_DISK) on the serial
 //! path, against the pinned backing (PADDOCK_MOE_HOST) on the same 35B-A3B
-//! UD file. Two gates, each run alone (`--exact`): the expert switches are
+//! UD file. Four gates, each run alone (`--exact`): the expert switches are
 //! process-wide, and the disk gate's peak RSS must be its own.
 //!
 //! 1. `moe_disk_write_artifact` - writes the artifact named by
@@ -207,11 +207,18 @@ fn moe_disk_write_artifact() {
     let Some((model, artifact, exec)) = setup() else {
         return;
     };
+    assert!(
+        std::env::var_os("PADDOCK_MOE_DISK").is_none(),
+        "the reference must run on the pinned backing"
+    );
     let map = MappedGguf::open(&model).expect("open gguf");
     // Written before the pinned load, so the write never shares the host
     // with the pinned experts.
     if artifact.exists() {
-        eprintln!("artifact {} exists - kept", artifact.display());
+        eprintln!(
+            "artifact {} exists - kept, the writer did not run",
+            artifact.display()
+        );
     } else {
         let t = Instant::now();
         GpuQwen35::write_expert_artifact(&exec, &map, &artifact).expect("write artifact");

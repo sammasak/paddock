@@ -553,7 +553,6 @@ pub(crate) fn write_expert_artifact(
     let id = expert_identity(map, names, exec.pack_version())?;
     let mut w = super::expert_store::ExpertArtifactWriter::create(path, &id, &layouts)
         .map_err(GpuError::ExpertIo)?;
-    let drv = |e: cudarc::driver::DriverError| super::from_driver(e);
     let mut record = Vec::new();
     for (layer, layout) in names.chunks(3).zip(&layouts) {
         let mut planes = Vec::with_capacity(3);
@@ -577,11 +576,11 @@ pub(crate) fn write_expert_artifact(
                     let n = per[2 * i + j];
                     exec.stream
                         .memcpy_dtoh(&s.slice(e * n..(e + 1) * n), &mut record[at..at + n])
-                        .map_err(drv)?;
+                        .map_err(super::from_driver)?;
                     at += n;
                 }
             }
-            exec.stream.synchronize().map_err(drv)?;
+            exec.stream.synchronize().map_err(super::from_driver)?;
             w.push_expert(&record).map_err(GpuError::ExpertIo)?;
         }
     }
