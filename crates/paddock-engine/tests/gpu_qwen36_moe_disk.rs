@@ -39,11 +39,14 @@ fn setup() -> Option<(
     if !common::heavy() {
         return None;
     }
+    // A heavy run asked for these gates: a missing model, pack or CUDA driver
+    // fails them instead of printing SKIP and reporting ok.
+    // SAFETY: single-threaded test binary (run with --exact), set before any reader.
+    unsafe { std::env::set_var("PADDOCK_STRICT_GATES", "1") };
     let model = common::model("QWEN36_MOE_UD_GGUF", common::QWEN36_35B_A3B_UD_Q4)?;
-    let Some(artifact) = std::env::var_os("QWEN36_MOE_DISK_ARTIFACT").map(PathBuf::from) else {
-        eprintln!("SKIP: set QWEN36_MOE_DISK_ARTIFACT to the artifact path");
-        return None;
-    };
+    let artifact = std::env::var_os("QWEN36_MOE_DISK_ARTIFACT")
+        .map(PathBuf::from)
+        .expect("set QWEN36_MOE_DISK_ARTIFACT to the artifact path");
     let exec = common::gpu_arc()?;
     // SAFETY: single-threaded test binary (run with --exact), set before any reader.
     unsafe {
