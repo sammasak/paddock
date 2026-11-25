@@ -4,6 +4,44 @@ Host: i9-10900K, 32 GiB RAM, RTX 3070 8 GiB (46 SMs, sm_86, PCIe 3.0 x16), Kings
 Model: Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf. Pack: paddock-cuda-sm86-0.1.21 (nix store). Branch: asus/ssd-expert-backing.
 Run helper: ~/paddock-runs/w/run.sh (systemd-run MemoryMax cap, swap off, nvidia-smi every 200 ms); logs in ~/paddock-runs/w/logs.
 
+## Strongest model for the Pi agent on asus (nixos-config#807)
+
+Planned with a Fable consult (read-only, repo + web). Candidates:
+
+| model / file | disk | path in Paddock | fits this host? | expected / measured | agent fit |
+|---|---|---|---|---|---|
+| Qwen3.6-35B-A3B UD-Q4_K_XL (on asus) | 22.4 GB | qwen35moe, pinned `[moe_offload]` (experts 18.3 GiB page-locked) | yes, 26G cap | measured below: 27-31 tok/s, 32K ctx | proven tool calls |
+| same, disk-backed | + 20.7 GB artifact | qwen35moe, `disk_artifact` | yes, 8G cap | measured: 9-15 tok/s, 4K ctx only | same model, too slow and short for an agent |
+| Qwen3.6-35B-A3B UD-Q3_K_XL | 16.8 GB + ~14.5 GB artifact | qwen35moe, disk | likely | est. 16-20 tok/s on disk; 3-bit tool-call quality unmeasured | risk |
+| Qwen3.8-Flash-Next UD-IQ1_S / Q4_K_XL | 66.4 / 111 GB | qwen4exp: pinned offload only (disk refused) | no: pinned needs > 32 GiB; a disk port is not built | est. 3-4 tok/s if ported | no |
+| gpt-oss-20b, Nemotron 3.5 30B-A3B, Laguna XS, Gemma 4 26B-A4B | - | VRAM-resident only | no (8 GB) | - | out |
+| Qwen3.5-9B dense | ~6 GB | qwen35, resident | yes | fast, small ctx | weaker fallback |
+
+Result: nothing larger than the 35B is servable on this host today; the strongest agent setup is the 35B Q4_K_XL served **pinned** (using the 32 GiB of RAM), not disk-backed. Measured on asus (`~/paddock-runs/w/serve-pinned/`, `start.sh` under `MemoryMax=26G`, swap off, memory.peak 26.0 GiB), config only:
+
+```toml
+host = "127.0.0.1"
+port = 11540
+model = "/home/lukas/paddock-runs/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"
+max_ctx = 32768
+max_batch = 1
+vram_budget = 7500
+prefill_chunk_rows = 1024   # new key: the default 8192-row chunk leaves no VRAM for the slot cache
+
+[moe_offload]
+enabled = true
+```
+
+| config | slots | chat (23 in) TTFT / decode | tool call (302 in) TTFT / decode | 194-204 out decode |
+|---|---|---|---|---|
+| max_ctx 16384, default chunk (elected 4096) | 0 (zero-copy) | 0.76 s / 15.5 tok/s | 2.93 s / 20.0 | 15.5 |
+| max_ctx 16384, chunk 1024 | 16 | 0.77 s / 30.0 | 2.80 s / 31.1 | 28.0 / 29.0 |
+| max_ctx 32768, chunk 1024 | 14 | 0.76 s / 28.7 | 2.81 s / 29.7 | 26.8 / 27.8 |
+
+Tool call in every row: `finish_reason=tool_calls`, `get_weather {"city":"Stockholm"}`. Long prompt at 32K ctx: a 6199-token prompt (a Rust source file, "what does this module do?") answered correctly, TTFT 26.74 s (232 tok/s prefill), decode 22.4 tok/s; the same prompt again: TTFT 0.44 s (prefix cache). Pinned serving runs the batched lane at width 1 (prefix cache, chunked prefill, decode pipe); the K-split capture bug did not show.
+
+Next for #807: real Pi tasks through the gateway (coordinator). The server listens on 127.0.0.1:11540 only; the gateway needs a host/key decision.
+
 ## HTTP serving on asus (queue item 6, nixos-config#508)
 
 Config only, no dev variables (`~/paddock-runs/w/serve/paddock.toml`; started by `w/serve/start.sh` under `systemd-run --user -p MemoryMax=8G -p MemorySwapMax=0`):
