@@ -378,6 +378,7 @@ impl GpuQwen35 {
     /// geometry against the target, splits `fc` into per-tap bands, leaves
     /// serving untouched until `dflash_ensure_state`.
     pub fn attach_dflash(&mut self, path: &Path) -> Result<(), GpuModelError> {
+        self.refuse_on_disk("speculative decoding (DFlash)")?;
         // the verify / tap walks in spec.rs and here do not rotate their
         // inputs, and the drafter would tap a target whose linears they run
         // wrong - refuse rather than draft noise

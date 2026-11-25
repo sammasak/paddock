@@ -57,7 +57,7 @@ pub use hadamard::HadamardGdnHeads;
 mod expert_store;
 mod moe_disk;
 pub use moe_disk::{
-    MoeDiskBacking, MoeDiskRefusal, MoeDiskStats, disk_slots, expert_identity, expert_plane_layout,
+    MoeDiskBacking, MoeDiskRefusal, MoeDiskStats, disk_slots, expert_identity,
     write_expert_artifact,
 };
 mod host_plane;
@@ -65,7 +65,7 @@ pub use host_plane::{HostMappedKq, HostMirror};
 mod moe_cache;
 pub use moe_cache::{
     ExpertCache, ExpertLayerLayout, ExpertPlaneLayout, MOE_CACHE_NONE, MoeOffloadCfg,
-    moe_cache_slots_pin, moe_offload, set_moe_offload,
+    moe_cache_slots_pin, moe_disk_artifact, moe_offload, set_moe_offload,
 };
 mod kquant;
 mod kumo;

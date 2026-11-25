@@ -42,13 +42,24 @@ pub fn set_moe_offload(cfg: MoeOffloadCfg) {
 }
 
 /// The armed config; `PADDOCK_MOE_HOST=1` is the development switch that
-/// enables it without a config file (tests, bring-up).
+/// enables it without a config file (tests, bring-up), and
+/// `PADDOCK_MOE_DISK` (see [`moe_disk_artifact`]) implies it.
 pub fn moe_offload() -> MoeOffloadCfg {
     let mut c = MOE_OFFLOAD.get().copied().unwrap_or_default();
-    if paddock_models::dev_var_os!("PADDOCK_MOE_HOST").is_some() {
+    if paddock_models::dev_var_os!("PADDOCK_MOE_HOST").is_some() || moe_disk_artifact().is_some() {
         c.enabled = true;
     }
     c
+}
+
+/// `PADDOCK_MOE_DISK=<artifact>`: development switch for the disk backing -
+/// the routed experts are read on a miss from this artifact (`moe_disk.rs`)
+/// instead of being held in page-locked RAM. Families that do not support
+/// it refuse at load.
+pub fn moe_disk_artifact() -> Option<std::path::PathBuf> {
+    paddock_models::dev_var_os!("PADDOCK_MOE_DISK")
+        .filter(|v| !v.is_empty())
+        .map(Into::into)
 }
 
 /// `PADDOCK_MOE_CACHE_SLOTS=<n>`: development pin for the per-layer slot

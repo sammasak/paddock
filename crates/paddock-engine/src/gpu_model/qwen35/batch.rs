@@ -65,6 +65,7 @@ impl GpuQwen35 {
     /// slot i. Returns the enabled capacity.
     pub fn enable_batch(&mut self, max_batch: usize) -> Result<usize, GpuModelError> {
         assert!(max_batch >= 1);
+        self.refuse_on_disk("batched serving (enable_batch)")?;
         let r = self.enable_batch_sized(max_batch);
         if r.is_err() {
             // A failed attempt leaves what it already seated (BatchState with

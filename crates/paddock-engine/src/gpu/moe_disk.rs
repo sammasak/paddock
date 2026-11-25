@@ -435,16 +435,37 @@ pub fn disk_slots(
     Ok(slots)
 }
 
-/// The repacked geometry of one k-quant expert tensor, from its GGUF shape
-/// and type alone - what the pinned load would produce, without the repack.
-pub fn expert_plane_layout(map: &MappedGguf, name: &str) -> Result<ExpertPlaneLayout, GpuError> {
-    let (info, _) = map.tensor_bytes(name)?;
-    if super::kq_params(info.ggml_type).is_none() {
-        return Err(MoeDiskRefusal::Quant(info.ggml_type).into());
+impl GpuExecutor {
+    /// The disk backing's seat for one expert tensor: the geometry
+    /// [`GpuExecutor::try_repack_kquant`] would produce, from the GGUF shape
+    /// and type alone, refused wherever that repack would refuse. `None` when
+    /// the tensor is not a k-quant type.
+    pub fn kq_expert_layout(
+        &self,
+        map: &MappedGguf,
+        name: &str,
+    ) -> Result<Option<ExpertPlaneLayout>, GpuError> {
+        self.rotated_basis_guard(map, name)?;
+        let (info, _) = map.tensor_bytes(name)?;
+        let ty = info.ggml_type;
+        if super::kq_params(ty).is_none() {
+            return Ok(None);
+        }
+        // the repack's own pack checks (try_repack_kquant, repack_kquant_raw)
+        if (super::kq_is_iq(ty) && !self.has_kquant_iq())
+            || (super::kq_is_ternary(ty) && !self.has_kquant_ternary())
+            || (matches!(ty, GgmlType::Q5_1 | GgmlType::Q8_0) && !self.has_kquant_flat32())
+            || (ty == GgmlType::Q5_0 && !self.has_kquant_q50())
+        {
+            return Err(GpuError::NoKernel {
+                name: name.to_owned(),
+                ty,
+            });
+        }
+        let dims: Vec<usize> = info.dims.iter().map(|&d| d as usize).collect();
+        let (data, scales) = super::kquant::kq_repacked_bytes(&dims, ty, name)?;
+        ExpertPlaneLayout::new(&dims, ty, data, scales).map(Some)
     }
-    let dims: Vec<usize> = info.dims.iter().map(|&d| d as usize).collect();
-    let (data, scales) = super::kquant::kq_repacked_bytes(&dims, info.ggml_type, name)?;
-    ExpertPlaneLayout::new(&dims, info.ggml_type, data, scales)
 }
 
 /// What an artifact must have been produced from: the kernel pack (it owns

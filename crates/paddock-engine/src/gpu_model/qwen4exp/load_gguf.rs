@@ -239,6 +239,11 @@ fn kq_seat(
             info.ggml_type
         )));
     }
+    if crate::gpu::moe_disk_artifact().is_some() {
+        return Err(unsupported(
+            crate::gpu::MoeDiskRefusal::Mode("the qwen4exp family").to_string(),
+        ));
+    }
     let seat = if crate::gpu::moe_offload().enabled {
         if info.ggml_type == GgmlType::Q8_0 {
             return Err(unsupported(format!(
