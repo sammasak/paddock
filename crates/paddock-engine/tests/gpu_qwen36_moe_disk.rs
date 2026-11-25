@@ -202,13 +202,15 @@ fn measure(m: &mut GpuQwen35, artifact: Option<&Path>) {
             return String::from("pinned");
         };
         let rows = b.rows - a.rows;
-        let misses = b.misses - a.misses;
+        // a slot miss is served by the host tier or read from disk
+        let misses = b.misses - a.misses + b.tier_hits - a.tier_hits;
         let mib = (b.bytes_read - a.bytes_read) as f64 / (1u64 << 20) as f64;
         let rt = (b.read_time - a.read_time).as_secs_f64();
         format!(
-            "misses {misses} of {rows} rows (hit {:.1}%), read {mib:.0} MiB in {rt:.2}s \
-             ({:.0} MiB/s), staging waits {}",
+            "misses {misses} of {rows} rows (hit {:.1}%), from the host tier {}, read {mib:.0} MiB \
+             in {rt:.2}s ({:.0} MiB/s), staging waits {}",
             100.0 * (1.0 - misses as f64 / rows.max(1) as f64),
+            b.tier_hits - a.tier_hits,
             mib / rt.max(1e-9),
             b.staging_waits - a.staging_waits
         )

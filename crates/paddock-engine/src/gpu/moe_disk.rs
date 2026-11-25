@@ -100,6 +100,8 @@ pub struct MoeDiskStats {
     pub staging_waits: u64,
     /// Wall time the host spent waiting for slot copies to complete.
     pub wait_time: Duration,
+    /// Misses served from the host tier (no disk read).
+    pub tier_hits: u64,
 }
 
 /// Host-side LRU over one layer's slots: the state the resolve kernel keeps
@@ -217,16 +219,128 @@ pub(super) fn plan_waves(
     Ok(n)
 }
 
+/// Where one miss's record comes from in a fill.
+#[derive(Clone, Copy)]
+enum Src {
+    /// Already in this host tier buffer.
+    Hit(usize),
+    /// Read into this tier buffer, which it is admitted to.
+    Tier(usize),
+    /// Read into this staging lease (an index into the batch's leases).
+    Staging(usize),
+}
+
+/// Pinned host copies of hot expert records, a tier between the slots and
+/// the disk: a hit is copied straight to its slot, with no read and no
+/// second digest check. Each layer owns an equal share of the buffers. An
+/// expert is admitted when it has been routed to at least as often as the
+/// least routed expert it would replace; a buffer is never written while a
+/// copy out of it may be pending.
+struct HostTier<B> {
+    bufs: Vec<B>,
+    /// Buffers a layer owns: layer `l` owns `l * quota..(l + 1) * quota`.
+    quota: usize,
+    /// The expert each buffer holds.
+    held: Vec<u32>,
+    /// Per layer, the buffer each expert is in.
+    at: Vec<Vec<u32>>,
+    /// Per layer, the routed rows of each expert since load.
+    count: Vec<Vec<u32>>,
+    pending: Vec<bool>,
+}
+
+impl<B: AsRef<[u8]> + AsMut<[u8]>> HostTier<B> {
+    fn new(bufs: Vec<B>, n_expert: Vec<usize>) -> Self {
+        let quota = bufs.len() / n_expert.len().max(1);
+        Self {
+            quota,
+            held: vec![MOE_CACHE_NONE; bufs.len()],
+            pending: vec![false; bufs.len()],
+            at: n_expert.iter().map(|&n| vec![MOE_CACHE_NONE; n]).collect(),
+            count: n_expert.iter().map(|&n| vec![0; n]).collect(),
+            bufs,
+        }
+    }
+
+    fn note(&mut self, layer: usize, rows: &[u32]) {
+        if self.quota == 0 {
+            return;
+        }
+        for &e in rows {
+            let c = &mut self.count[layer][e as usize];
+            *c = c.saturating_add(1);
+        }
+    }
+
+    fn lookup(&self, layer: usize, expert: u32) -> Option<usize> {
+        let b = *self.at.get(layer)?.get(expert as usize)?;
+        (b != MOE_CACHE_NONE).then_some(b as usize)
+    }
+
+    /// A buffer of `layer` for `expert`: an empty one, else the one holding
+    /// the least routed expert if `expert` is routed at least as often.
+    /// Never a pending buffer.
+    fn admit(&mut self, layer: usize, expert: u32) -> Option<usize> {
+        let count = &self.count[layer];
+        let held = &self.held;
+        let b = (layer * self.quota..(layer + 1) * self.quota)
+            .filter(|&b| !self.pending[b])
+            .min_by_key(|&b| match held[b] {
+                MOE_CACHE_NONE => (0, 0),
+                h => (1, count[h as usize]),
+            })?;
+        let old = self.held[b];
+        if old != MOE_CACHE_NONE {
+            if count[expert as usize] < count[old as usize] {
+                return None;
+            }
+            self.at[layer][old as usize] = MOE_CACHE_NONE;
+        }
+        self.held[b] = expert;
+        self.at[layer][expert as usize] = b as u32;
+        Some(b)
+    }
+
+    /// Forget what buffer `b` holds.
+    fn forget(&mut self, b: usize) {
+        let e = std::mem::replace(&mut self.held[b], MOE_CACHE_NONE);
+        if e != MOE_CACHE_NONE {
+            let layer = b / self.quota;
+            self.at[layer][e as usize] = MOE_CACHE_NONE;
+        }
+    }
+
+    fn buf(&self, b: usize) -> &[u8] {
+        self.bufs[b].as_ref()
+    }
+
+    /// The buffers `bs`, in their order. Only those are touched: others may
+    /// be under a copy.
+    fn bufs_mut(&mut self, bs: &[usize]) -> Vec<&mut [u8]> {
+        let mut out: Vec<Option<&mut [u8]>> = bs.iter().map(|_| None).collect();
+        for (i, b) in self.bufs.iter_mut().enumerate() {
+            if let Some(at) = bs.iter().position(|&x| x == i) {
+                out[at] = Some(b.as_mut());
+            }
+        }
+        out.into_iter()
+            .map(|b| b.expect("every index names a buffer"))
+            .collect()
+    }
+}
+
 /// The disk backing of one model: the artifact, the staging pool every layer
 /// shares (layers run one at a time), and each MoE layer's slot LRU. `M` is
 /// the device's copy mark.
 pub(super) struct DiskExperts<B, M> {
     store: DiskExpertStore,
     pool: StagingPool<B>,
+    tier: HostTier<B>,
     lru: Vec<SlotLru>,
-    /// Leases whose copies were enqueued and not yet waited for, oldest
-    /// first, each batch behind the mark taken after its copies.
-    in_flight: VecDeque<(M, Vec<StagingLease>)>,
+    /// Leases and tier buffers whose copies were enqueued and not yet
+    /// waited for, oldest first, each batch behind the mark taken after its
+    /// copies.
+    in_flight: VecDeque<(M, Vec<StagingLease>, Vec<usize>)>,
     jobs: Vec<MissJob>,
     /// Threads a fill reads its misses on.
     readers: usize,
@@ -235,11 +349,13 @@ pub(super) struct DiskExperts<B, M> {
 }
 
 impl<B: AsRef<[u8]> + AsMut<[u8]>, M> DiskExperts<B, M> {
-    /// `slots` per layer over every layer of `store`. The pool's buffers must
-    /// each hold one record of the largest layer.
+    /// `slots` per layer over every layer of `store`. The pool's buffers and
+    /// the host tier's (`tier`, split evenly between the layers; none turns
+    /// it off) must each hold one record of the largest layer.
     pub(super) fn new(
         store: DiskExpertStore,
         pool: StagingPool<B>,
+        tier: Vec<B>,
         slots: usize,
         readers: usize,
     ) -> Result<Self, GpuError> {
@@ -258,9 +374,18 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>, M> DiskExperts<B, M> {
             }
             lru.push(SlotLru::new(layout.n_expert(), slots));
         }
+        if let Some(b) = tier.iter().find(|b| b.as_ref().len() < pool.buf_len()) {
+            return Err(GpuError::Driver(format!(
+                "expert disk backing: a {} byte host tier buffer for {} byte records",
+                b.as_ref().len(),
+                pool.buf_len()
+            )));
+        }
+        let tier = HostTier::new(tier, lru.iter().map(|l| l.slot_of.len()).collect());
         Ok(Self {
             store,
             pool,
+            tier,
             lru,
             in_flight: VecDeque::new(),
             jobs: Vec::new(),
@@ -326,6 +451,7 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>, M> DiskExperts<B, M> {
         jobs.clear();
         self.lru[layer].resolve(rows, slot_rows, &mut jobs);
         self.stats.rows += rows.len() as u64;
+        self.tier.note(layer, rows);
         let r = self.fill_jobs(layer, &jobs, dev);
         if r.is_err() {
             self.lru[layer].invalidate(&jobs);
@@ -350,68 +476,133 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>, M> DiskExperts<B, M> {
             .expect("layer checked by fill")
             .stream_bytes();
         let mut todo = jobs;
+        let mut srcs = Vec::new();
         let mut leases = Vec::new();
+        let mut tiered = Vec::new();
         while !todo.is_empty() {
-            // as many misses as there are free buffers, read side by side;
-            // with none free, wait for the oldest batch's copies only, so the
-            // reads overlap whatever the stream still runs
-            if self.pool.available() == 0 {
+            // Each miss is served from the host tier, read into a tier buffer
+            // it is admitted to, or read into staging, as many as staging
+            // allows; the reads run side by side. With no staging free, wait
+            // for the oldest batch's copies only, so the reads overlap
+            // whatever the stream still runs.
+            srcs.clear();
+            leases.clear();
+            tiered.clear();
+            for j in todo {
+                let src = if let Some(b) = self.tier.lookup(layer, j.expert) {
+                    Src::Hit(b)
+                } else if let Some(b) = self.tier.admit(layer, j.expert) {
+                    Src::Tier(b)
+                } else if let Some(l) = self.pool.acquire() {
+                    leases.push(l);
+                    Src::Staging(leases.len() - 1)
+                } else {
+                    break;
+                };
+                if let Src::Hit(b) | Src::Tier(b) = src {
+                    // never written again until this batch's mark is waited for
+                    self.tier.pending[b] = true;
+                    tiered.push(b);
+                }
+                srcs.push(src);
+            }
+            if srcs.is_empty() {
+                if self.in_flight.is_empty() {
+                    return Err(GpuError::Driver(
+                        "expert disk backing: no staging buffer is free or in flight".into(),
+                    ));
+                }
                 self.stats.staging_waits += 1;
                 self.drain_oldest(dev)?;
+                continue;
             }
-            let n = todo.len().min(self.pool.available());
-            if n == 0 {
-                return Err(GpuError::Driver(
-                    "expert disk backing: no staging buffer is free or in flight".into(),
-                ));
-            }
-            let (batch, rest) = todo.split_at(n);
+            let (batch, rest) = todo.split_at(srcs.len());
             todo = rest;
-            leases.clear();
-            leases.extend((0..n).map(|_| self.pool.acquire().expect("counted free")));
+            let reads: Vec<MissJob> = batch
+                .iter()
+                .zip(&srcs)
+                .filter(|(_, s)| !matches!(s, Src::Hit(_)))
+                .map(|(j, _)| *j)
+                .collect();
             let t0 = Instant::now();
             let read = {
                 let store = &self.store;
-                let mut bufs = self.pool.bufs_mut(&leases);
-                read_records(store, layer, batch, &mut bufs, len, self.readers)
+                let mut staged = self.pool.bufs_mut(&leases).into_iter();
+                let admitted: Vec<usize> = srcs
+                    .iter()
+                    .filter_map(|s| match s {
+                        Src::Tier(b) => Some(*b),
+                        _ => None,
+                    })
+                    .collect();
+                let mut admitted = self.tier.bufs_mut(&admitted).into_iter();
+                let mut bufs: Vec<&mut [u8]> = srcs
+                    .iter()
+                    .filter_map(|s| match s {
+                        Src::Hit(_) => None,
+                        Src::Tier(_) => admitted.next(),
+                        Src::Staging(_) => staged.next(),
+                    })
+                    .collect();
+                read_records(store, layer, &reads, &mut bufs, len, self.readers)
             };
             self.stats.read_time += t0.elapsed();
             if let Err(e) = read {
-                // nothing was enqueued from these buffers
+                // nothing was enqueued from this batch; what the admitted
+                // buffers hold is unknown
                 for l in leases.drain(..) {
                     self.pool.release(l);
                 }
+                for s in &srcs {
+                    if let Src::Tier(b) = s {
+                        self.tier.forget(*b);
+                    }
+                }
+                for &b in &tiered {
+                    self.tier.pending[b] = false;
+                }
                 return Err(GpuError::ExpertIo(e));
             }
-            self.stats.misses += n as u64;
-            self.stats.bytes_read += (n * len) as u64;
-            let mut held = leases.drain(..);
-            let mut sent = Vec::with_capacity(n);
+            self.stats.misses += reads.len() as u64;
+            self.stats.bytes_read += (reads.len() * len) as u64;
+            self.stats.tier_hits += (srcs.len() - reads.len()) as u64;
+            let mut sent = vec![false; leases.len()];
             let mut failed = None;
-            'batch: for j in batch {
-                let lease = held.next().expect("one lease a miss");
-                let buf = self.pool.buf(&lease);
+            'batch: for (j, src) in batch.iter().zip(&srcs) {
+                let buf = match *src {
+                    Src::Hit(b) | Src::Tier(b) => self.tier.buf(b),
+                    Src::Staging(i) => {
+                        sent[i] = true;
+                        self.pool.buf(&leases[i])
+                    }
+                };
                 let mut off = 0;
                 for (k, &n) in streams.iter().enumerate() {
-                    // SAFETY: the lease joins `in_flight` behind a mark taken
-                    // below, or is stranded with the backing broken; a buffer
-                    // is released only after a wait on its mark returned Ok.
+                    // SAFETY: the buffer joins `in_flight` behind a mark
+                    // taken below, or is stranded with the backing broken; a
+                    // staging buffer is released, and a tier buffer written
+                    // again, only after a wait on its mark returned Ok.
                     let r = unsafe { dev.enqueue(k, j.slot, &buf[off..off + n]) };
                     if let Err(e) = r {
-                        sent.push(lease);
                         failed = Some(e);
                         break 'batch;
                     }
                     off += n;
                 }
-                sent.push(lease);
             }
-            // nothing was enqueued from the batch's later buffers
-            for l in held {
-                self.pool.release(l);
+            // nothing was enqueued from the batch's later staging buffers
+            let mut batch_leases = Vec::with_capacity(leases.len());
+            for (l, sent) in leases.drain(..).zip(sent) {
+                if sent {
+                    batch_leases.push(l);
+                } else {
+                    self.pool.release(l);
+                }
             }
             match dev.mark() {
-                Ok(m) => self.in_flight.push_back((m, sent)),
+                Ok(m) => self
+                    .in_flight
+                    .push_back((m, batch_leases, std::mem::take(&mut tiered))),
                 Err(e) => {
                     // copies the device may still run, with no way to wait
                     // for them: strand their buffers
@@ -438,7 +629,7 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>, M> DiskExperts<B, M> {
 
     /// Wait for every enqueued copy and release its staging buffer.
     fn drain(&mut self, dev: &mut impl SlotCopier<Mark = M>) -> Result<(), GpuError> {
-        let Some((last, _)) = self.in_flight.back() else {
+        let Some((last, _, _)) = self.in_flight.back() else {
             return Ok(());
         };
         let t0 = Instant::now();
@@ -449,9 +640,12 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>, M> DiskExperts<B, M> {
             self.broken = true;
             return Err(e);
         }
-        for (_, leases) in self.in_flight.drain(..) {
+        for (_, leases, tiered) in self.in_flight.drain(..) {
             for l in leases {
                 self.pool.release(l);
+            }
+            for b in tiered {
+                self.tier.pending[b] = false;
             }
         }
         Ok(())
@@ -459,7 +653,7 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>, M> DiskExperts<B, M> {
 
     /// Wait for the oldest batch's copies and release its staging buffers.
     fn drain_oldest(&mut self, dev: &mut impl SlotCopier<Mark = M>) -> Result<(), GpuError> {
-        let Some((mark, _)) = self.in_flight.front() else {
+        let Some((mark, _, _)) = self.in_flight.front() else {
             return Ok(());
         };
         let t0 = Instant::now();
@@ -469,9 +663,12 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>, M> DiskExperts<B, M> {
             self.broken = true;
             return Err(e);
         }
-        let (_, leases) = self.in_flight.pop_front().expect("front checked above");
+        let (_, leases, tiered) = self.in_flight.pop_front().expect("front checked above");
         for l in leases {
             self.pool.release(l);
+        }
+        for b in tiered {
+            self.tier.pending[b] = false;
         }
         Ok(())
     }
@@ -944,8 +1141,15 @@ impl MoeDiskBacking {
         );
         let pool = StagingPool::new(records, len, |n| PinnedBuf::new(stream.clone(), n))
             .map_err(|e| GpuError::Driver(format!("expert staging: {e}")))?;
+        // The host tier: PADDOCK_MOE_DISK_HOST_MB of pinned records
+        // (development instrument; none by default).
+        let tier_mb = dev_count(paddock_models::dev_var!("PADDOCK_MOE_DISK_HOST_MB"), 0);
+        let tier = (0..(tier_mb << 20) / len)
+            .map(|_| PinnedBuf::new(stream.clone(), len))
+            .collect::<std::io::Result<Vec<_>>>()
+            .map_err(|e| GpuError::Driver(format!("expert host tier: {e}")))?;
         *state = Some(Seat::Seated(Box::new(DiskExperts::new(
-            store, pool, slots, readers,
+            store, pool, tier, slots, readers,
         )?)));
         Ok(caches)
     }
@@ -1164,7 +1368,7 @@ mod tests {
             .max()
             .expect("layers");
         let pool = StagingPool::new(staging, len, |n| Ok(vec![0u8; n])).expect("pool");
-        DiskExperts::new(store, pool, slots, 2).expect("experts")
+        DiskExperts::new(store, pool, Vec::new(), slots, 2).expect("experts")
     }
 
     /// A device that applies each copy only at a `wait` on a later mark,
@@ -1243,6 +1447,22 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    /// `experts` with a host tier of `tier` buffers (split over both layers).
+    fn tiered(
+        path: &Path,
+        slots: usize,
+        staging: usize,
+        tier: usize,
+    ) -> DiskExperts<Vec<u8>, usize> {
+        let store = DiskExpertStore::open(path, &ID, &layouts()).expect("open");
+        let len = (0..store.n_layers())
+            .filter_map(|l| store.record_bytes(l))
+            .max()
+            .expect("layers");
+        let pool = StagingPool::new(staging, len, |n| Ok(vec![0u8; n])).expect("pool");
+        DiskExperts::new(store, pool, vec![vec![0u8; len]; tier], slots, 2).expect("experts")
     }
 
     /// Fill `rows` and check every row's slot holds its expert's record once
@@ -1367,6 +1587,58 @@ mod tests {
     }
 
     #[test]
+    fn a_tier_hit_is_copied_without_a_read() {
+        let path = artifact("tier-hit");
+        // two slots, four tier buffers (two a layer)
+        let mut x = tiered(&path, 2, 2, 4);
+        let mut dev = FakeDevice::new(2);
+        fill_and_check(&mut x, &mut dev, 0, &[1, 2]);
+        assert_eq!((x.stats().misses, x.stats().tier_hits), (2, 0));
+        // 3 and 4 evict 1 and 2 from the slots; the tier is full, so they
+        // are admitted only when routed as often (they are: once each)
+        fill_and_check(&mut x, &mut dev, 0, &[3, 4]);
+        // 1 comes back from the tier only if it is still there
+        let before = x.stats();
+        fill_and_check(&mut x, &mut dev, 0, &[3, 1]);
+        let after = x.stats();
+        assert_eq!(
+            (after.misses - before.misses) + (after.tier_hits - before.tier_hits),
+            1,
+            "3 is in a slot, 1 is a miss"
+        );
+        // routed most, 1 stays in the tier: a later miss of it reads nothing
+        for _ in 0..3 {
+            fill_and_check(&mut x, &mut dev, 0, &[1, 2]);
+            fill_and_check(&mut x, &mut dev, 0, &[5, 6]);
+        }
+        let before = x.stats();
+        fill_and_check(&mut x, &mut dev, 0, &[1, 2]);
+        let after = x.stats();
+        assert_eq!(after.misses, before.misses, "1 and 2 come from the tier");
+        assert_eq!(after.tier_hits - before.tier_hits, 2);
+    }
+
+    #[test]
+    fn a_pending_tier_buffer_is_never_written() {
+        let path = artifact("tier-pending");
+        // one tier buffer a layer, no settle between fills: the buffer
+        // holding 1 is still under its copy when 2 misses
+        let mut x = tiered(&path, 1 + 1, 2, 2);
+        let mut dev = FakeDevice::new(2);
+        let mut slots = [MOE_CACHE_NONE; 1];
+        x.fill(0, &[1], &mut slots, &mut dev).expect("fill");
+        assert_eq!(x.tier.lookup(0, 1), Some(0));
+        x.fill(0, &[2], &mut slots, &mut dev).expect("fill");
+        assert_eq!(x.tier.lookup(0, 1), Some(0), "the pending buffer kept 1");
+        assert_eq!(x.tier.lookup(0, 2), None, "2 went through staging");
+        dev.flush();
+        let ls = layouts();
+        assert_eq!(dev.slot(slots[0]), record(&ls, 0, 2));
+        x.settle(&mut dev).expect("settle");
+        assert!(x.tier.pending.iter().all(|&p| !p));
+    }
+
+    #[test]
     fn only_the_oldest_batch_is_waited_for_and_released() {
         // one miss, then two: the second fill finds one buffer free, sends
         // a batch of one, then must wait for the first fill's batch alone
@@ -1382,7 +1654,7 @@ mod tests {
         // came from 5's, so 6 and 7 are still pending behind their marks
         let ls = layouts();
         assert_eq!(dev.slot(one[0]), record(&ls, 0, 5));
-        let held: usize = x.in_flight.iter().map(|(_, l)| l.len()).sum();
+        let held: usize = x.in_flight.iter().map(|(_, l, _)| l.len()).sum();
         assert_eq!(held, 2, "the two later batches stay in flight");
         dev.flush();
         assert_eq!(dev.slot(two[0]), record(&ls, 0, 6));
@@ -1429,7 +1701,7 @@ mod tests {
         let misses = x.stats().misses;
         fill_and_check(&mut x, &mut dev, 0, &[1, 6]);
         assert_eq!(x.stats().misses, misses + 2);
-        let held: usize = x.in_flight.iter().map(|(_, l)| l.len()).sum();
+        let held: usize = x.in_flight.iter().map(|(_, l, _)| l.len()).sum();
         assert_eq!(x.pool.available() + held, 4, "no lease lost");
     }
 
@@ -1496,15 +1768,15 @@ mod tests {
             .max()
             .expect("layers");
         assert!(
-            DiskExperts::<_, usize>::new(store(), pool(big), 0, 1).is_err(),
+            DiskExperts::<_, usize>::new(store(), pool(big), Vec::new(), 0, 1).is_err(),
             "no slots"
         );
         assert!(
-            DiskExperts::<_, usize>::new(store(), pool(big), N_EXPERT + 1, 1).is_err(),
+            DiskExperts::<_, usize>::new(store(), pool(big), Vec::new(), N_EXPERT + 1, 1).is_err(),
             "slots"
         );
         assert!(
-            DiskExperts::<_, usize>::new(store(), pool(big - 1), 4, 1).is_err(),
+            DiskExperts::<_, usize>::new(store(), pool(big - 1), Vec::new(), 4, 1).is_err(),
             "staging too small"
         );
     }
