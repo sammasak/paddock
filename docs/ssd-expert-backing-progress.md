@@ -59,6 +59,8 @@ Pi 1.2.0 (`/etc/profiles/per-user/lukas/bin/pi`) against `http://127.0.0.1:11540
 
 ## Resume here (state at 2026-11-25 16:30, branch asus/ssd-expert-backing)
 
+- 2026-11-25 about 18:45: the hand-started serve (user unit `paddock-serve`) was replaced by the declared system service (nixos-config PR 817); the user-unit lines below are history.
+
 - Goals done: SSD streaming (accepted), HTTP serving of the disk-backed 35B (queue item 6), model plan for the Pi agent (#807, first candidate measured).
 - Running on asus until 20:45: `paddock-serve.service` (user unit), the 35B **pinned** at max_ctx 32768 on 127.0.0.1:11540, config `~/paddock-runs/w/serve-pinned/paddock.toml`. Restart: `~/paddock-runs/w/serve-pinned/start.sh` (26G cap). The disk-backed serve: `~/paddock-runs/w/serve/start.sh` (8G cap). Requests: `python3 -I ~/paddock-runs/w/serve/stream.py <request.json>` (chat.json, tool.json, long*.json).
 - Next step: real Pi tasks through the gateway against the pinned serve (coordinator; needs a non-loopback bind and an API key, which is the owner's call). If RAM must stay bounded instead: a chunked serial prefill for the disk path (it is limited to max_ctx 4096 on 8 GB), then the Q3_K_XL quant.
