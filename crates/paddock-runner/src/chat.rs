@@ -2585,6 +2585,12 @@ fn stream_response(mut meta: Meta, rxs: Vec<UnboundedReceiver<TokenEvent>>) -> R
                     meta.prompt_len = meta.prompt_len.max(rows as usize);
                 }
                 TokenEvent::Token { id, logprobs } => {
+                    // the first token, for a stream that never sees its Done
+                    // (the n == 1 stop-string break below, a disconnect, an
+                    // engine error)
+                    if cs.ids.is_empty() {
+                        meta.scope.token_seen();
+                    }
                     cs.ids.push(id);
                     if let Some(lp) = logprobs {
                         cs.lps.push(lp);
@@ -2855,6 +2861,60 @@ fn chunk(
         }],
     })
     .to_string()
+}
+
+/// The streaming handler over `rxs` with no model behind it: a hand-built
+/// byte-level vocabulary (`h e l o he ll hell hello`), the Plain dialect and
+/// the client's `stop` strings.
+#[cfg(test)]
+pub(crate) fn stream_for_test(
+    scope: crate::events::EventScope,
+    stop: &[&str],
+    rxs: Vec<UnboundedReceiver<TokenEvent>>,
+) -> axum::body::Body {
+    use paddock_models::gguf::{GgufFile, Value};
+    let strs = |v: &[&str]| Value::Array(v.iter().map(|s| Value::Str((*s).into())).collect());
+    let gguf = GgufFile {
+        version: 3,
+        alignment: 32,
+        metadata: [
+            ("tokenizer.ggml.model", Value::Str("gpt2".into())),
+            ("tokenizer.ggml.pre", Value::Str("gpt-4o".into())),
+            (
+                "tokenizer.ggml.tokens",
+                strs(&["h", "e", "l", "o", "he", "ll", "hell", "hello"]),
+            ),
+            (
+                "tokenizer.ggml.merges",
+                strs(&["h e", "l l", "he ll", "hell o"]),
+            ),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v))
+        .collect(),
+        tensors: vec![],
+        data_offset: 0,
+    };
+    let meta = Meta {
+        id: "chatcmpl-t".into(),
+        model_id: "m1".into(),
+        tokenizer: Arc::new(paddock_tokenizer::GgufTokenizer::from_gguf(&gguf).expect("tokenizer")),
+        prompt_len: 16,
+        text_prompt_len: 16,
+        dialect: Dialect::Plain,
+        thinking_open: false,
+        stop_strings: stop.iter().map(|s| (*s).to_owned()).collect(),
+        single_tool_call: false,
+        hints: None,
+        logprobs: false,
+        legacy_functions: false,
+        audio_rows: 0,
+        ocr: None,
+        skip_special: None,
+        ctc: None,
+        scope,
+    };
+    stream_response(meta, rxs).into_body()
 }
 
 #[cfg(test)]

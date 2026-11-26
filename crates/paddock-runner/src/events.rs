@@ -22,8 +22,10 @@
 //! and the KV page footprint. `ttft_ms` runs from arrival at the edge to the
 //! engine's first sampled token (tokenize + queue + prefill), not to the first
 //! response byte: a stream's SSE preamble goes out before prefill finishes.
-//! Only a request without an engine token falls back to the first byte, so
-//! every success still carries one TTFT sample.
+//! A chat stream that ends before the engine's stats arrive (a stop string,
+//! a disconnect) ends it where the handler received its first token. Only a
+//! request without a token falls back to the first byte, so every success
+//! still carries one TTFT sample.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -120,9 +122,10 @@ pub struct EventRecord {
     #[serde(rename = "paddock.kv_pages", skip_serializing_if = "Option::is_none")]
     pub kv_pages: Option<u64>,
     /// Arrival at the edge to the engine's first sampled token (tokenize +
-    /// queue + prefill). A request that reported no token (embeddings,
-    /// audio, an engine error or a disconnect before the engine's stats
-    /// arrived) falls back to the first response-body byte.
+    /// queue + prefill); a chat stream cut before the engine's stats arrived
+    /// ends it at the handler's receipt of that token. A request without a
+    /// token (embeddings, audio, an engine error or a disconnect before the
+    /// first one) falls back to the first response-body byte.
     #[serde(rename = "paddock.ttft_ms", skip_serializing_if = "Option::is_none")]
     pub ttft_ms: Option<u64>,
     /// Output tokens over the post-first-token window - the edge view of decode
@@ -177,8 +180,15 @@ struct Cells {
     spec_drafted: Option<u64>,
     spec_accepted: Option<u64>,
     kv_pages: Option<u64>,
-    /// The earliest generation's `RunStats::prefilled_at`: the first token.
+    /// The first token: the earliest generation's `RunStats::prefilled_at`,
+    /// or a stream handler's receipt of it when no Done arrived.
     first_token: Option<Instant>,
+}
+
+impl Cells {
+    fn earliest_token(&mut self, t: Instant) {
+        self.first_token = Some(self.first_token.map_or(t, |f| f.min(t)));
+    }
 }
 
 /// Cloneable handle the middleware plants in the request extensions and the
@@ -256,9 +266,18 @@ impl EventScope {
                 c.kv_pages = Some(c.kv_pages.unwrap_or(0).max(s.kv_pages as u64));
             }
             if let Some(t) = s.prefilled_at {
-                c.first_token = Some(c.first_token.map_or(t, |f| f.min(t)));
+                c.earliest_token(t);
             }
         });
+    }
+
+    /// A streaming handler received a generation's first token. A stream
+    /// that ends before the engine's Done (a stop string, a disconnect, an
+    /// error) carries no `prefilled_at`, so this is its first token; when
+    /// Done does arrive, the engine's earlier stamp wins.
+    pub fn token_seen(&self) {
+        let t = Instant::now();
+        self.with(|c| c.earliest_token(t));
     }
 
     /// Public response timing, with no event metadata or credentials. Totals
@@ -661,10 +680,80 @@ pub async fn events_mw(
     )
 }
 
-/// One request through the middleware's recording body, with the edge
-/// arrival at `t0`: a stream whose SSE preamble is polled out first (header
-/// time), then each generation's engine `stats` are folded in and the body
-/// ends. Returns the record; the observation lands in `metrics`.
+/// One request through the middleware's recording body, its response built
+/// around the live scope, arriving at the edge at `t0` (None: once the
+/// response is built, so setup time is not read as latency).
+#[cfg(test)]
+pub(crate) struct RecordingForTest {
+    ring: Arc<EventRing>,
+    body: RecordingBody,
+}
+
+#[cfg(test)]
+impl RecordingForTest {
+    pub(crate) fn new(
+        metrics: Arc<crate::metrics::Metrics>,
+        t0: Option<Instant>,
+        body: impl FnOnce(EventScope) -> axum::body::Body,
+    ) -> Self {
+        let ring = EventRing::new();
+        let scope = EventScope::live();
+        scope.model("m1");
+        let inner = body(scope.clone());
+        let t0 = t0.unwrap_or_else(Instant::now);
+        RecordingForTest {
+            ring: ring.clone(),
+            body: RecordingBody {
+                inner,
+                pending: Some(Pending {
+                    ring,
+                    metrics,
+                    scope,
+                    endpoint: "/v1/chat/completions".into(),
+                    origin: Default::default(),
+                    request_id: "req_t".into(),
+                    traceparent: None,
+                    session_id: None,
+                    api_key_hash: None,
+                    ts_ms: 0,
+                    t0,
+                    status: 200,
+                    stream: true,
+                }),
+                first_frame: None,
+                completed: false,
+            },
+        }
+    }
+
+    pub(crate) fn t0(&self) -> Instant {
+        self.body.pending.as_ref().expect("not finished").t0
+    }
+
+    /// The next data frame as text, None at the end of the body.
+    pub(crate) async fn frame(&mut self) -> Option<String> {
+        use http_body_util::BodyExt as _;
+        loop {
+            let f = self.body.frame().await?.expect("infallible body");
+            if let Ok(d) = f.into_data() {
+                return Some(String::from_utf8_lossy(&d).into_owned());
+            }
+        }
+    }
+
+    /// Drop the body - at its end, or mid-stream as a client that left - and
+    /// return the record it emitted.
+    pub(crate) fn finish(self) -> Arc<EventRecord> {
+        let RecordingForTest { ring, body } = self;
+        drop(body);
+        let (_, _, mut events) = ring.since(0, 1);
+        events.pop().expect("one record")
+    }
+}
+
+/// A stream whose SSE preamble is polled out first (header time), then each
+/// generation's engine `stats` are folded in and the body ends. Returns the
+/// record; the observation lands in `metrics`.
 #[cfg(test)]
 pub(crate) fn record_stream_for_test(
     metrics: Arc<crate::metrics::Metrics>,
@@ -672,33 +761,15 @@ pub(crate) fn record_stream_for_test(
     cached: usize,
     stats: &[paddock_engine::service::RunStats],
 ) -> Arc<EventRecord> {
-    let ring = EventRing::new();
-    let scope = EventScope::live();
-    scope.model("m1");
-    scope.usage(16, 4);
-    scope.cached(cached);
-    let mut body = RecordingBody {
-        inner: axum::body::Body::from("data: {\"role\":\"assistant\"}\n\n"),
-        pending: Some(Pending {
-            ring: ring.clone(),
-            metrics,
-            scope: scope.clone(),
-            endpoint: "/v1/chat/completions".into(),
-            origin: Default::default(),
-            request_id: "req_t".into(),
-            traceparent: None,
-            session_id: None,
-            api_key_hash: None,
-            ts_ms: 0,
-            t0,
-            status: 200,
-            stream: true,
-        }),
-        first_frame: None,
-        completed: false,
-    };
+    let mut scope = EventScope::default();
+    let mut r = RecordingForTest::new(metrics, Some(t0), |s| {
+        s.usage(16, 4);
+        s.cached(cached);
+        scope = s;
+        axum::body::Body::from("data: {\"role\":\"assistant\"}\n\n")
+    });
     let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
-    let first = http_body::Body::poll_frame(std::pin::Pin::new(&mut body), &mut cx);
+    let first = http_body::Body::poll_frame(std::pin::Pin::new(&mut r.body), &mut cx);
     assert!(
         matches!(first, std::task::Poll::Ready(Some(Ok(_)))),
         "the preamble frame"
@@ -707,11 +778,9 @@ pub(crate) fn record_stream_for_test(
         scope.phases(s);
     }
     while let std::task::Poll::Ready(Some(_)) =
-        http_body::Body::poll_frame(std::pin::Pin::new(&mut body), &mut cx)
+        http_body::Body::poll_frame(std::pin::Pin::new(&mut r.body), &mut cx)
     {}
-    drop(body);
-    let (_, _, mut events) = ring.since(0, 1);
-    events.pop().expect("one record")
+    r.finish()
 }
 
 #[cfg(test)]
@@ -938,5 +1007,106 @@ mod tests {
         assert_eq!(r.prefix_resume_pos, Some(8));
         assert_eq!(r.session_id.as_deref(), Some("s1"));
         assert_eq!(r.finish_reasons, ["stop"]);
+    }
+
+    /// A streamed chat answer through the real handler and recording body:
+    /// the SSE preamble leaves at once, the first token can arrive `DELAY`
+    /// later. Returns the test's sender and the body, its preamble read.
+    async fn chat_stream(stop: &[&str]) -> (TokenTx, RecordingForTest) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let metrics = crate::metrics::Metrics::new("i".into(), Default::default(), None);
+        let mut r = RecordingForTest::new(metrics, None, |scope| {
+            crate::chat::stream_for_test(scope, stop, vec![rx])
+        });
+        assert!(r.frame().await.expect("preamble").contains("assistant"));
+        // header time, far enough under DELAY that it cannot pass for it
+        assert!(r.t0().elapsed() < DELAY / 2, "{:?}", r.t0().elapsed());
+        tokio::time::sleep(DELAY).await;
+        (tx, r)
+    }
+
+    type TokenTx = tokio::sync::mpsc::UnboundedSender<paddock_engine::service::TokenEvent>;
+    const DELAY: Duration = Duration::from_millis(120);
+
+    fn token(id: u32) -> paddock_engine::service::TokenEvent {
+        paddock_engine::service::TokenEvent::Token { id, logprobs: None }
+    }
+
+    async fn drain(r: &mut RecordingForTest) -> Vec<String> {
+        let mut frames = Vec::new();
+        while let Some(f) = r.frame().await {
+            frames.push(f);
+        }
+        frames
+    }
+
+    #[tokio::test]
+    async fn a_stop_string_exit_ends_ttft_at_the_first_token_not_the_header() {
+        let (tx, mut r) = chat_stream(&["ll"]).await;
+        // "he" then "ll": the stop string hits and n == 1 leaves the handler
+        // without waiting for the engine's Done
+        tx.send(token(4)).unwrap();
+        tx.send(token(5)).unwrap();
+        let frames = drain(&mut r).await;
+        assert!(frames.iter().any(|f| f.contains("\"stop\"")), "{frames:?}");
+        let rec = r.finish();
+        assert!(!rec.client_disconnected);
+        assert_eq!(rec.finish_reasons, ["stop"]);
+        let ttft = rec.ttft_ms.expect("a TTFT sample");
+        assert!(ttft >= DELAY.as_millis() as u64, "header time: {ttft} ms");
+        assert!(ttft <= rec.duration_ms);
+    }
+
+    #[tokio::test]
+    async fn a_disconnect_after_the_first_token_keeps_its_arrival() {
+        let (tx, mut r) = chat_stream(&[]).await;
+        tx.send(token(4)).unwrap();
+        assert!(r.frame().await.expect("delta").contains("he"));
+        let rec = r.finish();
+        assert!(rec.client_disconnected);
+        assert!(rec.ttft_ms.is_some_and(|ms| ms >= DELAY.as_millis() as u64));
+    }
+
+    /// No token at all: the documented first-byte fallback, one sample per
+    /// request, no panic - on an engine error and on a client that left.
+    #[tokio::test]
+    async fn a_stream_without_a_token_falls_back_to_its_first_byte() {
+        let (tx, mut r) = chat_stream(&["ll"]).await;
+        tx.send(paddock_engine::service::TokenEvent::Error(
+            paddock_engine::service::EngineError::internal("boom"),
+        ))
+        .unwrap();
+        let frames = drain(&mut r).await;
+        assert!(
+            frames.iter().any(|f| f.contains("engine_error")),
+            "{frames:?}"
+        );
+        let rec = r.finish();
+        assert!(rec.ttft_ms.is_some_and(|ms| ms < DELAY.as_millis() as u64));
+
+        let (_tx, r) = chat_stream(&[]).await;
+        let rec = r.finish();
+        assert!(rec.client_disconnected);
+        assert!(rec.ttft_ms.is_some_and(|ms| ms < DELAY.as_millis() as u64));
+    }
+
+    /// The handler's receipt never displaces the engine's earlier stamp.
+    #[tokio::test]
+    async fn the_done_path_keeps_the_engine_first_token() {
+        let (tx, mut r) = chat_stream(&[]).await;
+        let t0 = r.t0();
+        tx.send(token(4)).unwrap();
+        tx.send(paddock_engine::service::TokenEvent::Done(
+            paddock_engine::service::FinishReason::Length,
+            paddock_engine::service::RunStats {
+                prefilled_at: Some(t0 + Duration::from_millis(40)),
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+        drain(&mut r).await;
+        let rec = r.finish();
+        assert_eq!(rec.finish_reasons, ["length"]);
+        assert_eq!(rec.ttft_ms, Some(40));
     }
 }
