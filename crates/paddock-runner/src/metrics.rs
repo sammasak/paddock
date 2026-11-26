@@ -1673,7 +1673,8 @@ mod tests {
         let s = m.render(Format::Classic, 0);
         let b = "gen_ai_server_time_to_first_token_seconds_bucket{gen_ai_operation_name=\"chat\",\
                  gen_ai_provider_name=\"paddock\",gen_ai_request_model=\"m1\",origin=\"live\"";
-        let at = |prompt: &str, le: &str| sample(&s, &format!("{b},prompt=\"{prompt}\",le=\"{le}\"}}"));
+        let at =
+            |prompt: &str, le: &str| sample(&s, &format!("{b},prompt=\"{prompt}\",le=\"{le}\"}}"));
         // header time would land in the first bucket
         assert_eq!((at("fresh", "0.01"), at("resumed", "0.01")), (0, 0));
         assert_eq!((at("fresh", "0.16"), at("fresh", "0.32")), (0, 1));

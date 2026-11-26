@@ -681,7 +681,10 @@ pub(crate) fn record_stream_for_test(
     };
     let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
     let first = http_body::Body::poll_frame(std::pin::Pin::new(&mut body), &mut cx);
-    assert!(matches!(first, std::task::Poll::Ready(Some(Ok(_)))), "the preamble frame");
+    assert!(
+        matches!(first, std::task::Poll::Ready(Some(Ok(_)))),
+        "the preamble frame"
+    );
     scope.phases(stats);
     while let std::task::Poll::Ready(Some(_)) =
         http_body::Body::poll_frame(std::pin::Pin::new(&mut body), &mut cx)

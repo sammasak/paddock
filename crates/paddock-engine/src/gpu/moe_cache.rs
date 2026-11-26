@@ -815,7 +815,11 @@ mod layout_tests {
     fn pinned_lookups_count_hits_and_misses_across_a_counter_wrap() {
         let mut l = SlotLedger::default();
         let hits_misses = |(rows, misses): (u64, u64)| (rows - misses, misses);
-        assert_eq!(hits_misses(l.absorb([0, 0])), (0, 0), "a seated cache reads 0, 0");
+        assert_eq!(
+            hits_misses(l.absorb([0, 0])),
+            (0, 0),
+            "a seated cache reads 0, 0"
+        );
         // one resolve of 8 routed rows, 3 of them not resident
         assert_eq!(hits_misses(l.absorb([8, 3])), (5, 3));
         // the same experts again: all hits
@@ -824,6 +828,9 @@ mod layout_tests {
         let mut l = SlotLedger::default();
         l.absorb([u32::MAX - 1, u32::MAX]);
         let (rows, misses) = l.absorb([6, 2]);
-        assert_eq!((rows, misses), (u64::from(u32::MAX) + 7, u64::from(u32::MAX) + 3));
+        assert_eq!(
+            (rows, misses),
+            (u64::from(u32::MAX) + 7, u64::from(u32::MAX) + 3)
+        );
     }
 }
