@@ -51,21 +51,24 @@ pub mod vision;
 pub(crate) use ops::*;
 pub(crate) use rotation::{Rotation, rotate_opt};
 
+const MIN_CACHE_PREFIX_DEFAULT: usize = 512;
+const RESUME_LIVE_MAX_DEFAULT: usize = 12;
+
 /// Only resume from a checkpoint at least this deep - below it the state
 /// restore + KV page copies aren't worth skipping the (cheap) short prefill.
 ///
 /// This is the knob wide-batch bimodality turns out to sit on. With the cache
 /// on, a wide cell's median throughput FALLS and its TTFT p50 rises, and a
 /// profile of a stalling window shows no GPU idle at all - so a short-prefix
-/// resume is not saving work, it is ADDING it. PADDOCK_MIN_CACHE_PREFIX
-/// overrides so the threshold can be swept against a real workload instead of
-/// guessed.
+/// resume is not saving work, it is ADDING it. `[prefix_resume]` in the
+/// config, else PADDOCK_MIN_CACHE_PREFIX, overrides so the threshold can be
+/// swept against a real workload instead of guessed.
 fn min_cache_prefix() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
-        paddock_models::dev_var!("PADDOCK_MIN_CACHE_PREFIX")
-            .ok()
-            .and_then(|v| v.parse().ok())
+        gate_threshold(
+            resume_gate_cfg().min_cache_prefix,
+            paddock_models::dev_var!("PADDOCK_MIN_CACHE_PREFIX").ok().as_deref(),
             // 512, not 32. Measured at wide batch with 128-token prompts, so
             // every hit resumed: resumes on runs slower AND bimodal, resumes
             // off via this floor runs faster and tight - while INSERTS still
@@ -74,7 +77,8 @@ fn min_cache_prefix() -> usize {
             // actually worth skipping (~34 ms at this lane's wave rate) and
             // stops it for the short ones where the restore dominates. The
             // pay-off point above 512 is not measured.
-            .unwrap_or(512)
+            MIN_CACHE_PREFIX_DEFAULT,
+        )
     })
 }
 
@@ -91,11 +95,49 @@ fn min_cache_prefix() -> usize {
 fn resume_live_max() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
-        paddock_models::dev_var!("PADDOCK_RESUME_LIVE_MAX")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(12)
+        gate_threshold(
+            resume_gate_cfg().resume_live_max,
+            paddock_models::dev_var!("PADDOCK_RESUME_LIVE_MAX").ok().as_deref(),
+            RESUME_LIVE_MAX_DEFAULT,
+        )
     })
+}
+
+/// `[prefix_resume]` from the runner config: the two resume-gate thresholds
+/// a deployment can pin without an env var. `None` = the env var, else the
+/// measured default.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ResumeGateCfg {
+    pub min_cache_prefix: Option<usize>,
+    pub resume_live_max: Option<usize>,
+}
+
+static RESUME_GATE: std::sync::OnceLock<ResumeGateCfg> = std::sync::OnceLock::new();
+
+/// Arm the gate once before any model loads (the same shape as
+/// `kv_plan::set_prefill_chunk_rows`): both thresholds are read once, at
+/// the first resume.
+pub fn set_resume_gate(cfg: ResumeGateCfg) {
+    let _ = RESUME_GATE.set(cfg);
+}
+
+fn resume_gate_cfg() -> ResumeGateCfg {
+    RESUME_GATE.get().copied().unwrap_or_default()
+}
+
+/// Config value if set, else a parseable env value, else `default`.
+fn gate_threshold(cfg: Option<usize>, env: Option<&str>, default: usize) -> usize {
+    cfg.or_else(|| env.and_then(|v| v.parse().ok()))
+        .unwrap_or(default)
+}
+
+/// Whether a checkpoint at `pos` is worth resuming on a serve with
+/// `slots_cfg` configured slots: never below 32, and otherwise when the
+/// skipped prefill is big (`pos >= min_prefix`) or the serve is narrow
+/// enough (`slots_cfg <= live_max`) that the per-slot restore cost is not
+/// paid many times in one tick. See [`resume_live_max`].
+fn resume_worth_it(pos: usize, slots_cfg: usize, min_prefix: usize, live_max: usize) -> bool {
+    pos >= 32 && (pos >= min_prefix || slots_cfg <= live_max)
 }
 
 /// Don't bother snapshotting checkpoints for prompts shorter than this.
@@ -3702,5 +3744,74 @@ mod mm_layout_tests {
         assert!(build_mm_layout(&one, &[]).is_err()); // chunk but no grid
         assert!(build_mm_layout(&one, &[(2, 2), (2, 2)]).is_err()); // too many grids
         assert!(build_mm_layout(&[MmChunk::Text(vec![1, 2])], &[]).is_err()); // no image
+    }
+}
+
+#[cfg(test)]
+mod resume_gate_tests {
+    //! CPU pin of the multi-turn resume gate on its shipped defaults.
+    use super::{
+        MIN_CACHE_PREFIX_DEFAULT, RESUME_LIVE_MAX_DEFAULT, gate_threshold, resume_worth_it,
+    };
+
+    fn gate(pos: usize, slots: usize) -> bool {
+        resume_worth_it(pos, slots, MIN_CACHE_PREFIX_DEFAULT, RESUME_LIVE_MAX_DEFAULT)
+    }
+
+    #[test]
+    fn defaults_are_512_and_12() {
+        assert_eq!(MIN_CACHE_PREFIX_DEFAULT, 512);
+        assert_eq!(RESUME_LIVE_MAX_DEFAULT, 12);
+    }
+
+    #[test]
+    fn a_narrow_serve_resumes_every_position_from_32() {
+        for slots in [1, 8, 11, 12] {
+            for pos in [32, 33, 48, 256, 511, 512, 513, 4096] {
+                assert!(gate(pos, slots), "slots {slots} pos {pos}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_wide_serve_resumes_only_from_512() {
+        for slots in [13, 16, 32, 64] {
+            for pos in [32, 48, 256, 511] {
+                assert!(!gate(pos, slots), "slots {slots} pos {pos}");
+            }
+            for pos in [512, 513, 4096] {
+                assert!(gate(pos, slots), "slots {slots} pos {pos}");
+            }
+        }
+    }
+
+    #[test]
+    fn below_32_never_resumes() {
+        for slots in [1, 12, 13, 32] {
+            for pos in [0, 1, 16, 31] {
+                assert!(!gate(pos, slots), "slots {slots} pos {pos}");
+            }
+        }
+        // not even when the thresholds would admit it
+        assert!(!resume_worth_it(31, 1, 0, usize::MAX));
+    }
+
+    #[test]
+    fn non_default_thresholds_move_both_boundaries() {
+        // min 1024, live max 4: slots 4 resumes from 32, slots 5 from 1024
+        assert!(resume_worth_it(32, 4, 1024, 4));
+        assert!(!resume_worth_it(1023, 5, 1024, 4));
+        assert!(resume_worth_it(1024, 5, 1024, 4));
+        assert!(!resume_worth_it(512, 13, 1024, 12));
+    }
+
+    #[test]
+    fn config_beats_env_beats_default() {
+        assert_eq!(gate_threshold(Some(256), Some("1024"), 512), 256);
+        assert_eq!(gate_threshold(None, Some("1024"), 512), 1024);
+        assert_eq!(gate_threshold(None, None, 512), 512);
+        // an unparseable env value falls through to the default, as before
+        assert_eq!(gate_threshold(None, Some("lots"), 512), 512);
+        assert_eq!(gate_threshold(Some(8), Some("lots"), 12), 8);
     }
 }

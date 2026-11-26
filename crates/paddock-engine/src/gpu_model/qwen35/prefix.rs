@@ -329,9 +329,13 @@ impl GpuQwen35 {
                 // fixed for the serve and is exactly "how many could resume
                 // in one tick".
                 let slots_cfg = self.batch.as_ref().expect("batch").tables.len();
-                let worth_it =
-                    pos >= super::min_cache_prefix() || slots_cfg <= super::resume_live_max();
-                if worth_it && pos >= 32 && pos < t_len {
+                let worth_it = super::resume_worth_it(
+                    pos,
+                    slots_cfg,
+                    super::min_cache_prefix(),
+                    super::resume_live_max(),
+                );
+                if worth_it && pos < t_len {
                     {
                         let bs = self.batch.as_mut().expect("batch");
                         let pool = bs.pool.as_mut().expect("prefix requires the pool");

@@ -54,6 +54,34 @@ pub struct MoeOffload {
     pub dense_host: Vec<String>,
 }
 
+/// `[prefix_resume]` - the qwen35 multi-turn resume gate. A cached prefix
+/// resumes when its checkpoint is at least `min_cache_prefix` tokens deep
+/// (default 512) or the serve has at most `resume_live_max` slots (default
+/// 12). `min_cache_prefix` is also the floor for multimodal resumes, wave
+/// publish cuts and the shared-head split, none of which take the narrow-serve
+/// exception. Unset = `PADDOCK_MIN_CACHE_PREFIX` / `PADDOCK_RESUME_LIVE_MAX`
+/// (dev builds only), else the default.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PrefixResume {
+    pub min_cache_prefix: Option<usize>,
+    pub resume_live_max: Option<usize>,
+}
+
+impl PrefixResume {
+    /// Refuse a `min_cache_prefix` below the text gate's 32-token floor:
+    /// the other paths it floors have no floor of their own.
+    pub fn checked(self) -> Result<Self, String> {
+        match self.min_cache_prefix {
+            Some(n) if n < 32 => Err(format!(
+                "[prefix_resume] min_cache_prefix = {n} is below 32 (no resume is taken \
+                 below 32 tokens)"
+            )),
+            _ => Ok(self),
+        }
+    }
+}
+
 /// `[moe_offload]` parsed against the rest of the config by
 /// [`Config::expert_offload`]: each backing carries only the keys legal
 /// for it, so the runner arms what it is handed and checks nothing.
@@ -198,6 +226,8 @@ pub struct Config {
     pub residency: crate::residency::Config,
     /// See [`MoeOffload`].
     pub moe_offload: MoeOffload,
+    /// See [`PrefixResume`].
+    pub prefix_resume: PrefixResume,
     /// Override the KV plan's graph/scratch reserve, in MiB. gpt-oss charges
     /// a fixed 3 GiB `graph/prefill scratch` by default (sized for 16-48 GB
     /// cards; on 8 GB cards it alone exhausts the grant and starves both the
@@ -454,6 +484,7 @@ impl Default for Config {
             kv_offload: KvOffload::default(),
             residency: crate::residency::Config::default(),
             moe_offload: MoeOffload::default(),
+            prefix_resume: PrefixResume::default(),
             graph_scratch_mib: None,
             prefill_chunk_rows: None,
             max_tokens: None,
@@ -1064,6 +1095,34 @@ mod tests {
         assert!(c.prefill_chunk_rows.is_none());
         let c: Config = toml::from_str("prefill_chunk_rows = 1024").expect("parse");
         assert_eq!(c.prefill_chunk_rows, Some(1024));
+    }
+
+    #[test]
+    fn prefix_resume_parses_and_defaults_to_unset() {
+        let c: Config = toml::from_str("").expect("parse");
+        assert!(c.prefix_resume.min_cache_prefix.is_none());
+        assert!(c.prefix_resume.resume_live_max.is_none());
+        let c: Config =
+            toml::from_str("[prefix_resume]\nmin_cache_prefix = 1024\nresume_live_max = 16")
+                .expect("parse");
+        assert_eq!(c.prefix_resume.min_cache_prefix, Some(1024));
+        assert_eq!(c.prefix_resume.resume_live_max, Some(16));
+        let c: Config = toml::from_str("[prefix_resume]\nresume_live_max = 4").expect("parse");
+        assert!(c.prefix_resume.min_cache_prefix.is_none());
+        assert_eq!(c.prefix_resume.resume_live_max, Some(4));
+        toml::from_str::<Config>("[prefix_resume]\nmin_prefix = 1").expect_err("unknown key");
+    }
+
+    #[test]
+    fn prefix_resume_below_32_is_refused() {
+        let pr = |n| PrefixResume {
+            min_cache_prefix: Some(n),
+            resume_live_max: None,
+        };
+        assert!(pr(31).checked().is_err());
+        assert!(pr(0).checked().is_err());
+        assert!(pr(32).checked().is_ok());
+        assert!(PrefixResume::default().checked().is_ok());
     }
 
     #[test]
