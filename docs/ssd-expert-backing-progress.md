@@ -1,6 +1,5 @@
 # SSD expert backing: progress on asus-b460m
 
-NEED ROOT: `sudo nvidia-smi -pl 130` (for the 130 W comparison of rung 1b; I measure, then `sudo nvidia-smi -pl 270` to restore today's limit). Until it is run I go on with the bigger rungs.
 
 
 Host: i9-10900K, 32 GiB RAM, RTX 3070 8 GiB (46 SMs, sm_86, PCIe 3.0 x16), Kingston SA2000 NVMe.

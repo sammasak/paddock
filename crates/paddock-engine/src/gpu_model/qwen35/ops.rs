@@ -2089,6 +2089,12 @@ pub(super) fn moe_ffn(
     // branch's use (sorted engages only past sorted_min >= 128 rows).
     if batch > 64 {
         prefill_quant(exec, pxq, pxs, yq, xn, embd, batch)?;
+        // a k-quant seat's dp4a GEMM reads the row-major staging, which the
+        // >64-row prefill_quant leaves stale (Qwen3.5-122B UD: Q5_K shared
+        // experts decoded every prompt past 64 tokens to gibberish)
+        if w.shexp_gate.kq().is_some() || w.shexp_up.kq().is_some() {
+            exec.quantize_q8(xn, pxq, pxs, batch * embd)?;
+        }
         shexp_mm_wide(
             exec,
             &w.shexp_gate,
@@ -2117,7 +2123,8 @@ pub(super) fn moe_ffn(
                 prefill_mm(exec, q, pxq, pxs, yq, skfix, shexp_gate, shexp_out, batch)?
             }
             QuantW::Kq(_) => {
-                prefill_quant(exec, pxq, pxs, yq, shexp_gate, dims.shexp_ff, batch)?;
+                // the dp4a GEMM reads only the row-major staging
+                exec.quantize_q8(shexp_gate, pxq, pxs, batch * dims.shexp_ff)?;
                 shexp_mm_wide(
                     exec,
                     &w.shexp_down,
