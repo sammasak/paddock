@@ -373,6 +373,23 @@ impl Demand {
         Err(self.wont_fit(grant))
     }
 
+    /// The same shape with the mandatory checkpoint pages made evictable and
+    /// the expert slot cache taking the whole surplus above full context, for
+    /// a caller whose [`Self::plan`] refused: `None` when there is no cache
+    /// floor or no checkpoint pages to trade. A lost checkpoint costs a
+    /// re-prefill of that turn; the cache it pays for is every decoded token
+    /// (35B-A3B at 2048 x 16 on 8 GB: 0.98 GiB of checkpoints refused the
+    /// 8-slot floor; 14 slots decode 25.4 tok/s, 16 slots 26.6). The pages
+    /// still ride the pool's unused blocks, as the evictable want always did.
+    pub fn ckpts_yield_to_cache(&self) -> Option<Demand> {
+        (self.expert_cache_floor > 0 && self.ckpt_blocks > 0).then(|| Demand {
+            ckpt_blocks: 0,
+            retention_blocks: self.retention_blocks + self.ckpt_blocks,
+            expert_cache_share: 1.0,
+            ..self.clone()
+        })
+    }
+
     /// Plan, or - when nothing fits - the smallest runnable shape instead of a
     /// refusal: one slot at the progress floor.
     ///
@@ -620,6 +637,63 @@ mod tests {
             reserves: vec![Reserve::new("slack", GIB), Reserve::new("scratch", GIB)],
             ..Default::default()
         }
+    }
+
+    /// Qwen3.6-35B-A3B, experts pinned in host RAM, max_ctx 2048 x max_batch
+    /// 16 on an 8 GB RTX 3070 (vram_budget 7500), figures from its refused
+    /// start: the 16 live turns' checkpoints (0.98 GiB) crowd out the 8-slot
+    /// cache floor, so the plan refuses; with them evictable it keeps full
+    /// context and the cache seats at least the 16 slots that decode 26.6
+    /// tok/s.
+    #[test]
+    fn a_35b_a3b_at_2048_x_16_trades_checkpoints_for_slots() {
+        let g = |x: f64| (x * GIB as f64) as u64;
+        let mib = |x: u64| x << 20;
+        let price: u64 = 80_740_352; // one slot across the 40 MoE layers
+        let margin = mib(64);
+        let d = Demand {
+            family: "qwen35",
+            max_ctx: 2048,
+            slots: 16,
+            blocks_per_slot: 128,
+            block_bytes: g(1.676483154296875) / 10987,
+            per_slot_bytes: g(0.9962539672851563) / 16,
+            ckpt_blocks: 16 * 402,
+            retention_blocks: 80 * 402,
+            floor_blocks_per_slot: 128,
+            reserves: vec![
+                Reserve::new("conv staging", g(0.50)),
+                Reserve::new("checkpoint staging", g(0.18)),
+                Reserve::new("prefill wave buffers", g(0.09)),
+                Reserve::new("graph pools + headroom", g(0.75)),
+            ],
+            when_short: WhenShort::Refuse,
+            expert_cache_floor: 8 * price + margin,
+            expert_cache_share: 0.5,
+            expert_cache_max: 256 * price + margin,
+            ..Default::default()
+        };
+        let grant = g(4.201030107215047);
+        let e = d
+            .plan(grant)
+            .expect_err("checkpoints + context + floor exceed the grant");
+        assert!(e.message.contains("resume checkpoints"), "{}", e.message);
+        let y = d
+            .ckpts_yield_to_cache()
+            .expect("a cache floor and checkpoints to trade");
+        let p = y.plan(grant).expect("the traded shape plans");
+        assert_eq!(p.slots, 16);
+        assert_eq!(p.pool_blocks, 16 * 128, "full context, nothing more");
+        assert!(!p.shared);
+        let slots = (p.expert_cache_bytes - margin) / price;
+        assert!(slots >= 16, "{slots} slots");
+        assert!(p.pool_bytes + p.slot_bytes + y.fixed() + p.expert_cache_bytes <= grant);
+        // no cache floor, nothing to trade: the family's refusal stands
+        let plain = Demand {
+            expert_cache_floor: 0,
+            ..d.clone()
+        };
+        assert!(plain.ckpts_yield_to_cache().is_none());
     }
 
     /// The fallback must not walk past the grant.

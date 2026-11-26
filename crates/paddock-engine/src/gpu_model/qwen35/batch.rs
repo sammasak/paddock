@@ -324,8 +324,11 @@ impl GpuQwen35 {
         // max_batch 16: 0 slots, 15.5 tok/s; 16 slots, 26.6). Half of the
         // pool's optional surplus (prefix retention) goes to it too, up to
         // every expert resident or the operator's vram_gb. A pinned pool or
-        // slot count keeps the old rule: the cache takes what is left.
-        const MOE_CACHE_MARGIN: u64 = 256 << 20;
+        // slot count keeps the old rule: the cache takes what is left. The
+        // margin is allocator slack, measured small (a planned 8-slot cache on
+        // the 35B-A3B: ledger 40 MiB over plan; the backbone's 835 allocations
+        // 0.08 GB); 256 MiB cost two slots, 25.4 instead of 26.6 tok/s.
+        const MOE_CACHE_MARGIN: u64 = 64 << 20;
         let (expert_cache_floor, expert_cache_max) = match self.moe_cache_slot_price() {
             Some((price, experts))
                 if explicit_pool_pin.is_none()
@@ -394,9 +397,25 @@ impl GpuQwen35 {
             expert_cache_max,
             ..Default::default()
         };
-        let plan = match demand.plan(grant) {
-            Ok(p) => p,
-            Err(e) => return Ok(Err(e.message)),
+        // A shape refused only because the live turns' checkpoint pages crowd
+        // out the slot cache floor serves with those pages evictable and the
+        // cache, not retention, taking the surplus (kv_plan::ckpts_yield_to_cache).
+        let (demand, plan) = match demand.plan(grant) {
+            Ok(p) => (demand, p),
+            Err(e) => match demand.ckpts_yield_to_cache() {
+                Some(d) => match d.plan(grant) {
+                    Ok(p) => {
+                        tracing::info!(
+                            ckpt_pages = demand.ckpt_blocks,
+                            "qwen35: the live turns' checkpoints ride evictable pages so the \
+                             expert slot cache keeps its floor and the surplus"
+                        );
+                        (d, p)
+                    }
+                    Err(_) => return Ok(Err(e.message)),
+                },
+                None => return Ok(Err(e.message)),
+            },
         };
         plan.report(&demand, grant);
         self.prefill_chunk_rows = chunk;
@@ -541,8 +560,8 @@ impl GpuQwen35 {
                 pr.set_state_paged(max_ckpts, pages_per_ckpt);
                 tracing::info!(
                     pages_per_checkpoint = pages_per_ckpt,
-                    guaranteed = ckpt_blocks / pages_per_ckpt,
-                    wanted = (ckpt_blocks + ckpt_retention) / pages_per_ckpt,
+                    guaranteed = demand.ckpt_blocks / pages_per_ckpt,
+                    wanted = (demand.ckpt_blocks + demand.retention_blocks) / pages_per_ckpt,
                     "qwen35 paged zero-copy prefix cache active - checkpoints in pool pages"
                 );
                 Some(layout)
@@ -855,7 +874,14 @@ impl GpuQwen35 {
         // adds only what that reserve names - graphs, the decode arena, the
         // lazily seated spec state (its own reserve) - so a later reading of
         // the ledger against `expected` is the same check under load.
-        let expected = ledger_at_plan + plan_reserved;
+        // a seated slot cache is charged too: its term is planned VRAM like the
+        // pool (without a cache that term is only the grant's unspent rest)
+        let cache_term = if self.moe_cache_active() {
+            moe_cache_budget
+        } else {
+            0
+        };
+        let expected = ledger_at_plan + plan_reserved + cache_term;
         let actual = self.exec.process_mem_used().unwrap_or(0);
         tracing::info!(
             expected_gib = expected as f64 / (1u64 << 30) as f64,
