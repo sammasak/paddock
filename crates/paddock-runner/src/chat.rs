@@ -57,16 +57,73 @@ fn err(status: StatusCode, kind: &str, msg: impl Into<String>) -> Response {
 /// `error.type`, and `error.code`. Shared by every OpenAI-shape surface
 /// (chat, completions, responses).
 pub(crate) fn engine_err(e: &EngineError) -> Response {
+    let (status, body) = openai_body(e);
+    (status, Json(body)).into_response()
+}
+
+fn openai_body(e: &EngineError) -> (StatusCode, ErrorBody) {
     let (status, kind) = match e.class {
         ErrorClass::InvalidRequest => (StatusCode::BAD_REQUEST, "invalid_request_error"),
         ErrorClass::Overloaded => (StatusCode::SERVICE_UNAVAILABLE, "server_error"),
         ErrorClass::Internal => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error"),
     };
-    let mut body = ErrorBody::new(kind, &e.message);
+    let mut body = ErrorBody::new(kind, openai_message(e));
     if let Some(code) = e.code {
         body = body.with_code(code);
     }
+    (status, body)
+}
+
+/// A context overflow opens with OpenAI's own sentence, numbers included:
+/// Pi and other OpenAI clients compact their history on it (or on the
+/// `context_length_exceeded` code). The engine's levers (pages, detail,
+/// --max-ctx) follow in parentheses.
+fn openai_message(e: &EngineError) -> String {
+    match e.overflow {
+        Some((got, max)) => format!(
+            "This model's maximum context length is {max} tokens. However, you requested \
+             {got} tokens ({}).",
+            e.message
+        ),
+        None => e.message.clone(),
+    }
+}
+
+/// The over-window refusal for chat completions and completions: the
+/// OpenAI envelope with `param: "messages"`, as OpenAI's chat refusal
+/// carries. Completions takes the same param on purpose, so one client-side
+/// match covers both.
+pub(crate) fn overflow_err(e: &EngineError) -> Response {
+    let (status, mut body) = openai_body(e);
+    body.error.param = Some("messages".to_owned());
     (status, Json(body)).into_response()
+}
+
+/// Refuse an over-window prompt at the edge, before any prefill or queue
+/// admission: one WARN carrying sizes only (never prompt text), one count
+/// under `paddock_request_refused_total{reason="context_length"}`, then the
+/// surface's own 400 envelope.
+pub(crate) fn refuse_overflow(
+    route: &'static str,
+    e: &EngineError,
+    envelope: fn(&EngineError) -> Response,
+) -> Response {
+    note_overflow(route, e);
+    envelope(e)
+}
+
+/// The WARN and count of [`refuse_overflow`], alone: for the streaming
+/// messages agent loop, whose refusal is an SSE `error` event on an open 200.
+pub(crate) fn note_overflow(route: &'static str, e: &EngineError) {
+    if let Some((got, max)) = e.overflow {
+        tracing::warn!(
+            route,
+            prompt_tokens = got,
+            max_ctx = max,
+            "prompt exceeds the context window; refused with context_length_exceeded"
+        );
+    }
+    crate::metrics::context_length_refused();
 }
 
 /// Rows the engine actually admits for a prompt: the pad-free text stream
@@ -128,7 +185,19 @@ pub(crate) fn context_gate(
         return None;
     }
     let (total, image_rows, images) = admitted_rows(model, text_len, mm_chunks);
-    if total <= max_ctx {
+    overflow(total, image_rows, images, max_ctx)
+}
+
+/// [`context_gate`]'s verdict on already-priced rows: a prompt of exactly
+/// `max_ctx` rows fits. The reply budget is not added - the engine clamps
+/// `max_tokens` to the room left, so a full prompt still gets an answer.
+pub(crate) fn overflow(
+    total: usize,
+    image_rows: usize,
+    images: usize,
+    max_ctx: usize,
+) -> Option<EngineError> {
+    if max_ctx == 0 || total <= max_ctx {
         return None;
     }
     Some(if image_rows > 0 {
@@ -2328,7 +2397,7 @@ pub async fn handle(
         prepared.mm_chunks.as_deref(),
         state.max_ctx,
     ) {
-        return engine_err(&e);
+        return refuse_overflow("chat", &e, overflow_err);
     }
 
     // n choices = n engine sequences; per-choice seed offsets keep sampled
@@ -2925,9 +2994,68 @@ pub(crate) fn stream_for_test(
     stream_response(meta, rxs).into_body()
 }
 
+/// Status and JSON body of an edge refusal, for each surface's tests.
+#[cfg(test)]
+pub(crate) async fn refusal_json(r: Response) -> (StatusCode, serde_json::Value) {
+    use http_body_util::BodyExt;
+    let status = r.status();
+    let bytes = r.into_body().collect().await.expect("body").to_bytes();
+    (status, serde_json::from_slice(&bytes).expect("json body"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One token past the window (Pi's nine-file read on a 16384 window) is
+    /// a 400 in OpenAI's envelope and words, with both numbers, counted once.
+    #[tokio::test]
+    async fn an_over_window_chat_prompt_is_openais_context_length_400() {
+        let e = overflow(16_385, 0, 0, 16_384).expect("one past the window");
+        let before = crate::metrics::context_length_refusals();
+        let (status, v) = refusal_json(refuse_overflow("chat", &e, overflow_err)).await;
+        assert!(crate::metrics::context_length_refusals() > before);
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let err = &v["error"];
+        assert_eq!(err["type"], "invalid_request_error");
+        assert_eq!(err["code"], "context_length_exceeded");
+        assert_eq!(err["param"], "messages");
+        let msg = err["message"].as_str().expect("message");
+        assert!(
+            msg.starts_with(
+                "This model's maximum context length is 16384 tokens. However, you requested \
+                 16385 tokens"
+            ),
+            "{msg}"
+        );
+    }
+
+    /// The window is inclusive and the reply budget is not added to it: a
+    /// full window, a window minus a reply budget and an empty prompt all
+    /// pass, and an unset window (0) gates nothing.
+    #[test]
+    fn prompts_inside_the_window_pass_the_edge_check() {
+        assert!(overflow(16_384, 0, 0, 16_384).is_none());
+        assert!(overflow(16_384 - 4_096, 0, 0, 16_384).is_none());
+        assert!(overflow(0, 0, 0, 16_384).is_none());
+        assert!(overflow(100_000, 0, 0, 0).is_none());
+    }
+
+    /// Image rows carrying the overflow keep the engine's page and detail
+    /// levers after OpenAI's sentence.
+    #[test]
+    fn an_image_overflow_keeps_its_levers_after_openais_words() {
+        let e = overflow(20_000, 12_000, 3, 16_384).expect("over");
+        let msg = openai_message(&e);
+        assert!(
+            msg.starts_with("This model's maximum context length is 16384 tokens."),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("20000 tokens") && msg.contains("`pages`"),
+            "{msg}"
+        );
+    }
 
     /// A family whose tool-call syntax has no grammar refuses honestly, and the
     /// refusal says which reason applies - a roadmap item, or a family with no

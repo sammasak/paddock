@@ -1583,7 +1583,7 @@ pub async fn handle(
         prepared.mm_chunks.as_deref(),
         state.max_ctx,
     ) {
-        return engine_err(&e);
+        return crate::chat::refuse_overflow("messages", &e, engine_err);
     }
     let ctx = Ctx {
         id: format!("msg_{}", uuid::Uuid::new_v4().simple()),
@@ -2727,7 +2727,7 @@ async fn run_mcp_agent(
             prepared.mm_chunks.as_deref(),
             state.max_ctx,
         ) {
-            return engine_err(&e);
+            return crate::chat::refuse_overflow("messages", &e, engine_err);
         }
         if round == 0 {
             prompt_len = prepared.prompt_ids.len();
@@ -3250,6 +3250,7 @@ fn stream_mcp_agent(
                 prepared.mm_chunks.as_deref(),
                 state.max_ctx,
             ) {
+                crate::chat::note_overflow("messages", &ge);
                 yield ev("error", json!({"type":"error","error":{"type":anthropic_kind(ge.class),"message":anthropic_message(&ge)}}));
                 return;
             }

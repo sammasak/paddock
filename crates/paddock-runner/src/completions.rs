@@ -15,7 +15,7 @@ use axum::response::{IntoResponse, Json, Response};
 use paddock_api::ErrorBody;
 use paddock_api::completions::{CompletionChoice, CompletionRequest, CompletionResponse, Usage};
 use paddock_engine::sampler::SamplingParams;
-use paddock_engine::service::{EngineError, FinishReason, GenRequest, TokenEvent, TokenLogprobs};
+use paddock_engine::service::{FinishReason, GenRequest, TokenEvent, TokenLogprobs};
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
 use crate::routes::AppState;
@@ -238,11 +238,8 @@ pub async fn handle(
     scope.tokenized(t_prep.elapsed());
     // Over-window prompt: clean 400 at the edge for stream and non-stream alike
     // (mirrors the engine's admit check).
-    if state.max_ctx > 0 && prepared.prompt_ids.len() > state.max_ctx {
-        return crate::chat::engine_err(&EngineError::context_overflow(
-            prepared.prompt_ids.len(),
-            state.max_ctx,
-        ));
+    if let Some(e) = crate::chat::overflow(prepared.prompt_ids.len(), 0, 0, state.max_ctx) {
+        return crate::chat::refuse_overflow("completions", &e, crate::chat::overflow_err);
     }
 
     let meta = ResponseMeta {
@@ -713,4 +710,31 @@ fn chunk_json(
         "choices": [choice],
     })
     .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// /v1/completions refuses one token past the window with the same
+    /// OpenAI 400 as chat; a window minus a reply budget, a full window and
+    /// an empty prompt pass.
+    #[tokio::test]
+    async fn an_over_window_completion_prompt_is_openais_context_length_400() {
+        let e = crate::chat::overflow(4_097, 0, 0, 4_096).expect("one past the window");
+        let r = crate::chat::refuse_overflow("completions", &e, crate::chat::overflow_err);
+        let (status, v) = crate::chat::refusal_json(r).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        assert_eq!(v["error"]["code"], "context_length_exceeded");
+        assert_eq!(v["error"]["param"], "messages");
+        let msg = v["error"]["message"].as_str().expect("message");
+        assert!(
+            msg.contains("is 4096 tokens") && msg.contains("requested 4097 tokens"),
+            "{msg}"
+        );
+        for fits in [4_096 - 256, 4_096, 0] {
+            assert!(crate::chat::overflow(fits, 0, 0, 4_096).is_none(), "{fits}");
+        }
+    }
 }
