@@ -323,17 +323,22 @@ impl GpuQwen35 {
         // refuses instead of serving every expert zero-copy (a 35B-A3B at
         // max_batch 16: 0 slots, 15.5 tok/s; 16 slots, 26.6). Half of the
         // pool's optional surplus (prefix retention) goes to it too, up to
-        // every expert resident or the operator's vram_gb. A pinned pool
-        // keeps the old rule: the cache takes what the pin leaves.
+        // every expert resident or the operator's vram_gb. A pinned pool or
+        // slot count keeps the old rule: the cache takes what is left.
         const MOE_CACHE_MARGIN: u64 = 256 << 20;
         let (expert_cache_floor, expert_cache_max) = match self.moe_cache_slot_price() {
-            Some((price, experts)) if explicit_pool_pin.is_none() && !self.moe_cache_active() => {
-                let floor = super::MOE_CACHE_MIN_SLOTS as u64 * price + MOE_CACHE_MARGIN;
+            Some((price, experts))
+                if explicit_pool_pin.is_none()
+                    && crate::gpu::moe_cache_slots_pin().is_none()
+                    && !self.moe_cache_active() =>
+            {
+                let smallest = super::MOE_CACHE_MIN_SLOTS as u64 * price;
+                let floor = smallest + MOE_CACHE_MARGIN;
                 let all = experts as u64 * price;
                 match crate::gpu::moe_offload().vram_bytes {
-                    // a vram_gb below the floor reserves nothing (the
+                    // a vram_gb below the smallest cache reserves nothing (the
                     // refusal's way out) and seats no cache
-                    Some(cap) if cap < floor => (0, 0),
+                    Some(cap) if cap < smallest => (0, 0),
                     cap => (
                         floor,
                         (cap.map_or(all, |c| c.min(all)) + MOE_CACHE_MARGIN).max(floor),

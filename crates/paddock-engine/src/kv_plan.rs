@@ -29,6 +29,9 @@
 //!                                        clamped to what the device has free
 //!
 //!   grant - Σ reserves - slots × per_slot_bytes  =  bytes for the KV pool
+//!                                                   and the expert slot cache
+//!                                                   (its floor first, then its
+//!                                                   share of the surplus)
 //!
 //!   pool_blocks = that / block_bytes, clamped to
 //!       ceiling  slots × blocks_per_slot + retention   (nothing above is
@@ -237,7 +240,8 @@ pub struct Plan {
     pub shared: bool,
     /// Bytes left for the expert-offload slot cache: the floor, its share,
     /// and whatever the pool's ceiling left over, capped at
-    /// `Demand::expert_cache_max`.
+    /// `Demand::expert_cache_max`. For a family with no cache term this is
+    /// just the grant's unspent remainder.
     pub expert_cache_bytes: u64,
 }
 
@@ -344,20 +348,17 @@ impl Demand {
             if self.when_short == WhenShort::Refuse && blocks < full {
                 continue;
             }
-            // The slot cache's share comes out of the bytes above what this
-            // width needs, never below it; leftovers past the pool's ceiling
-            // count toward it before the pool gives up a block.
-            let need = match self.when_short {
-                WhenShort::Refuse => full,
-                WhenShort::Narrow => self.floor(slots),
-            };
+            // The slot cache's share comes out of the bytes above full
+            // context (optional retention), never out of context; leftovers
+            // past the pool's ceiling count toward it before the pool gives
+            // up a block. `affordable` returned Some, so kv >= floor + blocks.
+            let need = full.min(blocks);
             let per_block = self.block_bytes.max(1);
             let kv = self.kv_bytes(grant, slots).unwrap_or(0);
             let surplus = kv - self.expert_cache_floor - need * per_block;
             let share = (surplus as f64 * self.expert_cache_share.clamp(0.0, 1.0)) as u64;
-            let target = (self.expert_cache_floor + share)
-                .min(self.expert_cache_max)
-                .max(self.expert_cache_floor);
+            let max = self.expert_cache_max.max(self.expert_cache_floor);
+            let target = (self.expert_cache_floor + share).min(max);
             let blocks = blocks.min((kv - target) / per_block);
             return Ok(Plan {
                 slots,
@@ -366,9 +367,7 @@ impl Demand {
                 slot_bytes: slots as u64 * self.per_slot_bytes,
                 token_capacity: blocks as usize * BLOCK_TOKENS,
                 shared: blocks < full,
-                expert_cache_bytes: kv
-                    .saturating_sub(blocks * self.block_bytes)
-                    .min(self.expert_cache_max),
+                expert_cache_bytes: kv.saturating_sub(blocks * self.block_bytes).min(max),
             });
         }
         Err(self.wont_fit(grant))
@@ -480,10 +479,11 @@ impl Demand {
             ..self.clone()
         };
         let floor_note = if self.expert_cache_floor > 0 && without_floor.plan(grant).is_ok() {
-            fixes.push(format!(
-                "set [moe_offload] vram_gb below {:.2} to serve the experts zero-copy (slow)",
-                gib(self.expert_cache_floor)
-            ));
+            fixes.push(
+                "lower [moe_offload] vram_gb below the smallest cache to serve the experts \
+                 zero-copy (slow)"
+                    .into(),
+            );
             format!(
                 " beside the {:.2} GiB expert slot cache floor",
                 gib(self.expert_cache_floor)
@@ -979,6 +979,26 @@ mod tests {
         assert_eq!(p.expert_cache_bytes, 38 * GIB - p.pool_bytes);
     }
 
+    /// Under Narrow the share takes only the retention above full context,
+    /// not the context a seated slot would otherwise keep.
+    #[test]
+    fn a_narrow_share_leaves_full_context_alone() {
+        let d = Demand {
+            slots: 1,
+            expert_cache_floor: GIB,
+            expert_cache_share: 1.0,
+            ..pooled()
+        };
+        // 2 reserves + 1 floor + 2 GiB of context (512 blocks), no retention
+        let p = d.plan(5 * GIB).unwrap();
+        assert_eq!(p.pool_blocks, 512);
+        assert!(!p.shared);
+        // short of full context, the share takes nothing from the pool
+        let p = d.plan(4 * GIB).unwrap();
+        assert_eq!(p.pool_blocks, 256);
+        assert_eq!(p.expert_cache_bytes, GIB);
+    }
+
     /// A shape that fits without the slot cache floor but not with it refuses,
     /// and the refusal says the floor is the term that did not fit.
     #[test]
@@ -995,7 +1015,7 @@ mod tests {
             head.contains("beside the 1.00 GiB expert slot cache floor"),
             "{e}"
         );
-        assert!(head.contains("[moe_offload] vram_gb below 1.00"), "{e}");
+        assert!(head.contains("[moe_offload] vram_gb below"), "{e}");
         assert!(e.contains("expert slot cache floor 1.00"), "{e}");
         // a grant short with or without the floor does not blame it
         let e = d.plan(6 * GIB).unwrap_err().message;
