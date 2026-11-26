@@ -219,7 +219,10 @@ const TAIL_SLACK: usize = 8;
 /// How much of `prompt` a resume at its cut `cut` (< `prompt.len()`) must
 /// repeat to continue it: all but the re-rendered tail, and always at least
 /// one token past the cut - a resume there matches the cut's own prefix by
-/// construction, which tells nothing.
+/// construction, which tells nothing. A cut a token or two before the
+/// prompt end is ambiguous: that token may be one the next turn re-renders,
+/// and then the writer's own next turn counts as a shared hit - the safe
+/// direction, and one the cap's aging bounds.
 fn reach_of(prompt: &[u32], cut: usize) -> usize {
     prompt
         .len()
