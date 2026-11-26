@@ -1574,26 +1574,28 @@ impl GpuQwen35 {
         self.exec.trim_mem_pool();
     }
 
-    /// Cache counters summed over the layers: `(rows resolved, misses)` since
-    /// load; `None` without a cache. Syncs the stream - for gates and logs.
+    /// Cache counters summed over the layers and the MTP head's own cache:
+    /// `(rows resolved, misses)` since load; `None` without a cache. Syncs
+    /// the stream - for gates and logs.
     pub fn moe_cache_stats(&self) -> Result<Option<(u64, u64)>, GpuModelError> {
         // the disk backing resolves on the host; the device counters stay 0.
-        // A slot miss is a disk read or a host tier hit.
+        // A slot miss is a disk read or a host tier hit. The head is never
+        // disk-backed: the disk seating leaves it uncached.
         if let Some(s) = self.moe_disk_stats() {
             return Ok(Some((s.rows, s.misses + s.tier_hits)));
         }
-        let mut acc: Option<(u64, u64)> = None;
-        for l in &self.layers {
-            if let Ffn::Moe(m) = &l.ffn
-                && let Some(c) = &m.cache
-            {
-                let (r, m) = c.stats(&self.exec)?;
-                let a = acc.get_or_insert((0, 0));
-                a.0 += r;
-                a.1 += m;
-            }
-        }
-        Ok(acc)
+        let stats = self
+            .layers
+            .iter()
+            .map(|l| &l.ffn)
+            .chain(self.mtp.as_ref().map(|m| &m.ffn))
+            .filter_map(|ffn| match ffn {
+                Ffn::Moe(m) => m.cache.as_ref(),
+                _ => None,
+            })
+            .map(|c| c.stats(&self.exec))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ExpertCache::sum_stats(stats))
     }
 }
 
