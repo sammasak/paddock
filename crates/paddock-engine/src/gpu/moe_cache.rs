@@ -367,6 +367,14 @@ impl ExpertCache {
         Ok(l.absorb([v[0], v[1]]))
     }
 
+    /// Sum of several caches' [`Self::stats`]; `None` when no cache
+    /// reported, so a model without one exports no slot families.
+    pub(crate) fn sum_stats(stats: impl IntoIterator<Item = (u64, u64)>) -> Option<(u64, u64)> {
+        stats
+            .into_iter()
+            .reduce(|(r, m), (r2, m2)| (r + r2, m + m2))
+    }
+
     /// VRAM the slot planes hold.
     pub fn vram_bytes(&self) -> u64 {
         (self.gate.data.len()
@@ -831,6 +839,33 @@ mod layout_tests {
         assert_eq!(
             (rows, misses),
             (u64::from(u32::MAX) + 7, u64::from(u32::MAX) + 3)
+        );
+    }
+
+    #[test]
+    fn main_and_mtp_head_ledgers_sum_into_one_count() {
+        assert_eq!(
+            ExpertCache::sum_stats([]),
+            None,
+            "no cache seated reports nothing"
+        );
+        let (mut main, mut mtp) = (SlotLedger::default(), SlotLedger::default());
+        assert_eq!(
+            ExpertCache::sum_stats([main.absorb([0, 0]), mtp.absorb([0, 0])]),
+            Some((0, 0)),
+            "two seated caches that served nothing"
+        );
+        // the head's counters wrap while the main cache's do not
+        mtp.absorb([u32::MAX, u32::MAX - 2]);
+        let s = ExpertCache::sum_stats([main.absorb([8, 3]), mtp.absorb([3, 1])]);
+        assert_eq!(
+            s,
+            Some((8 + u64::from(u32::MAX) + 4, 3 + u64::from(u32::MAX) + 2))
+        );
+        // a model whose head has no cache counts the main cache alone
+        assert_eq!(
+            ExpertCache::sum_stats([main.absorb([16, 3])]),
+            Some((16, 3))
         );
     }
 }
