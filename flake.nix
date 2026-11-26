@@ -22,8 +22,8 @@
         overlays = [ rust-overlay.overlays.default ];
         config.allowUnfree = true;
       };
-      # Packaging files and docs do not affect the build; leaving them out keeps
-      # the source hash, and so the package, unchanged by Nix or doc edits.
+      # The Nix files and docs/ do not affect the build; leaving them out keeps
+      # the source hash, and so the package, unchanged by edits to them.
       source = pkgs.lib.cleanSourceWith {
         src = self;
         name = "paddock-source";
@@ -84,8 +84,8 @@
       checks.${system}.nix-format =
         pkgs.runCommand "paddock-nix-format" { nativeBuildInputs = [ pkgs.nixfmt ]; }
           ''
-            cp ${self}/flake.nix .
-            cp -r ${self}/nix .
+            cp ${./flake.nix} flake.nix
+            cp -r ${./nix} nix && chmod -R u+w nix
             nixfmt --check flake.nix nix/*.nix
             touch $out
           '';

@@ -45,7 +45,7 @@ stdenv.mkDerivation {
     readelf -h ${pack}
     cuobjdump --list-elf ${pack} > "$TMPDIR/pack-elf"
     ${lib.concatMapStrings (arch: ''
-      grep -F sm_${arch} "$TMPDIR/pack-elf"
+      grep -E "sm_${arch}([^0-9]|$)" "$TMPDIR/pack-elf"
     '') cudaArches}
     runHook postInstallCheck
   '';

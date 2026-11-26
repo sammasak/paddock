@@ -354,7 +354,7 @@ On x86_64-linux the flake builds the CPU-only runner and the CUDA kernel pack as
 separate outputs; neither needs a GPU to build.
 
 ```sh
-nix build .#paddock-runner      # the runner, no CUDA toolkit involved
+nix build .#paddock-runner      # the runner, no CUDA toolkit; runs its tests too
 nix build .#paddock-cuda-sm86   # the kernel pack for sm_86 (alias of .#paddock-cuda-pack)
 nix flake check                 # Nix formatting plus evaluation of every output
 nix develop                     # a shell with the pinned Rust toolchain and native tools
