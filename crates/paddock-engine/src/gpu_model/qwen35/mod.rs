@@ -1273,6 +1273,18 @@ fn build_nv4_planes(
     Ok(out)
 }
 
+/// Fewer slots than this and the pinned slot cache is not seated: the experts
+/// serve zero-copy instead.
+pub(super) const MOE_CACHE_MIN_SLOTS: usize = 8;
+
+/// The host-mapped expert planes of a MoE layer, if all three are.
+fn host_seats(m: &MoeFfnWeights) -> Option<(&HostMappedKq, &HostMappedKq, &HostMappedKq)> {
+    match (&m.gate_exps, &m.up_exps, &m.down_exps) {
+        (ExpW::KqHost(g), ExpW::KqHost(u), ExpW::KqHost(d)) => Some((g, u, d)),
+        _ => None,
+    }
+}
+
 /// Routed-expert MoE FFN weights (qwen3.6-A3B class: 256 tiny experts, top-8,
 /// plus a parallel shared expert behind a per-token sigmoid scalar gate -
 /// b9951 qwen35moe.cpp::build_layer_ffn is the reference math: softmax over
@@ -1295,12 +1307,6 @@ impl GpuQwen35 {
     pub fn enable_moe_cache(&mut self, budget: u64) -> Result<usize, GpuModelError> {
         if let Some(b) = self.moe_disk.clone() {
             return self.enable_moe_disk_cache(&b, budget);
-        }
-        fn host_seats(m: &MoeFfnWeights) -> Option<(&HostMappedKq, &HostMappedKq, &HostMappedKq)> {
-            match (&m.gate_exps, &m.up_exps, &m.down_exps) {
-                (ExpW::KqHost(g), ExpW::KqHost(u), ExpW::KqHost(d)) => Some((g, u, d)),
-                _ => None,
-            }
         }
         let mut moe: Vec<&mut MoeFfnWeights> = self
             .layers
@@ -1325,7 +1331,7 @@ impl GpuQwen35 {
         let auto = (budget / price) as usize;
         let slots = crate::gpu::moe_cache_slots_pin().unwrap_or(auto);
         let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
-        if slots < 8 {
+        if slots < MOE_CACHE_MIN_SLOTS {
             tracing::warn!(
                 slots,
                 budget_gib = gib(budget),
@@ -1461,6 +1467,31 @@ impl GpuQwen35 {
         }
         crate::gpu::write_expert_artifact(exec, map, &names, path)?;
         Ok(())
+    }
+
+    /// What one slot of the pinned slot cache costs across every host-mapped
+    /// MoE layer not yet cached, and the experts per layer (the most slots
+    /// that can be used); `None` when there is nothing to cache.
+    pub(super) fn moe_cache_slot_price(&self) -> Option<(u64, usize)> {
+        if self.moe_disk.is_some() || !self.exec.has_moe_cache() {
+            return None;
+        }
+        let seats: Vec<_> = self
+            .layers
+            .iter()
+            .map(|l| &l.ffn)
+            .chain(self.mtp.as_ref().map(|m| &m.ffn))
+            .filter_map(|ffn| match ffn {
+                Ffn::Moe(m) if m.cache.is_none() => host_seats(m),
+                _ => None,
+            })
+            .collect();
+        let price: u64 = seats
+            .iter()
+            .map(|(g, u, d)| ExpertCache::slot_bytes(g, u, d))
+            .sum();
+        let experts = seats.iter().map(|(g, _, _)| g.dims[2]).max()?;
+        (price > 0).then_some((price, experts))
     }
 
     /// True when any layer serves its experts through the offload slot cache.
