@@ -87,7 +87,6 @@ pub fn set_moe_offload(cfg: MoeOffloadCfg) {
 /// The `[moe_offload]` development switches (tests, bring-up), read here
 /// and nowhere else. Each wins over the armed config; read on every call
 /// because the GPU tests set them between loads.
-#[derive(Default)]
 struct DevVars {
     /// `PADDOCK_MOE_HOST=1`: offload on without a config file.
     host: bool,
