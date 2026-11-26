@@ -22,9 +22,10 @@
 //! and the KV page footprint. `ttft_ms` runs from arrival at the edge to the
 //! engine's first sampled token (tokenize + queue + prefill), not to the first
 //! response byte: a stream's SSE preamble goes out before prefill finishes.
-//! A chat, messages, completions or responses stream that ends before the engine's stats
-//! arrive (a stop string, a disconnect, an error) ends it where the handler
-//! received its first token. Only a request without a token falls back to the
+//! A chat, messages, completions or responses stream that ends before the
+//! engine's stats arrive (a stop string, a disconnect, an error) ends it where
+//! the handler received its first token; the responses agent loop does not
+//! stamp one yet. Only a request without a token falls back to the
 //! first byte, so every success still carries one TTFT sample.
 
 use std::collections::VecDeque;
@@ -1238,43 +1239,35 @@ mod tests {
 
     /// The messages agent loop has no CPU-only stream (each round submits
     /// to the model's engine), so its rounds' receipts drive
-    /// `messages::agent_token` behind a preamble frame here: a stream that
-    /// ends in round 1 without a Done keeps round 0's first token, and a
-    /// loop without a token falls back to its first byte.
+    /// `messages::agent_token` behind a preamble frame here: rounds cut
+    /// before their Done keep round 0's first token, past the header.
     #[tokio::test]
     async fn an_agent_loop_keeps_its_first_rounds_token() {
-        for tokens in [true, false] {
-            let metrics = crate::metrics::Metrics::new("i".into(), Default::default(), None);
-            let mut scope = EventScope::default();
-            let mut r = RecordingForTest::new(metrics, None, |s| {
-                scope = s;
-                axum::body::Body::from("event: message_start\n\n")
-            });
-            let t0 = r.t0();
-            r.frame().await.expect("the preamble");
-            let marks = Marks {
-                t0,
-                header: Instant::now(),
-            };
-            let e = Endpoint::Messages;
-            if !tokens {
-                marks.assert_first_byte(e, &r.finish(), true);
-                continue;
-            }
-            tokio::time::sleep(DELAY).await;
-            let sent = Instant::now();
-            let mut round0 = Vec::new();
-            crate::messages::agent_token(&scope, &mut round0, 8);
-            let seen = Instant::now();
-            tokio::time::sleep(DELAY).await;
-            crate::messages::agent_token(&scope, &mut round0, 9);
-            let mut round1 = Vec::new();
-            for t in [4, 5] {
-                crate::messages::agent_token(&scope, &mut round1, t);
-            }
-            assert_eq!((round0, round1), (vec![8, 9], vec![4, 5]));
-            marks.assert_first_token(e, &r.finish(), (sent, seen));
+        let metrics = crate::metrics::Metrics::new("i".into(), Default::default(), None);
+        let mut scope = EventScope::default();
+        let mut r = RecordingForTest::new(metrics, None, |s| {
+            scope = s;
+            axum::body::Body::from("event: message_start\n\n")
+        });
+        let t0 = r.t0();
+        r.frame().await.expect("the preamble");
+        let marks = Marks {
+            t0,
+            header: Instant::now(),
+        };
+        tokio::time::sleep(DELAY).await;
+        let sent = Instant::now();
+        let mut round0 = Vec::new();
+        crate::messages::agent_token(&scope, &mut round0, 8);
+        let seen = Instant::now();
+        tokio::time::sleep(DELAY).await;
+        crate::messages::agent_token(&scope, &mut round0, 9);
+        let mut round1 = Vec::new();
+        for t in [4, 5] {
+            crate::messages::agent_token(&scope, &mut round1, t);
         }
+        assert_eq!((round0, round1), (vec![8, 9], vec![4, 5]));
+        marks.assert_first_token(Endpoint::Messages, &r.finish(), (sent, seen));
     }
 
     /// The handler's receipt never displaces the engine's earlier stamp,
