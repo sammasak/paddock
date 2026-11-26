@@ -29,6 +29,9 @@
 //!                                        clamped to what the device has free
 //!
 //!   grant - Σ reserves - slots × per_slot_bytes  =  bytes for the KV pool
+//!                                                   and the expert slot cache
+//!                                                   (its floor first, then its
+//!                                                   share of the surplus)
 //!
 //!   pool_blocks = that / block_bytes, clamped to
 //!       ceiling  slots × blocks_per_slot + retention   (nothing above is
@@ -180,6 +183,17 @@ pub struct Demand {
     /// measured residual, and a ledger audit after allocation); gpt-oss still
     /// hedges.
     pub hedge_fraction: Option<f64>,
+    /// Bytes the expert-offload slot cache must keep, reserved before the
+    /// pool is sized: a width that cannot keep them refuses, and the refusal
+    /// names them. 0 for a family with no slot cache.
+    pub expert_cache_floor: u64,
+    /// Fraction of the pool's surplus (what the grant affords above the
+    /// blocks the width needs, i.e. optional retention) the slot cache takes
+    /// instead of the pool.
+    pub expert_cache_share: f64,
+    /// Bytes the slot cache can use at most (every expert resident, or the
+    /// operator's cap). The share never takes the pool's blocks past it.
+    pub expert_cache_max: u64,
 }
 
 impl Default for Demand {
@@ -198,6 +212,9 @@ impl Default for Demand {
             reserves: Vec::new(),
             when_short: WhenShort::Narrow,
             hedge_fraction: None,
+            expert_cache_floor: 0,
+            expert_cache_share: 0.0,
+            expert_cache_max: u64::MAX,
         }
     }
 }
@@ -221,6 +238,11 @@ pub struct Plan {
     /// long sequences share the budget and admission may queue or preempt.
     /// Never true under [`WhenShort::Refuse`] - those refuse instead.
     pub shared: bool,
+    /// Bytes left for the expert-offload slot cache: the floor, its share,
+    /// and whatever the pool's ceiling left over, capped at
+    /// `Demand::expert_cache_max`. For a family with no cache term this is
+    /// just the grant's unspent remainder.
+    pub expert_cache_bytes: u64,
 }
 
 /// A config the engine can prove infeasible, with the arithmetic that proves it.
@@ -277,13 +299,22 @@ impl Demand {
         self.reserves.iter().map(|r| r.bytes).sum()
     }
 
-    /// Blocks the grant affords at this width, before the floor is consulted.
-    /// `None` when the fixed + per-slot charges already exceed the grant.
-    fn affordable(&self, grant: u64, slots: usize) -> Option<u64> {
+    /// Bytes for the pool and the slot cache at this width: the grant less
+    /// the fixed and per-slot charges. `None` when those exceed the grant.
+    fn kv_bytes(&self, grant: u64, slots: usize) -> Option<u64> {
         let charged = self
             .fixed()
             .saturating_add(slots as u64 * self.per_slot_bytes);
-        let kv = grant.checked_sub(charged)?;
+        grant.checked_sub(charged)
+    }
+
+    /// Blocks the grant affords at this width once the slot cache floor is
+    /// kept, before the progress floor is consulted. `None` when the fixed +
+    /// per-slot charges and the cache floor already exceed the grant.
+    fn affordable(&self, grant: u64, slots: usize) -> Option<u64> {
+        let kv = self
+            .kv_bytes(grant, slots)?
+            .checked_sub(self.expert_cache_floor)?;
         let per_block = self.block_bytes.max(1);
         let mut blocks = kv / per_block;
         if let Some(f) = self.hedge_fraction {
@@ -317,6 +348,18 @@ impl Demand {
             if self.when_short == WhenShort::Refuse && blocks < full {
                 continue;
             }
+            // The slot cache's share comes out of the bytes above full
+            // context (optional retention), never out of context; leftovers
+            // past the pool's ceiling count toward it before the pool gives
+            // up a block. `affordable` returned Some, so kv >= floor + blocks.
+            let need = full.min(blocks);
+            let per_block = self.block_bytes.max(1);
+            let kv = self.kv_bytes(grant, slots).unwrap_or(0);
+            let surplus = kv - self.expert_cache_floor - need * per_block;
+            let share = (surplus as f64 * self.expert_cache_share.clamp(0.0, 1.0)) as u64;
+            let max = self.expert_cache_max.max(self.expert_cache_floor);
+            let target = (self.expert_cache_floor + share).min(max);
+            let blocks = blocks.min((kv - target) / per_block);
             return Ok(Plan {
                 slots,
                 pool_blocks: blocks as usize,
@@ -324,6 +367,7 @@ impl Demand {
                 slot_bytes: slots as u64 * self.per_slot_bytes,
                 token_capacity: blocks as usize * BLOCK_TOKENS,
                 shared: blocks < full,
+                expert_cache_bytes: kv.saturating_sub(blocks * self.block_bytes).min(max),
             });
         }
         Err(self.wont_fit(grant))
@@ -374,6 +418,7 @@ impl Demand {
                 slot_bytes: self.per_slot_bytes,
                 token_capacity: blocks as usize * BLOCK_TOKENS,
                 shared: blocks < self.full_context(1),
+                expert_cache_bytes: 0,
             }
         })
     }
@@ -399,6 +444,12 @@ impl Demand {
                 gib(asked as u64 * self.per_slot_bytes)
             ));
         }
+        if self.expert_cache_floor > 0 {
+            terms.push(format!(
+                "expert slot cache floor {:.2}",
+                gib(self.expert_cache_floor)
+            ));
+        }
 
         // What would work. Both are honest divisions of the same budget, so
         // offer whichever ones are actually reachable rather than a generic
@@ -421,6 +472,25 @@ impl Demand {
             Some(n) if n < asked => fixes.push(format!("lower max_batch to <={n}")),
             _ => {}
         }
+        // the slot cache floor is the term that did not fit: without it the
+        // asked shape plans
+        let without_floor = Demand {
+            expert_cache_floor: 0,
+            ..self.clone()
+        };
+        let floor_note = if self.expert_cache_floor > 0 && without_floor.plan(grant).is_ok() {
+            fixes.push(
+                "lower [moe_offload] vram_gb below the smallest cache to serve the experts \
+                 zero-copy (slow)"
+                    .into(),
+            );
+            format!(
+                " beside the {:.2} GiB expert slot cache floor",
+                gib(self.expert_cache_floor)
+            )
+        } else {
+            String::new()
+        };
         fixes.push("raise vram_budget, or free VRAM on this card".into());
 
         // The dev switch does not join `fixes`: those LEAD the message and are
@@ -467,7 +537,7 @@ impl Demand {
         WontFit {
             message: format!(
                 "{} cannot serve max_ctx {} x max_batch {asked}: needs {:.2} GiB of KV{ckpt_note}, \
-                 only {:.2} GiB fits. {}. \
+                 only {:.2} GiB fits{floor_note}. {}. \
                  Budget: {} => {:.2} GiB for KV at {:.2} MiB/block \
                  ({got} of {need} blocks, {} tokens shared across all sequences).{}",
                 self.family,
@@ -509,6 +579,7 @@ impl Plan {
                 slot_state_gib = gib(self.slot_bytes),
                 token_capacity = self.token_capacity,
                 full_context_tokens = d.blocks_per_slot * BLOCK_TOKENS * self.slots,
+                expert_cache_gib = gib(self.expert_cache_bytes),
                 reserves = %terms,
                 "KV plan is narrower than the configuration asked for"
             );
@@ -522,6 +593,7 @@ impl Plan {
                 slot_state_gib = gib(self.slot_bytes),
                 pool_blocks = self.pool_blocks,
                 token_capacity = self.token_capacity,
+                expert_cache_gib = gib(self.expert_cache_bytes),
                 reserves = %terms,
                 "KV plan"
             );
@@ -842,6 +914,115 @@ mod tests {
         );
     }
 
+    /// The slot cache floor is kept before the pool is sized: at a grant
+    /// where the pool alone would take everything up to its ceiling, it now
+    /// shrinks to leave the floor.
+    #[test]
+    fn the_expert_cache_floor_is_honoured_and_the_pool_shrinks() {
+        let d = Demand {
+            retention_blocks: 2048,
+            ..pooled()
+        };
+        // 2 GiB reserves, 8 GiB of KV: the pool takes all of it
+        let before = d.plan(10 * GIB).unwrap();
+        assert_eq!(before.pool_blocks, 2048);
+        assert_eq!(before.expert_cache_bytes, 0);
+        let d = Demand {
+            expert_cache_floor: 2 * GIB,
+            ..d
+        };
+        let p = d.plan(10 * GIB).unwrap();
+        assert_eq!(p.pool_blocks, 1536, "(8 - 2) GiB / 4 MiB");
+        assert_eq!(p.expert_cache_bytes, 2 * GIB);
+        assert!(p.pool_bytes + p.slot_bytes + d.fixed() + p.expert_cache_bytes <= 10 * GIB);
+    }
+
+    /// The share takes from the pool's optional surplus only, stops at the
+    /// cache's cap, and the leftovers above the ceiling still reach the cache.
+    #[test]
+    fn the_expert_cache_share_takes_only_the_surplus() {
+        let d = Demand {
+            slots: 1,
+            retention_blocks: 2048,
+            when_short: WhenShort::Refuse,
+            expert_cache_floor: GIB,
+            expert_cache_share: 0.5,
+            ..pooled()
+        };
+        // 10 GiB: 2 reserves, 1 floor, 7 left = 1792 blocks; need 512, so the
+        // share is half of the 1280 above it
+        let p = d.plan(10 * GIB).unwrap();
+        assert_eq!(p.pool_blocks, 512 + 640);
+        assert_eq!(p.expert_cache_bytes, GIB + 640 * (4 << 20));
+        // a share of 1 never cuts into the context a Refuse plan needs
+        let all = Demand {
+            expert_cache_share: 1.0,
+            ..d.clone()
+        };
+        assert_eq!(all.plan(10 * GIB).unwrap().pool_blocks, 512);
+        // the cap bounds what the share takes from the pool
+        let capped = Demand {
+            expert_cache_max: GIB + GIB / 2,
+            ..d.clone()
+        };
+        let p = capped.plan(10 * GIB).unwrap();
+        assert_eq!(p.pool_blocks, 1792 - 128);
+        assert_eq!(p.expert_cache_bytes, GIB + GIB / 2);
+        // past the pool's ceiling the rest is the cache's, up to its cap
+        let p = Demand {
+            expert_cache_max: 100 * GIB,
+            ..d
+        }
+        .plan(40 * GIB)
+        .unwrap();
+        assert_eq!(p.pool_blocks, 512 + 2048);
+        assert_eq!(p.expert_cache_bytes, 38 * GIB - p.pool_bytes);
+    }
+
+    /// Under Narrow the share takes only the retention above full context,
+    /// not the context a seated slot would otherwise keep.
+    #[test]
+    fn a_narrow_share_leaves_full_context_alone() {
+        let d = Demand {
+            slots: 1,
+            expert_cache_floor: GIB,
+            expert_cache_share: 1.0,
+            ..pooled()
+        };
+        // 2 reserves + 1 floor + 2 GiB of context (512 blocks), no retention
+        let p = d.plan(5 * GIB).unwrap();
+        assert_eq!(p.pool_blocks, 512);
+        assert!(!p.shared);
+        // short of full context, the share takes nothing from the pool
+        let p = d.plan(4 * GIB).unwrap();
+        assert_eq!(p.pool_blocks, 256);
+        assert_eq!(p.expert_cache_bytes, GIB);
+    }
+
+    /// A shape that fits without the slot cache floor but not with it refuses,
+    /// and the refusal says the floor is the term that did not fit.
+    #[test]
+    fn a_refusal_names_the_expert_cache_floor() {
+        let d = Demand {
+            when_short: WhenShort::Refuse,
+            expert_cache_floor: GIB,
+            ..pooled()
+        };
+        // 2 GiB reserves + 8 GiB context fits 10 GiB, not beside 1 GiB more
+        let e = d.plan(10 * GIB).unwrap_err().message;
+        let head = e.split_once(". Budget:").expect("ledger follows").0;
+        assert!(
+            head.contains("beside the 1.00 GiB expert slot cache floor"),
+            "{e}"
+        );
+        assert!(head.contains("[moe_offload] vram_gb below"), "{e}");
+        assert!(e.contains("expert slot cache floor 1.00"), "{e}");
+        // a grant short with or without the floor does not blame it
+        let e = d.plan(6 * GIB).unwrap_err().message;
+        assert!(!e.contains("beside the"), "{e}");
+        assert!(e.contains("expert slot cache floor 1.00"), "{e}");
+    }
+
     #[test]
     fn every_plan_fits_inside_its_grant() {
         // The invariant the whole module exists for, over a spread of shapes.
@@ -858,12 +1039,14 @@ mod tests {
                         floor_blocks_per_slot: 64,
                         floor_blocks_min: 256,
                         reserves: vec![Reserve::new("slack", GIB)],
+                        expert_cache_floor: GIB / 2,
+                        expert_cache_share: 0.5,
                         ..Default::default()
                     };
                     let grant = grant_gib * GIB;
                     if let Ok(p) = d.plan(grant) {
                         assert!(
-                            p.pool_bytes + p.slot_bytes + d.fixed() <= grant,
+                            p.pool_bytes + p.slot_bytes + d.fixed() + p.expert_cache_bytes <= grant,
                             "slots {slots} ctx {ctx} grant {grant_gib} GiB: \
                              pool {:.2} + slots {:.2} + reserves {:.2} > grant",
                             gib(p.pool_bytes),
@@ -871,6 +1054,7 @@ mod tests {
                             gib(d.fixed()),
                         );
                         assert!(p.slots >= 1 && p.slots <= slots);
+                        assert!(p.expert_cache_bytes >= d.expert_cache_floor);
                     }
                 }
             }

@@ -317,6 +317,36 @@ impl GpuQwen35 {
             }
             None => (0, 0),
         };
+        // [moe_offload]: the slot cache is a planned term, not the leftovers.
+        // Its floor is the smallest cache enable_moe_cache seats (plus the
+        // allocator margin it keeps back), so a plan that cannot keep it
+        // refuses instead of serving every expert zero-copy (a 35B-A3B at
+        // max_batch 16: 0 slots, 15.5 tok/s; 16 slots, 26.6). Half of the
+        // pool's optional surplus (prefix retention) goes to it too, up to
+        // every expert resident or the operator's vram_gb. A pinned pool or
+        // slot count keeps the old rule: the cache takes what is left.
+        const MOE_CACHE_MARGIN: u64 = 256 << 20;
+        let (expert_cache_floor, expert_cache_max) = match self.moe_cache_slot_price() {
+            Some((price, experts))
+                if explicit_pool_pin.is_none()
+                    && crate::gpu::moe_cache_slots_pin().is_none()
+                    && !self.moe_cache_active() =>
+            {
+                let smallest = super::MOE_CACHE_MIN_SLOTS as u64 * price;
+                let floor = smallest + MOE_CACHE_MARGIN;
+                let all = experts as u64 * price;
+                match crate::gpu::moe_offload().vram_bytes {
+                    // a vram_gb below the smallest cache reserves nothing (the
+                    // refusal's way out) and seats no cache
+                    Some(cap) if cap < smallest => (0, 0),
+                    cap => (
+                        floor,
+                        (cap.map_or(all, |c| c.min(all)) + MOE_CACHE_MARGIN).max(floor),
+                    ),
+                }
+            }
+            _ => (0, u64::MAX),
+        };
         let demand = kv_plan::Demand {
             family: "qwen35",
             max_ctx: self.max_ctx,
@@ -359,6 +389,9 @@ impl GpuQwen35 {
             // slot that needed 16 GiB of KV - "only 14.96 fits" - with 26 GiB
             // of grant unspent.
             hedge_fraction: None,
+            expert_cache_floor,
+            expert_cache_share: if expert_cache_floor > 0 { 0.5 } else { 0.0 },
+            expert_cache_max,
             ..Default::default()
         };
         let plan = match demand.plan(grant) {
@@ -375,15 +408,17 @@ impl GpuQwen35 {
                  the full chunk would not fit beside the KV this configuration needs"
             );
         }
-        // What the plan leaves after its pools and every listed reserve is
-        // the expert-offload slot cache's budget (sized at the end of this
-        // function, once the pools are allocated).
-        // a pinned pool (below) is the one allocated, so it is what the slot
-        // cache must fit beside
+        // The expert-offload slot cache's budget is the plan's cache term
+        // (sized at the end of this function, once the pools are allocated).
+        // A pinned pool (below) is the one allocated, so with a pin the cache
+        // takes what is left beside it.
         let pool_bytes = explicit_pool_pin.map_or(plan.pool_bytes, |n| n as u64 * block_bytes);
         let plan_reserved: u64 =
             demand.reserves.iter().map(|r| r.bytes).sum::<u64>() + pool_bytes + plan.slot_bytes;
-        let moe_cache_budget = grant.saturating_sub(plan_reserved);
+        let moe_cache_budget = match explicit_pool_pin {
+            Some(_) => grant.saturating_sub(plan_reserved),
+            None => plan.expert_cache_bytes,
+        };
         // An explicit pin is a development instrument: it overrides the plan
         // outright, including past the budget, and says so.
         let pool_block_count = match explicit_pool_pin {
@@ -790,11 +825,11 @@ impl GpuQwen35 {
         // during the prefill phase) and cut TTFT p50 2618 -> 616 ms at
         // equal throughput. The scheduler's overlap_ok conditions still
         // guard per tick; PADDOCK_OVERLAP=0 is the A/B kill switch.
-        // [moe_offload]: the slot cache takes what the plan left, less a
-        // 256 MiB allocator margin - the operator's levers stay max_ctx and
+        // [moe_offload]: the slot cache takes the plan's cache term, less the
+        // allocator margin - the operator's levers stay max_ctx and
         // max_batch, exactly as for the KV pool.
         if !self.moe_cache_active() {
-            self.enable_moe_cache(moe_cache_budget.saturating_sub(256 << 20))?;
+            self.enable_moe_cache(moe_cache_budget.saturating_sub(MOE_CACHE_MARGIN))?;
         }
         let overlap_on = paddock_models::dev_var!("PADDOCK_OVERLAP")
             .map(|v| v != "0")
