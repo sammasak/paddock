@@ -15,7 +15,7 @@ use axum::response::{IntoResponse, Json, Response};
 use paddock_api::ErrorBody;
 use paddock_api::completions::{CompletionChoice, CompletionRequest, CompletionResponse, Usage};
 use paddock_engine::sampler::SamplingParams;
-use paddock_engine::service::{EngineError, FinishReason, GenRequest, TokenEvent, TokenLogprobs};
+use paddock_engine::service::{FinishReason, GenRequest, TokenEvent, TokenLogprobs};
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
 use crate::routes::AppState;
