@@ -1658,7 +1658,7 @@ mod tests {
     fn ttft_ends_at_the_first_token_not_at_header_time() {
         use paddock_engine::service::RunStats;
         use std::time::Instant;
-        let m = Arc::new(Metrics::new("i".into(), ModelIds::default(), None));
+        let m = Metrics::new("i".into(), ModelIds::default(), None);
         // hand-set instants: arrival, then the first token 300 ms (fresh) and
         // 90 ms (resumed) later; the SSE preamble is polled out at arrival
         let t0 = Instant::now();
