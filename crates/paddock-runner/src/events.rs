@@ -25,7 +25,8 @@
 //! A chat, messages or completions stream that ends before the engine's stats
 //! arrive (a stop string, a disconnect, an error) ends it where the handler
 //! received its first token. Only a request without a token falls back to the
-//! first byte, so every success still carries one TTFT sample.
+//! first byte (as does a `/v1/responses` stream, which stamps no receipt
+//! yet), so every success still carries one TTFT sample.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -122,10 +123,11 @@ pub struct EventRecord {
     #[serde(rename = "paddock.kv_pages", skip_serializing_if = "Option::is_none")]
     pub kv_pages: Option<u64>,
     /// Arrival at the edge to the engine's first sampled token (tokenize +
-    /// queue + prefill); a stream cut before the engine's stats arrived
-    /// ends it at the handler's receipt of that token. A request without a
-    /// token (embeddings, audio, an engine error or a disconnect before the
-    /// first one) falls back to the first response-body byte.
+    /// queue + prefill); a chat, messages or completions stream cut before
+    /// the engine's stats arrived ends it at the handler's receipt of that
+    /// token. A request without a token (embeddings, audio, an engine error
+    /// or a disconnect before the first one) and a `/v1/responses` stream
+    /// cut that way fall back to the first response-body byte.
     #[serde(rename = "paddock.ttft_ms", skip_serializing_if = "Option::is_none")]
     pub ttft_ms: Option<u64>,
     /// Output tokens over the post-first-token window - the edge view of decode
@@ -693,6 +695,7 @@ pub(crate) struct RecordingForTest {
 impl RecordingForTest {
     pub(crate) fn new(
         metrics: Arc<crate::metrics::Metrics>,
+        endpoint: &str,
         t0: Option<Instant>,
         body: impl FnOnce(EventScope) -> axum::body::Body,
     ) -> Self {
@@ -709,7 +712,7 @@ impl RecordingForTest {
                     ring,
                     metrics,
                     scope,
-                    endpoint: "/v1/chat/completions".into(),
+                    endpoint: endpoint.into(),
                     origin: Default::default(),
                     request_id: "req_t".into(),
                     traceparent: None,
@@ -762,7 +765,7 @@ pub(crate) fn record_stream_for_test(
     stats: &[paddock_engine::service::RunStats],
 ) -> Arc<EventRecord> {
     let mut scope = EventScope::default();
-    let mut r = RecordingForTest::new(metrics, Some(t0), |s| {
+    let mut r = RecordingForTest::new(metrics, "/v1/chat/completions", Some(t0), |s| {
         s.usage(16, 4);
         s.cached(cached);
         scope = s;
@@ -1018,6 +1021,16 @@ mod tests {
     }
     const ENDPOINTS: [Endpoint; 3] = [Endpoint::Chat, Endpoint::Messages, Endpoint::Completions];
 
+    impl Endpoint {
+        fn path(self) -> &'static str {
+            match self {
+                Endpoint::Chat => "/v1/chat/completions",
+                Endpoint::Messages => "/v1/messages",
+                Endpoint::Completions => "/v1/completions",
+            }
+        }
+    }
+
     /// What the stop-string exit records as its finish reason.
     fn stop_reason(e: Endpoint) -> &'static str {
         match e {
@@ -1052,7 +1065,7 @@ mod tests {
         async fn new(e: Endpoint, stop: &[&str]) -> Self {
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             let metrics = crate::metrics::Metrics::new("i".into(), Default::default(), None);
-            let mut r = RecordingForTest::new(metrics, None, |scope| match e {
+            let mut r = RecordingForTest::new(metrics, e.path(), None, |scope| match e {
                 Endpoint::Chat => crate::chat::stream_for_test(scope, stop, vec![rx]),
                 Endpoint::Messages => crate::messages::stream_for_test(scope, stop, rx),
                 Endpoint::Completions => crate::completions::stream_for_test(scope, stop, vec![rx]),
@@ -1211,7 +1224,7 @@ mod tests {
     #[tokio::test]
     async fn a_stream_without_a_token_falls_back_to_its_first_byte() {
         for e in ENDPOINTS {
-            let mut s = Stream::new(e, &["ll"]).await;
+            let mut s = Stream::new(e, &[]).await;
             tokio::time::sleep(DELAY).await;
             s.tx.send(engine_error()).unwrap();
             assert!(!drain(&mut s.r).await.is_empty(), "{e:?}");
