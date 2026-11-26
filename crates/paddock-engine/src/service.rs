@@ -304,6 +304,11 @@ pub struct RunStats {
     pub prefill_ms: u32,
     /// prefill done -> finish: the decode-phase wall clock.
     pub decode_ms: u32,
+    /// When the request's first token was sampled (next-token: the prompt's
+    /// prefill finished; block diffusion: its first block was accepted):
+    /// where the serving layer's time to first token ends. None on a request
+    /// that generates no token (a structured read).
+    pub prefilled_at: Option<std::time::Instant>,
     /// Speculative tokens drafted for this sequence across its rounds...
     pub spec_drafted: u32,
     /// ...and how many of those the verify pass accepted. 0/0 = never rode spec.
@@ -1257,11 +1262,15 @@ fn run_request_diffusion(
         None
     };
     let t_prefilled = std::time::Instant::now();
-    let stats = |t_prefilled: std::time::Instant| RunStats {
+    // a canvas's first token exists once its first block is accepted, not
+    // when the prompt is in KV
+    let mut first_block: Option<std::time::Instant> = None;
+    let stats = |t_prefilled: std::time::Instant, first_block| RunStats {
         sampled_stop: false,
         queued_ms,
         prefill_ms: dur_ms(t_prefilled.saturating_duration_since(t_admit)),
         decode_ms: dur_ms(t_prefilled.elapsed()),
+        prefilled_at: first_block,
         spec_drafted: 0,
         spec_accepted: 0,
         kv_pages: 0,
@@ -1280,9 +1289,10 @@ fn run_request_diffusion(
                 return;
             }
         };
+        first_block.get_or_insert_with(std::time::Instant::now);
         for &id in &block {
             if req.stop_tokens.contains(&id) {
-                finish_sampled_stop(&req.events, metrics, stats(t_prefilled));
+                finish_sampled_stop(&req.events, metrics, stats(t_prefilled, first_block));
                 return;
             }
             if req
@@ -1308,9 +1318,10 @@ fn run_request_diffusion(
         }
         base += block.len();
     }
-    let _ = req
-        .events
-        .send(TokenEvent::Done(FinishReason::Length, stats(t_prefilled)));
+    let _ = req.events.send(TokenEvent::Done(
+        FinishReason::Length,
+        stats(t_prefilled, first_block),
+    ));
 }
 
 /// The batched loop for a BLOCK-DIFFUSION backend (DiffusionGemma): up to
@@ -1351,6 +1362,8 @@ fn run_batched_diffusion(
         queued_ms: u32,
         t_admit: std::time::Instant,
         t_prefilled: std::time::Instant,
+        /// When the first block was accepted: the first token. None on a read.
+        first_block: Option<std::time::Instant>,
     }
     impl DSlot {
         fn stats(&self) -> RunStats {
@@ -1359,6 +1372,7 @@ fn run_batched_diffusion(
                 queued_ms: self.queued_ms,
                 prefill_ms: dur_ms(self.t_prefilled.saturating_duration_since(self.t_admit)),
                 decode_ms: dur_ms(self.t_prefilled.elapsed()),
+                prefilled_at: self.first_block,
                 spec_drafted: 0,
                 spec_accepted: 0,
                 kv_pages: 0,
@@ -1487,6 +1501,7 @@ fn run_batched_diffusion(
                 queued_ms,
                 t_admit,
                 t_prefilled: t_admit,
+                first_block: None,
             });
             match req.mm_chunks {
                 Some(chunks) => mm_pending.push((k, chunks)),
@@ -1685,6 +1700,7 @@ fn run_batched_diffusion(
                     continue;
                 }
             };
+            s.first_block.get_or_insert_with(std::time::Instant::now);
             generator.canvas_close(h);
             s.canvas = None;
             s.steps = 0;
@@ -1736,7 +1752,9 @@ fn run_batched_diffusion(
 /// allocated after it (the warm-up's drafter state, grow-on-demand scratch),
 /// and the manager's reconciler measured NVML against that stale figure:
 /// 2.6-21.8 GB of "drift" on a healthy runner, warned every two seconds for
-/// days.
+/// days. The MoE slot cache counters that need a device sync ride the same
+/// cadence: armed at warm-up (as 0), current within a second while serving,
+/// final once idle.
 fn refresh_model_mem(
     generator: &dyn Generator,
     metrics: &EngineMetrics,
@@ -1749,6 +1767,9 @@ fn refresh_model_mem(
     *last = Some(std::time::Instant::now());
     if let Some(b) = generator.device_mem_used() {
         metrics.model_mem_bytes.store(b, Relaxed);
+    }
+    if let Some(s) = generator.moe_slot_stats_synced() {
+        metrics.store_moe_slots(s);
     }
 }
 
@@ -2015,6 +2036,7 @@ fn run_request(generator: &mut dyn Generator, mut req: GenRequest, metrics: &Eng
                         queued_ms,
                         prefill_ms: dur_ms(t_read.saturating_duration_since(t_admit)),
                         decode_ms: dur_ms(t_read.elapsed()),
+                        prefilled_at: None,
                         spec_drafted: 0,
                         spec_accepted: 0,
                         kv_pages: 0,
@@ -2048,6 +2070,7 @@ fn run_request(generator: &mut dyn Generator, mut req: GenRequest, metrics: &Eng
         queued_ms,
         prefill_ms: dur_ms(t_prefilled.saturating_duration_since(t_admit)),
         decode_ms: dur_ms(t_prefilled.elapsed()),
+        prefilled_at: Some(t_prefilled),
         spec_drafted: 0,
         spec_accepted: 0,
         kv_pages: 0, // serial path: no paged pool
@@ -2417,6 +2440,7 @@ impl Slot {
             queued_ms,
             prefill_ms,
             decode_ms,
+            prefilled_at: self.prefill_done,
             spec_drafted: self.spec_drafted,
             spec_accepted: self.spec_accepted,
             kv_pages: (self.pos as usize).div_ceil(crate::kv_pool::BLOCK_TOKENS) as u32,
@@ -7387,6 +7411,59 @@ mod usage_tests {
         assert_eq!(spec_live_slots(&slots, &chunking), [1]);
         chunking.remove(&0);
         assert_eq!(spec_live_slots(&slots, &chunking), [0, 1]);
+    }
+
+    /// A family with a pinned MoE slot cache: its counters live on the
+    /// device, so only the synced read reports them.
+    struct PinnedSlots(Option<(u64, u64)>);
+
+    impl Generator for PinnedSlots {
+        fn reset(&mut self) {}
+        fn forward(&mut self, _token: u32) -> Result<Vec<f32>, GenError> {
+            Ok(vec![0.0, 1.0])
+        }
+        fn vocab(&self) -> usize {
+            2
+        }
+        fn forward_prefill_stream(&mut self, _tokens: &[u32]) -> Result<Vec<f32>, GenError> {
+            Ok(vec![0.0, 1.0])
+        }
+        fn moe_slot_stats_synced(&self) -> Option<(u64, u64)> {
+            self.0
+        }
+    }
+
+    #[test]
+    fn moe_cache_counters_publish_at_zero_then_count_once_a_second() {
+        let m = EngineMetrics::default();
+        let slots = |m: &EngineMetrics| {
+            (
+                m.moe_slots_armed.load(Relaxed),
+                m.moe_slot_hits.load(Relaxed),
+                m.moe_slot_misses.load(Relaxed),
+            )
+        };
+        let mut g = PinnedSlots(Some((0, 0)));
+        publish_model_counters(&g, &m);
+        assert_eq!(
+            slots(&m),
+            (0, 0, 0),
+            "the per-pass publish takes no device sync"
+        );
+        // the warm-up refresh arms a seated cache; here it has served nothing
+        refresh_model_mem(&g, &m, &mut None, MODEL_MEM_REFRESH);
+        assert_eq!(slots(&m), (1, 0, 0));
+        let mut seen = None;
+        g.0 = Some((5, 3));
+        refresh_model_mem(&g, &m, &mut seen, MODEL_MEM_REFRESH);
+        assert_eq!(slots(&m), (1, 5, 3));
+        // a busy pass inside the second does not sync again
+        g.0 = Some((13, 3));
+        refresh_model_mem(&g, &m, &mut seen, MODEL_MEM_REFRESH);
+        assert_eq!(slots(&m), (1, 5, 3));
+        // going idle reads the final figure
+        refresh_model_mem(&g, &m, &mut None, MODEL_MEM_REFRESH);
+        assert_eq!(slots(&m), (1, 13, 3));
     }
 
     /// A generator whose multimodal prefill runs a row count deliberately

@@ -4,8 +4,8 @@
 //! edge (correlation ids, timing, status) and enriched by the handler (usage,
 //! finish reasons, cached-prefix depth) through an [`EventScope`] riding the
 //! request extensions. The record is pushed when the RESPONSE BODY completes -
-//! a streaming completion's record carries its true duration and edge TTFT,
-//! and a client disconnect still yields a record with whatever was known.
+//! a streaming completion's record carries its true duration and TTFT, and a
+//! client disconnect still yields a record with whatever was known.
 //!
 //! Invariant (doc §8.7): observability never blocks serving. The hot-path cost
 //! is one short mutex push into a fixed-size ring (~4K records ≈ 2 MB); there
@@ -19,8 +19,11 @@
 //! no semconv equivalent are `paddock.*`: the per-request phase split
 //! (tokenize at the edge; queue/prefill/decode measured inside the engine and
 //! carried on `TokenEvent::Done` as `RunStats`), spec-decode drafted/accepted,
-//! and the KV page footprint. The edge-measured `ttft_ms` stays alongside as
-//! the client-visible number the engine phases decompose.
+//! and the KV page footprint. `ttft_ms` runs from arrival at the edge to the
+//! engine's first sampled token (tokenize + queue + prefill), not to the first
+//! response byte: a stream's SSE preamble goes out before prefill finishes.
+//! Only a request without an engine token falls back to the first byte, so
+//! every success still carries one TTFT sample.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -116,11 +119,13 @@ pub struct EventRecord {
     /// on the serial (non-paged) engine.
     #[serde(rename = "paddock.kv_pages", skip_serializing_if = "Option::is_none")]
     pub kv_pages: Option<u64>,
-    /// Edge-measured time to first response-body byte. For streaming this is
-    /// the client-visible TTFT (queue + tokenize + prefill + first decode).
+    /// Arrival at the edge to the engine's first sampled token (tokenize +
+    /// queue + prefill). A request that reported no token (embeddings,
+    /// audio, an engine error or a disconnect before the engine's stats
+    /// arrived) falls back to the first response-body byte.
     #[serde(rename = "paddock.ttft_ms", skip_serializing_if = "Option::is_none")]
     pub ttft_ms: Option<u64>,
-    /// Output tokens over the post-first-byte window - the edge view of decode
+    /// Output tokens over the post-first-token window - the edge view of decode
     /// rate. Streaming responses only (non-streamed compute is not separable
     /// at the edge).
     #[serde(
@@ -172,6 +177,8 @@ struct Cells {
     spec_drafted: Option<u64>,
     spec_accepted: Option<u64>,
     kv_pages: Option<u64>,
+    /// The earliest generation's `RunStats::prefilled_at`: the first token.
+    first_token: Option<Instant>,
 }
 
 /// Cloneable handle the middleware plants in the request extensions and the
@@ -247,6 +254,9 @@ impl EventScope {
             }
             if s.kv_pages > 0 {
                 c.kv_pages = Some(c.kv_pages.unwrap_or(0).max(s.kv_pages as u64));
+            }
+            if let Some(t) = s.prefilled_at {
+                c.first_token = Some(c.first_token.map_or(t, |f| f.min(t)));
             }
         });
     }
@@ -424,12 +434,16 @@ struct Pending {
 }
 
 impl Pending {
-    fn finalize(self, ttft: Option<Duration>, completed: bool) {
+    fn finalize(self, first_frame: Option<Duration>, completed: bool) {
         let duration = self.t0.elapsed();
         let cells = self.scope.take();
+        let ttft = cells
+            .first_token
+            .map(|t| t.saturating_duration_since(self.t0))
+            .or(first_frame);
         let ttft_ms = ttft.map(|d| d.as_millis() as u64);
-        // Edge decode rate: tokens over the post-first-byte window. Streaming
-        // only - a non-streamed response computes everything before byte one.
+        // Edge decode rate: tokens over the post-first-token window. Streaming
+        // only - a non-streamed response holds every byte until the end.
         let decode_tok_s = match (self.stream, cells.output_tokens, ttft) {
             (true, Some(out), Some(t)) if out > 0 && duration > t => {
                 Some(out as f64 / (duration - t).as_secs_f64())
@@ -493,9 +507,10 @@ impl Pending {
     }
 }
 
-/// Response body that timestamps its first data frame (edge TTFT) and emits
-/// the event record when dropped - i.e. when the body finished streaming, the
-/// client disconnected, or the response was discarded.
+/// Response body that timestamps its first data frame (the TTFT fallback for
+/// a request without an engine token) and emits the event record when
+/// dropped - i.e. when the body finished streaming, the client disconnected,
+/// or the response was discarded.
 struct RecordingBody {
     inner: axum::body::Body,
     pending: Option<Pending>,
@@ -646,6 +661,59 @@ pub async fn events_mw(
     )
 }
 
+/// One request through the middleware's recording body, with the edge
+/// arrival at `t0`: a stream whose SSE preamble is polled out first (header
+/// time), then each generation's engine `stats` are folded in and the body
+/// ends. Returns the record; the observation lands in `metrics`.
+#[cfg(test)]
+pub(crate) fn record_stream_for_test(
+    metrics: Arc<crate::metrics::Metrics>,
+    t0: Instant,
+    cached: usize,
+    stats: &[paddock_engine::service::RunStats],
+) -> Arc<EventRecord> {
+    let ring = EventRing::new();
+    let scope = EventScope::live();
+    scope.model("m1");
+    scope.usage(16, 4);
+    scope.cached(cached);
+    let mut body = RecordingBody {
+        inner: axum::body::Body::from("data: {\"role\":\"assistant\"}\n\n"),
+        pending: Some(Pending {
+            ring: ring.clone(),
+            metrics,
+            scope: scope.clone(),
+            endpoint: "/v1/chat/completions".into(),
+            origin: Default::default(),
+            request_id: "req_t".into(),
+            traceparent: None,
+            session_id: None,
+            api_key_hash: None,
+            ts_ms: 0,
+            t0,
+            status: 200,
+            stream: true,
+        }),
+        first_frame: None,
+        completed: false,
+    };
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    let first = http_body::Body::poll_frame(std::pin::Pin::new(&mut body), &mut cx);
+    assert!(
+        matches!(first, std::task::Poll::Ready(Some(Ok(_)))),
+        "the preamble frame"
+    );
+    for s in stats {
+        scope.phases(s);
+    }
+    while let std::task::Poll::Ready(Some(_)) =
+        http_body::Body::poll_frame(std::pin::Pin::new(&mut body), &mut cx)
+    {}
+    drop(body);
+    let (_, _, mut events) = ring.since(0, 1);
+    events.pop().expect("one record")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -751,6 +819,7 @@ mod tests {
             spec_drafted: 40,
             spec_accepted: 30,
             kv_pages: 12,
+            prefilled_at: None,
         });
         scope.phases(&paddock_engine::service::RunStats {
             sampled_stop: false,
@@ -760,6 +829,7 @@ mod tests {
             spec_drafted: 10,
             spec_accepted: 8,
             kv_pages: 9,
+            prefilled_at: None,
         });
         let timing = scope.response_timing().unwrap();
         assert_eq!(
@@ -811,6 +881,7 @@ mod tests {
             spec_drafted: 0,
             spec_accepted: 0,
             kv_pages: 0,
+            prefilled_at: None,
         });
         let p = Pending {
             ring: ring.clone(),

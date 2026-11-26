@@ -183,9 +183,10 @@ pub struct EngineMetrics {
     pub prefix_state_writes: AtomicU64,
     pub prefix_state_steals: AtomicU64,
     pub prefix_state_refused: AtomicU64,
-    /// MoE expert slot cache, monotonic since load: routed rows found in a
-    /// slot vs. rows whose expert had to be brought in. `moe_slots_armed` is 1
-    /// once a model reported it.
+    /// MoE expert slot cache (pinned or disk-backed), monotonic since load:
+    /// routed rows found in a slot vs. rows whose expert had to be brought in.
+    /// `moe_slots_armed` is 1 once a model with a seated cache reported it,
+    /// at 0 from warm-up on.
     pub moe_slots_armed: AtomicU8,
     pub moe_slot_hits: AtomicU64,
     pub moe_slot_misses: AtomicU64,
@@ -207,6 +208,17 @@ impl EngineMetrics {
         self.moe_slot_hits.store(hits, Relaxed);
         self.moe_slot_misses.store(misses, Relaxed);
         self.moe_slots_armed.store(1, Relaxed);
+    }
+}
+
+/// A failed slot cache counter readback: warned once per process, then at
+/// debug, since the refresh that hits it runs every second.
+pub(crate) fn warn_slot_readback(e: &dyn std::fmt::Display) {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::debug!("MoE slot cache counters unreadable: {e}");
+    } else {
+        tracing::warn!("MoE slot cache counters unreadable: {e} (further failures at debug)");
     }
 }
 

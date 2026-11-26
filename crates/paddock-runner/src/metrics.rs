@@ -190,8 +190,12 @@ pub struct Observation<'a> {
     /// the operation, so label sets stay consistent.
     pub model: Option<&'a str>,
     pub duration: Duration,
-    /// Edge time to first response-body byte (streaming: the client-visible
-    /// TTFT; non-streaming: equals duration - the client's truth either way).
+    /// Arrival at the edge to the engine's first sampled token (tokenize +
+    /// queue + prefill), streamed or not. Not the first response byte: a
+    /// stream's SSE preamble leaves before prefill ends. A request without an
+    /// engine token (embeddings, audio) falls back to its first body byte, so
+    /// every success has one sample - the manager's overflow bucket is
+    /// `successes - sum(ttft_h)`.
     pub ttft: Option<Duration>,
     /// Engine-measured decode wall clock - TPOT's numerator.
     pub decode_ms: Option<u64>,
@@ -963,8 +967,9 @@ impl Metrics {
             out,
             name,
             "histogram",
-            "Time to first response-body byte (client-visible TTFT), by prompt \
-             kind (fresh | resumed from the prefix cache)",
+            "Time from request arrival to the first generated token (tokenize, \
+             queue and prefill; not the first response byte), by prompt kind \
+             (fresh | resumed from the prefix cache)",
             Some("seconds"),
             om,
         );
@@ -1085,12 +1090,12 @@ fn render_cache_ledgers(out: &mut String, m: &EngineMetrics, om: bool) {
     if m.moe_slots_armed.load(Relaxed) == 1 {
         c(
             "paddock_moe_expert_slot_hits",
-            "Routed MoE rows served from a resident expert slot (rows minus slot loads; disk-backed experts only)",
+            "Routed MoE rows served from a resident expert slot (rows minus slot loads)",
             m.moe_slot_hits.load(Relaxed),
         );
         c(
             "paddock_moe_expert_slot_misses",
-            "Experts loaded into a slot on a miss (disk reads plus host-tier copies; disk-backed experts only)",
+            "Experts loaded into a slot on a miss (pinned-mirror fills, or disk reads plus host-tier copies)",
             m.moe_slot_misses.load(Relaxed),
         );
     }
@@ -1652,6 +1657,48 @@ mod tests {
     }
 
     #[test]
+    fn ttft_ends_at_the_first_token_not_at_header_time() {
+        use paddock_engine::service::RunStats;
+        use std::time::Instant;
+        let m = Metrics::new("i".into(), ModelIds::default(), None);
+        // hand-set instants: arrival, then the first token 300 ms (fresh) and
+        // 90 ms (resumed) later; the SSE preamble is polled out at arrival
+        let t0 = Instant::now();
+        let stats = |ms| RunStats {
+            prefill_ms: ms as u32,
+            prefilled_at: Some(t0 + Duration::from_millis(ms)),
+            ..RunStats::default()
+        };
+        // an agent loop's second round does not move the first token
+        let fresh =
+            crate::events::record_stream_for_test(m.clone(), t0, 0, &[stats(300), stats(2000)]);
+        let resumed = crate::events::record_stream_for_test(m.clone(), t0, 4096, &[stats(90)]);
+        assert_eq!((fresh.ttft_ms, resumed.ttft_ms), (Some(300), Some(90)));
+        let s = m.render(Format::Classic, 0);
+        let b = "gen_ai_server_time_to_first_token_seconds_bucket{gen_ai_operation_name=\"chat\",\
+                 gen_ai_provider_name=\"paddock\",gen_ai_request_model=\"m1\",origin=\"live\"";
+        let at =
+            |prompt: &str, le: &str| sample(&s, &format!("{b},prompt=\"{prompt}\",le=\"{le}\"}}"));
+        // header time would land in the first bucket
+        assert_eq!((at("fresh", "0.01"), at("resumed", "0.01")), (0, 0));
+        assert_eq!((at("fresh", "0.16"), at("fresh", "0.32")), (0, 1));
+        assert_eq!((at("resumed", "0.08"), at("resumed", "0.16")), (0, 1));
+        // a request without an engine token (embeddings, audio) falls back
+        // to its first byte, so every success still has one sample
+        let none = crate::events::record_stream_for_test(m.clone(), t0, 0, &[RunStats::default()]);
+        assert!(
+            none.ttft_ms.is_some_and(|ms| ms < 300),
+            "{:?}",
+            none.ttft_ms
+        );
+        let s = m.render(Format::Classic, 0);
+        assert_eq!(
+            sample(&s, &format!("{b},prompt=\"fresh\",le=\"+Inf\"}}")),
+            2
+        );
+    }
+
+    #[test]
     fn cache_ledgers_and_queue_depth_render_with_help_and_type() {
         use paddock_engine::metrics::QueueTicket;
         let eng = Arc::new(EngineMetrics::default());
@@ -1661,6 +1708,21 @@ mod tests {
         assert!(!s.contains("paddock_prefix_state_"));
         assert!(!s.contains("paddock_moe_expert_slot_"));
         assert_eq!(sample(&s, "paddock_num_requests_waiting "), 0);
+
+        // a seated expert cache that has served nothing exports both at 0
+        eng.store_moe_slots((0, 0));
+        let s = m.render(Format::Classic, 0);
+        for name in [
+            "paddock_moe_expert_slot_hits_total",
+            "paddock_moe_expert_slot_misses_total",
+        ] {
+            assert!(s.contains(&format!("# HELP {name} ")), "{name} HELP");
+            assert!(
+                s.contains(&format!("# TYPE {name} counter\n")),
+                "{name} TYPE"
+            );
+            assert_eq!(sample(&s, &format!("{name} ")), 0, "{name}");
+        }
 
         eng.store_prefix_state((7, 3, 2));
         eng.store_moe_slots((90, 10));

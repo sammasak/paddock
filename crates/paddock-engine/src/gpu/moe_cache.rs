@@ -302,6 +302,8 @@ pub struct ExpertCache {
     n_jobs: CudaSlice<u32>,
     /// `[rows resolved, misses]`, accumulated by every resolve.
     stats: CudaSlice<u32>,
+    /// Host totals of `stats`, wrap-safe (see [`SlotLedger`]).
+    ledger: std::sync::Mutex<SlotLedger>,
     /// Expert-major prefill (waves): a prefill launch whose routed rows
     /// exceed `slots` is served in `n_waves` (= ceil(n_expert / slots))
     /// passes over the token-batched pair, each pass marking every
@@ -361,7 +363,8 @@ impl ExpertCache {
     /// logs and gates, never on the tick.
     pub fn stats(&self, exec: &GpuExecutor) -> Result<(u64, u64), GpuError> {
         let v = exec.to_host_u32(&self.stats)?;
-        Ok((v[0] as u64, v[1] as u64))
+        let mut l = self.ledger.lock().unwrap_or_else(|p| p.into_inner());
+        Ok(l.absorb([v[0], v[1]]))
     }
 
     /// VRAM the slot planes hold.
@@ -379,6 +382,28 @@ impl ExpertCache {
     pub fn slot_bytes(gate: &HostMappedKq, up: &HostMappedKq, down: &HostMappedKq) -> u64 {
         let per = |p: &RepackedKQ| ((p.data.len() + p.scales.len()) / p.dims[2]) as u64;
         per(gate) + per(up) + per(down)
+    }
+}
+
+/// Host totals of one cache's device `[rows, misses]` counters. The resolve
+/// kernel keeps them as u32, which wraps after ~537M tokens per layer at 8
+/// routed experts; each readback adds the wrapping delta since the last, so
+/// the `_total` counters `/metrics` exports from them never step back. Exact
+/// while reads come less than 2^32 rows apart (the engine reads once a second).
+#[derive(Debug, Default)]
+pub(crate) struct SlotLedger {
+    seen: [u32; 2],
+    rows: u64,
+    misses: u64,
+}
+
+impl SlotLedger {
+    /// Fold one readback in; `(rows resolved, misses)` since load.
+    pub(crate) fn absorb(&mut self, raw: [u32; 2]) -> (u64, u64) {
+        self.rows += u64::from(raw[0].wrapping_sub(self.seen[0]));
+        self.misses += u64::from(raw[1].wrapping_sub(self.seen[1]));
+        self.seen = raw;
+        (self.rows, self.misses)
     }
 }
 
@@ -489,6 +514,7 @@ impl GpuExecutor {
             jobs: self.to_device_u32(&vec![0u32; 2 * max_rows])?,
             n_jobs: self.to_device_u32(&[0u32])?,
             stats: self.to_device_u32(&[0u32, 0u32])?,
+            ledger: Default::default(),
             n_waves,
             wave_of: self.to_device_u32(&vec![MOE_CACHE_NONE; n_expert])?,
             wave_ids: self.to_device_u32(&vec![0u32; n_waves * slots])?,
@@ -783,5 +809,28 @@ mod layout_tests {
         let other = ExpertPlaneLayout::new(&[256, 640, 4], GgmlType::Q4K, 4096, 768)
             .expect("valid expert plane");
         assert!(ExpertLayerLayout::new([p(640, 4096, 768), other, p(320, 2048, 384)]).is_err());
+    }
+
+    #[test]
+    fn pinned_lookups_count_hits_and_misses_across_a_counter_wrap() {
+        let mut l = SlotLedger::default();
+        let hits_misses = |(rows, misses): (u64, u64)| (rows - misses, misses);
+        assert_eq!(
+            hits_misses(l.absorb([0, 0])),
+            (0, 0),
+            "a seated cache reads 0, 0"
+        );
+        // one resolve of 8 routed rows, 3 of them not resident
+        assert_eq!(hits_misses(l.absorb([8, 3])), (5, 3));
+        // the same experts again: all hits
+        assert_eq!(hits_misses(l.absorb([16, 3])), (13, 3));
+        // the device counters wrap between two reads
+        let mut l = SlotLedger::default();
+        l.absorb([u32::MAX - 1, u32::MAX]);
+        let (rows, misses) = l.absorb([6, 2]);
+        assert_eq!(
+            (rows, misses),
+            (u64::from(u32::MAX) + 7, u64::from(u32::MAX) + 3)
+        );
     }
 }
