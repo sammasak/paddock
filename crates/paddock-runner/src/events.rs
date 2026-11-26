@@ -1055,9 +1055,7 @@ mod tests {
             let mut r = RecordingForTest::new(metrics, None, |scope| match e {
                 Endpoint::Chat => crate::chat::stream_for_test(scope, stop, vec![rx]),
                 Endpoint::Messages => crate::messages::stream_for_test(scope, stop, rx),
-                Endpoint::Completions => {
-                    crate::completions::stream_for_test(scope, stop, vec![rx])
-                }
+                Endpoint::Completions => crate::completions::stream_for_test(scope, stop, vec![rx]),
             });
             let t0 = r.t0();
             // chat's role delta, message_start and ping; completions sends none
@@ -1098,9 +1096,19 @@ mod tests {
         }
 
         /// The TTFT lies within the first token's receipt, past the header.
-        fn assert_first_token(self, e: Endpoint, rec: &EventRecord, (sent, seen): (Instant, Instant)) {
-            let ttft = rec.ttft_ms.unwrap_or_else(|| panic!("{e:?}: no TTFT sample"));
-            assert!(self.ms(sent) > self.ms(self.header), "{e:?}: DELAY opens the gap");
+        fn assert_first_token(
+            self,
+            e: Endpoint,
+            rec: &EventRecord,
+            (sent, seen): (Instant, Instant),
+        ) {
+            let ttft = rec
+                .ttft_ms
+                .unwrap_or_else(|| panic!("{e:?}: no TTFT sample"));
+            assert!(
+                self.ms(sent) > self.ms(self.header),
+                "{e:?}: DELAY opens the gap"
+            );
             assert!(
                 (self.ms(sent)..=self.ms(seen)).contains(&ttft),
                 "{e:?}: {ttft} ms, the token arrived in {}..={} ms",
@@ -1117,7 +1125,10 @@ mod tests {
             match (e, framed) {
                 (Endpoint::Completions, false) => assert_eq!(rec.ttft_ms, None, "{e:?}"),
                 (Endpoint::Completions, true) => {
-                    assert!(rec.ttft_ms.is_some_and(|ms| ms > self.ms(self.header)), "{e:?}")
+                    assert!(
+                        rec.ttft_ms.is_some_and(|ms| ms > self.ms(self.header)),
+                        "{e:?}"
+                    )
                 }
                 _ => assert!(
                     rec.ttft_ms.is_some_and(|ms| ms <= self.ms(self.header)),
@@ -1139,9 +1150,9 @@ mod tests {
     }
 
     fn engine_error() -> paddock_engine::service::TokenEvent {
-        paddock_engine::service::TokenEvent::Error(
-            paddock_engine::service::EngineError::internal("boom"),
-        )
+        paddock_engine::service::TokenEvent::Error(paddock_engine::service::EngineError::internal(
+            "boom",
+        ))
     }
 
     async fn drain(r: &mut RecordingForTest) -> Vec<String> {
