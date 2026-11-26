@@ -47,11 +47,7 @@ pub fn page_demand(slots: usize, pages_per_ckpt: usize, want_per_slot: u64) -> (
     if pages_per_ckpt == 0 {
         return (0, 0); // no recurrent state to checkpoint
     }
-    if let Some(n) = paddock_models::dev_var!("PADDOCK_KV_STATE_CKPTS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&n| n > 0)
-    {
+    if let Some(n) = ckpts_pin() {
         return (n * pages_per_ckpt, 0);
     }
     let must = (slots as u64 * CKPTS_PER_TURN).min(CKPTS_FLOOR);
@@ -60,6 +56,15 @@ pub fn page_demand(slots: usize, pages_per_ckpt: usize, want_per_slot: u64) -> (
         must as usize * pages_per_ckpt,
         want.saturating_sub(must) as usize * pages_per_ckpt,
     )
+}
+
+/// The operator's checkpoint count (`PADDOCK_KV_STATE_CKPTS`, a positive
+/// integer; anything else is no pin): every one of them mandatory.
+pub fn ckpts_pin() -> Option<usize> {
+    paddock_models::dev_var!("PADDOCK_KV_STATE_CKPTS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
 }
 
 /// Descriptor capacity (u64 words) for one checkpoint's page-split copy: a

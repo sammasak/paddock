@@ -194,6 +194,10 @@ pub struct Demand {
     /// Bytes the slot cache can use at most (every expert resident, or the
     /// operator's cap). The share never takes the pool's blocks past it.
     pub expert_cache_max: u64,
+    /// The checkpoint count is pinned by the operator
+    /// (`PADDOCK_KV_STATE_CKPTS`): those pages are what is being measured, so
+    /// [`Self::ckpts_yield_to_cache`] never trades them.
+    pub ckpts_pinned: bool,
 }
 
 impl Default for Demand {
@@ -215,6 +219,7 @@ impl Default for Demand {
             expert_cache_floor: 0,
             expert_cache_share: 0.0,
             expert_cache_max: u64::MAX,
+            ckpts_pinned: false,
         }
     }
 }
@@ -376,19 +381,23 @@ impl Demand {
     /// The same shape with the mandatory checkpoint pages made evictable and
     /// the expert slot cache taking the whole surplus above full context, for
     /// a caller whose [`Self::plan`] refused at every shape it will try
-    /// (qwen35: every prefill chunk): `None` when there is no cache floor or
-    /// no checkpoint pages to trade. It trades whether the pages crowd out
-    /// the floor or the context itself; full context is never traded. A lost checkpoint costs a
-    /// re-prefill of that turn; the cache it pays for is every decoded token
+    /// (qwen35: every prefill chunk, see [`next_attempt`]): `None` when there
+    /// is no cache floor, no checkpoint pages, or the count is pinned. It
+    /// trades whether the pages crowd out the floor or the context itself;
+    /// full context is never traded. The cache it buys is every decoded token
     /// (35B-A3B at 2048 x 16 on 8 GB: 0.98 GiB of checkpoints refused the
-    /// 8-slot floor; 14 slots decode 25.4 tok/s, 16 slots 26.6). The pages
-    /// still ride the pool's unused blocks, as the evictable want always did.
+    /// 8-slot floor; traded, 17 slots decode 27.2 tok/s). The cost is resume:
+    /// the checkpoints then compete for the pool's free pages, and where one
+    /// is a large share of the pool (402 of 2048 blocks there) they thrash
+    /// and multi-turn sessions re-prefill every turn.
     pub fn ckpts_yield_to_cache(&self) -> Option<Demand> {
-        (self.expert_cache_floor > 0 && self.ckpt_blocks > 0).then(|| Demand {
-            ckpt_blocks: 0,
-            retention_blocks: self.retention_blocks + self.ckpt_blocks,
-            expert_cache_share: 1.0,
-            ..self.clone()
+        (self.expert_cache_floor > 0 && self.ckpt_blocks > 0 && !self.ckpts_pinned).then(|| {
+            Demand {
+                ckpt_blocks: 0,
+                retention_blocks: self.retention_blocks + self.ckpt_blocks,
+                expert_cache_share: 1.0,
+                ..self.clone()
+            }
         })
     }
 
@@ -620,6 +629,27 @@ impl Plan {
     }
 }
 
+/// The next attempt after a refused plan at prefill chunk `chunk`: halve the
+/// chunk down to `min_chunk`, then, once and only when a trade is possible,
+/// walk the ladder again from `top_chunk` with the checkpoints traded
+/// ([`Demand::ckpts_yield_to_cache`]): guaranteed checkpoints outrank a
+/// wider chunk. `None`: the refusal stands.
+pub fn next_attempt(
+    chunk: usize,
+    min_chunk: usize,
+    top_chunk: usize,
+    traded: bool,
+    tradable: bool,
+) -> Option<(usize, bool)> {
+    if chunk > min_chunk {
+        Some((chunk / 2, traded))
+    } else if !traded && tradable {
+        Some((top_chunk, true))
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -649,6 +679,70 @@ mod tests {
     /// tok/s.
     #[test]
     fn a_35b_a3b_at_2048_x_16_trades_checkpoints_for_slots() {
+        let (d, grant, price, margin) = a3b_2048_x_16();
+        let e = d
+            .plan(grant)
+            .expect_err("checkpoints + context + floor exceed the grant");
+        assert!(e.message.contains("resume checkpoints"), "{}", e.message);
+        let y = d
+            .ckpts_yield_to_cache()
+            .expect("a cache floor and checkpoints to trade");
+        let p = y.plan(grant).expect("the traded shape plans");
+        assert_eq!(p.slots, 16);
+        assert_eq!(p.pool_blocks, 16 * 128, "full context, nothing more");
+        assert!(!p.shared);
+        let slots = (p.expert_cache_bytes - margin) / price;
+        assert!(slots >= 16, "{slots} slots");
+        assert!(p.pool_bytes + p.slot_bytes + y.fixed() + p.expert_cache_bytes <= grant);
+    }
+
+    /// A refusal no trade can help stays a refusal: without a cache floor
+    /// there is nothing to trade for, and the ladder ends at its last chunk.
+    #[test]
+    fn a_refusal_with_no_trade_possible_stays_a_refusal() {
+        let (d, grant, _, _) = a3b_2048_x_16();
+        let plain = Demand {
+            expert_cache_floor: 0,
+            expert_cache_share: 0.0,
+            expert_cache_max: u64::MAX,
+            ..d
+        };
+        // without the floor, context + checkpoints still exceed a smaller grant
+        let grant = grant - 4 * GIB / 10;
+        assert!(plain.plan(grant).is_err());
+        assert!(plain.ckpts_yield_to_cache().is_none());
+        assert_eq!(next_attempt(512, 512, 1024, false, false), None);
+        // the ladder: halve first, keeping the pass; trade once from the top
+        assert_eq!(
+            next_attempt(1024, 512, 1024, false, true),
+            Some((512, false))
+        );
+        assert_eq!(
+            next_attempt(512, 512, 1024, false, true),
+            Some((1024, true))
+        );
+        assert_eq!(next_attempt(1024, 512, 1024, true, true), Some((512, true)));
+        assert_eq!(
+            next_attempt(512, 512, 1024, true, true),
+            None,
+            "one trade pass only"
+        );
+    }
+
+    /// A pinned checkpoint count is what an A/B arm measures: never traded.
+    #[test]
+    fn a_checkpoint_pin_is_never_traded() {
+        let (d, grant, _, _) = a3b_2048_x_16();
+        let pinned = Demand {
+            ckpts_pinned: true,
+            ..d
+        };
+        assert!(pinned.plan(grant).is_err());
+        assert!(pinned.ckpts_yield_to_cache().is_none());
+    }
+
+    /// The 35B-A3B shape above: (demand, grant, slot price, margin).
+    fn a3b_2048_x_16() -> (Demand, u64, u64, u64) {
         let g = |x: f64| (x * GIB as f64) as u64;
         let mib = |x: u64| x << 20;
         let price: u64 = 80_740_352; // one slot across the 40 MoE layers
@@ -675,27 +769,7 @@ mod tests {
             expert_cache_max: 256 * price + margin,
             ..Default::default()
         };
-        let grant = g(4.201030107215047);
-        let e = d
-            .plan(grant)
-            .expect_err("checkpoints + context + floor exceed the grant");
-        assert!(e.message.contains("resume checkpoints"), "{}", e.message);
-        let y = d
-            .ckpts_yield_to_cache()
-            .expect("a cache floor and checkpoints to trade");
-        let p = y.plan(grant).expect("the traded shape plans");
-        assert_eq!(p.slots, 16);
-        assert_eq!(p.pool_blocks, 16 * 128, "full context, nothing more");
-        assert!(!p.shared);
-        let slots = (p.expert_cache_bytes - margin) / price;
-        assert!(slots >= 16, "{slots} slots");
-        assert!(p.pool_bytes + p.slot_bytes + y.fixed() + p.expert_cache_bytes <= grant);
-        // no cache floor, nothing to trade: the family's refusal stands
-        let plain = Demand {
-            expert_cache_floor: 0,
-            ..d.clone()
-        };
-        assert!(plain.ckpts_yield_to_cache().is_none());
+        (d, g(4.201030107215047), price, margin)
     }
 
     /// The fallback must not walk past the grant.
