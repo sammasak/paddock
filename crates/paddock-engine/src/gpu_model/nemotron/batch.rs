@@ -1133,6 +1133,7 @@ impl GpuNemotron {
                 // index bookkeeping only: as many as the pool could ever hold
                 let max_ckpts = pool_blocks.checked_div(pages_per_ckpt).unwrap_or(0).max(1) as u32;
                 pr.set_state_paged(max_ckpts, pages_per_ckpt);
+                pr.set_state_guaranteed((ckpt_blocks / pages_per_ckpt) as u32);
                 let stages = (0..n_stages)
                     .map(|_| self.exec.alloc(state_ckpt_f32))
                     .collect::<Result<Vec<_>, _>>()?;
