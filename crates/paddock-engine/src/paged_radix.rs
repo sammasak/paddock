@@ -1062,7 +1062,11 @@ impl PagedRadix {
             .map(|(i, _)| i)
         else {
             // every resident checkpoint is shared: hold them (see note_resume)
-            if self.nodes.iter().any(|n| n.alive && n.shared && n.state_blk.is_some()) {
+            if self
+                .nodes
+                .iter()
+                .any(|n| n.alive && n.shared && n.state_blk.is_some())
+            {
                 self.st_refused += 1;
             }
             return None;
@@ -2054,7 +2058,11 @@ mod tests {
         cuts: &[usize],
     ) -> (Vec<u32>, Vec<Option<u32>>) {
         r.begin_seq(slot);
-        let toks: Vec<u32> = seeds.iter().flat_map(|&s| block_toks(s)).chain([7]).collect();
+        let toks: Vec<u32> = seeds
+            .iter()
+            .flat_map(|&s| block_toks(s))
+            .chain([7])
+            .collect();
         let mut t = prefill(pool, seeds.len());
         let mut got = Vec::new();
         for &c in cuts {
@@ -2088,7 +2096,11 @@ mod tests {
         let b: Vec<u32> = [1, 2, 20, 21].iter().flat_map(|&s| block_toks(s)).collect();
         assert_eq!(r.match_full(&b).ckpt, Some((2 * BLOCK_TOKENS, x)));
         r.note_resume(1, &b, 2 * BLOCK_TOKENS);
-        assert_eq!(shared_held(&r), 1, "a cut another session resumed is shared");
+        assert_eq!(
+            shared_held(&r),
+            1,
+            "a cut another session resumed is shared"
+        );
         // A burst of per-session checkpoints steals every plain one, the
         // cut that came after it in A's own prompt included.
         for seed in 100..110 {
@@ -2098,7 +2110,11 @@ mod tests {
         let (_, steals, refused) = r.state_stats();
         assert_eq!(steals, 8, "two free indices, then every attach stole");
         assert_eq!(refused, 0);
-        assert_eq!(r.match_full(&a).ckpt, Some((2 * BLOCK_TOKENS, x)), "A's end cut went");
+        assert_eq!(
+            r.match_full(&a).ckpt,
+            Some((2 * BLOCK_TOKENS, x)),
+            "A's end cut went"
+        );
         let c: Vec<u32> = [1, 2, 30].iter().flat_map(|&s| block_toks(s)).collect();
         assert_eq!(
             r.match_full(&c).ckpt,
@@ -2118,7 +2134,10 @@ mod tests {
         let writer = r.slot_seq[0];
         r.begin_seq(3);
         let turn2: Vec<u32> = [a.clone(), vec![5; BLOCK_TOKENS]].concat();
-        assert_eq!(r.match_full(&turn2).ckpt.map(|(p, _)| p), Some(4 * BLOCK_TOKENS));
+        assert_eq!(
+            r.match_full(&turn2).ckpt.map(|(p, _)| p),
+            Some(4 * BLOCK_TOKENS)
+        );
         r.note_resume(3, &turn2, 4 * BLOCK_TOKENS);
         assert_eq!(shared_held(&r), 0);
         assert_eq!(r.slot_seq[3], writer, "turn 2 continues A");
@@ -2144,8 +2163,10 @@ mod tests {
             assert!(got.iter().all(Option::is_some));
             for k in 0..resumes {
                 r.begin_seq(1);
-                let other: Vec<u32> =
-                    [sys, 100 + 10 * sys + k].iter().flat_map(|&s| block_toks(s)).collect();
+                let other: Vec<u32> = [sys, 100 + 10 * sys + k]
+                    .iter()
+                    .flat_map(|&s| block_toks(s))
+                    .collect();
                 r.note_resume(1, &other, BLOCK_TOKENS);
             }
             nodes.push(r.node_at(&block_toks(sys), BLOCK_TOKENS).expect("cached"));
@@ -2153,7 +2174,10 @@ mod tests {
         assert_eq!(shared_held(&r), SHARED_CKPT_CAP);
         let shared = |i: usize| r.nodes[nodes[i] as usize].shared;
         assert!(shared(0), "the most resumed prefix stays held");
-        assert!(!shared(1) && shared(2), "of the one-hit ones the older turned plain");
+        assert!(
+            !shared(1) && shared(2),
+            "of the one-hit ones the older turned plain"
+        );
     }
 
     #[test]
