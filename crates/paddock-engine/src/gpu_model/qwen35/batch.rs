@@ -378,9 +378,11 @@ impl GpuQwen35 {
         // What the plan leaves after its pools and every listed reserve is
         // the expert-offload slot cache's budget (sized at the end of this
         // function, once the pools are allocated).
-        let plan_reserved: u64 = demand.reserves.iter().map(|r| r.bytes).sum::<u64>()
-            + plan.pool_bytes
-            + plan.slot_bytes;
+        // a pinned pool (below) is the one allocated, so it is what the slot
+        // cache must fit beside
+        let pool_bytes = explicit_pool_pin.map_or(plan.pool_bytes, |n| n as u64 * block_bytes);
+        let plan_reserved: u64 =
+            demand.reserves.iter().map(|r| r.bytes).sum::<u64>() + pool_bytes + plan.slot_bytes;
         let moe_cache_budget = grant.saturating_sub(plan_reserved);
         // An explicit pin is a development instrument: it overrides the plan
         // outright, including past the budget, and says so.
