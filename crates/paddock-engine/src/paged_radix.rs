@@ -83,10 +83,11 @@ struct Node {
     /// The sequence that wrote this node's checkpoint ([`PagedRadix::begin_seq`]);
     /// 0 when unknown (a tier restore, a family that never names its slot).
     writer: u64,
-    /// Its writer has since checkpointed a PROMPT deeper on this path, so a
-    /// resume here branches off that sequence ([`PagedRadix::note_resume`]).
-    /// Sticky: it outlives the deeper checkpoint being stolen.
-    superseded: bool,
+    /// How deep (in blocks) the writer's prompt went on this path: a resume
+    /// matching that far continues the writer's sequence, one diverging
+    /// sooner branches off it ([`PagedRadix::note_resume`]). Kept on the
+    /// checkpoint, so it outlives the writer's deeper cuts being stolen.
+    reach: u32,
     /// Resumes of this checkpoint by a sequence other than its writer.
     shared_hits: u32,
     /// The checkpoint is SHARED across sequences ([`PagedRadix::note_resume`]):
@@ -201,11 +202,8 @@ struct Stamp {
     seq: u64,
     /// The node the insert's path ends at.
     at: u32,
-    /// A prompt cut (not a reply): it supersedes the writer's cuts above it.
-    prompt: bool,
-    /// The writing admission's resume node: cuts at or above it were not
-    /// passed by this admission and stay as they are.
-    from: u32,
+    /// The insert's depth in blocks: the checkpoint's first `reach`.
+    depth: u32,
 }
 
 /// At most this many shared checkpoints ([`PagedRadix::note_resume`]) are
@@ -262,7 +260,7 @@ impl PagedRadix {
                 ckpt_used: 0,
                 anchor: false,
                 writer: 0,
-                superseded: false,
+                reach: 0,
                 shared_hits: 0,
                 shared: false,
                 tkey: None,
@@ -354,13 +352,57 @@ impl PagedRadix {
         self.insert_as(tokens, blocks, pool, low);
         let full = (tokens.len() / BLOCK_TOKENS).min(blocks.len());
         let seq = self.slot_seq.get(slot).copied().unwrap_or(0);
-        let from = self.slot_from.get(slot).copied().unwrap_or(0);
+        if prompt && seq != 0 {
+            self.extend_reach(slot, seq, &tokens[..full * BLOCK_TOKENS]);
+        }
         self.last_insert = self.node_at(tokens, full * BLOCK_TOKENS).map(|at| Stamp {
             seq,
             at,
-            prompt,
-            from,
+            depth: full as u32,
         });
+    }
+
+    /// The prompt `tokens` of sequence `seq` reaches past its own cuts on
+    /// the path: the ones this admission prefilled through, below the node it
+    /// resumed at. The cuts it resumed beyond keep the reach of the turn
+    /// that wrote them, so a next user turn that re-renders the reply away
+    /// still matches them fully.
+    fn extend_reach(&mut self, slot: usize, seq: u64, tokens: &[u32]) {
+        let from = self.slot_from.get(slot).copied().unwrap_or(0);
+        let depth = (tokens.len() / BLOCK_TOKENS) as u32;
+        let mut past = from == 0;
+        let mut node = 0u32;
+        for chunk in tokens.chunks_exact(BLOCK_TOKENS) {
+            let Some(&child) = self.nodes[node as usize].children.get(&hash_block(chunk)) else {
+                return;
+            };
+            if self.nodes[child as usize].tokens != chunk {
+                return;
+            }
+            node = child;
+            let n = &mut self.nodes[node as usize];
+            if past && n.state_blk.is_some() && n.writer == seq {
+                n.reach = n.reach.max(depth);
+            }
+            past |= node == from;
+        }
+    }
+
+    /// How many full blocks of `tokens` the tree holds. No LRU bump.
+    fn matched_depth(&self, tokens: &[u32]) -> u32 {
+        let mut node = 0u32;
+        let mut depth = 0;
+        for chunk in tokens.chunks_exact(BLOCK_TOKENS) {
+            let Some(&child) = self.nodes[node as usize].children.get(&hash_block(chunk)) else {
+                break;
+            };
+            if self.nodes[child as usize].tokens != chunk {
+                break;
+            }
+            node = child;
+            depth += 1;
+        }
+        depth
     }
 
     /// Slot `slot` admits a request under a fresh sequence id: the
@@ -379,12 +421,13 @@ impl PagedRadix {
 
     /// Slot `slot` resumed at the checkpoint on boundary `pos` of `tokens`.
     ///
-    /// At a checkpoint its writer never prefilled past with a prompt cut,
-    /// the resume CONTINUES that sequence (the next turn of one
-    /// conversation): the slot takes the writer's id, so its own later cuts
-    /// stay one sequence. A superseded checkpoint is where another sequence
-    /// branches off - the back-off cut of a system prompt every new agent
-    /// session starts from - so it is SHARED and held against steals while
+    /// A resume whose prompt matches the tree as far as the checkpoint's
+    /// writer's prompt went (`Node::reach`) CONTINUES that sequence (the
+    /// next turn of one conversation, a tool turn, a retry): the slot takes
+    /// the writer's id, so its own later cuts stay one sequence. One that
+    /// diverges sooner branches off - a new agent session resuming the
+    /// back-off cut of the system prompt it shares - so the checkpoint is
+    /// SHARED and held against steals while
     /// it ranks among the [`SHARED_CKPT_CAP`] most resumed shared ones (ties:
     /// the most recently used). Past the cap the lowest-ranked one turns
     /// plain; when that is the newcomer, each held one loses a hit, so a
@@ -409,7 +452,7 @@ impl PagedRadix {
         if n.low {
             return;
         }
-        if n.writer != 0 && !n.superseded {
+        if n.writer != 0 && self.matched_depth(tokens) >= n.reach {
             self.slot_seq[slot] = n.writer;
             return;
         }
@@ -431,7 +474,7 @@ impl PagedRadix {
             if low == node as usize {
                 // a contender that could not get in ages the held ones
                 for &i in held.iter().filter(|&&i| i != low) {
-                    self.nodes[i].shared_hits = (self.nodes[i].shared_hits - 1).max(1);
+                    self.nodes[i].shared_hits = self.nodes[i].shared_hits.saturating_sub(1).max(1);
                 }
             }
         }
@@ -675,6 +718,7 @@ impl PagedRadix {
     /// node is missing (evicted between publication and now) or already
     /// checkpointed.
     pub fn attach_state_at(&mut self, tokens: &[u32], pos: usize, idx: u32) -> bool {
+        let stamp = self.last_insert.take();
         let want = pos / BLOCK_TOKENS;
         if want == 0 || !pos.is_multiple_of(BLOCK_TOKENS) {
             return false;
@@ -691,7 +735,6 @@ impl PagedRadix {
             }
             node = child;
         }
-        let stamp = self.last_insert.take();
         if node == 0 || self.nodes[node as usize].state_blk.is_some() {
             return false;
         }
@@ -926,29 +969,9 @@ impl PagedRadix {
         let n = &mut self.nodes[node as usize];
         n.state_blk = Some(idx);
         n.writer = writer;
+        n.reach = stamp.map_or(0, |s| s.depth);
         if let Some(p) = self.paged.as_mut() {
             p.attached[idx as usize] = true;
-        }
-        if let Some(s) = stamp.filter(|s| s.prompt) {
-            self.supersede_above(node, s.seq, s.from);
-        }
-    }
-
-    /// `writer` just cut a prompt at `node`, having resumed at `from`: its
-    /// checkpoints between are superseded - the ones this admission
-    /// prefilled past, not the anchor it resumed beyond. The walk stops at
-    /// `from`, or at one already marked (an earlier cut marked above it).
-    fn supersede_above(&mut self, node: u32, writer: u64, from: u32) {
-        let mut v = self.nodes[node as usize].parent;
-        while v != 0 && v != from {
-            let n = &mut self.nodes[v as usize];
-            if n.state_blk.is_some() && n.writer == writer {
-                if n.superseded {
-                    break;
-                }
-                n.superseded = true;
-            }
-            v = n.parent;
         }
     }
 
@@ -957,7 +980,7 @@ impl PagedRadix {
         let n = self.nodes.get_mut(node)?;
         let idx = n.state_blk.take()?;
         n.writer = 0;
-        n.superseded = false;
+        n.reach = 0;
         n.shared_hits = 0;
         n.shared = false;
         if let Some(p) = self.paged.as_mut() {
@@ -1202,7 +1225,7 @@ impl PagedRadix {
                 ckpt_used: 0,
                 anchor: false,
                 writer: 0,
-                superseded: false,
+                reach: 0,
                 shared_hits: 0,
                 shared: false,
                 tkey: self.nodes[node as usize].tkey.map(|k| k.child(chunk)),
@@ -1386,7 +1409,7 @@ impl PagedRadix {
                 ckpt_used: 0,
                 anchor: false,
                 writer: 0,
-                superseded: false,
+                reach: 0,
                 shared_hits: 0,
                 shared: false,
                 tkey,
@@ -2222,6 +2245,27 @@ mod tests {
     }
 
     #[test]
+    fn a_writers_deepest_cut_is_shared_once_another_session_branches_off_it() {
+        // A short first task: the only cut A makes is the one inside the
+        // system prompt. A's own next turn continues it; B branches off it.
+        let mut pool = KvPool::with_blocks(64);
+        let mut r = PagedRadix::new();
+        r.set_state_paged(8, 1);
+        let (a, _) = session(&mut r, &mut pool, 0, &[1, 2, 10], &[2]);
+        let writer = r.slot_seq[0];
+        r.begin_seq(1);
+        let turn2: Vec<u32> = [&a[..3 * BLOCK_TOKENS], &block_toks(60)[..], &[7]].concat();
+        r.note_resume(1, &turn2, 2 * BLOCK_TOKENS);
+        assert_eq!((shared_held(&r), r.slot_seq[1]), (0, writer));
+        r.insert_for(1, &turn2, prefill(&mut pool, 4).blocks(), &mut pool);
+        r.begin_seq(2);
+        let b: Vec<u32> = [1, 2, 20].iter().flat_map(|&s| block_toks(s)).collect();
+        r.note_resume(2, &b, 2 * BLOCK_TOKENS);
+        assert_eq!(shared_held(&r), 1);
+        assert_ne!(r.slot_seq[2], writer);
+    }
+
+    #[test]
     fn the_branch_point_stays_shared_after_its_writers_deeper_cut_is_stolen() {
         let mut pool = KvPool::with_blocks(64);
         let mut r = PagedRadix::new();
@@ -2268,12 +2312,13 @@ mod tests {
         let mut pool = KvPool::with_blocks(64);
         let mut r = PagedRadix::new();
         r.set_state_paged(8, 1);
-        // shared: cut at block 1 of a prompt its writer went past
+        // shared: cut at block 1 of a prompt its writer went past, resumed by
+        // one that diverges after block 1
         let (s1, _) = session(&mut r, &mut pool, 0, &[1, 11], &[1, 2]);
         let end = r.detach_state_at(&s1, 2 * BLOCK_TOKENS).expect("end cut");
         r.recycle_state(end);
         r.begin_seq(1);
-        r.note_resume(1, &s1, BLOCK_TOKENS);
+        r.note_resume(1, &s1[..BLOCK_TOKENS], BLOCK_TOKENS);
         let (n2, _) = session(&mut r, &mut pool, 2, &[2], &[1]);
         assert_eq!(r.mark_anchor(&n2, BLOCK_TOKENS), Some(BLOCK_TOKENS));
         let (p3, _) = session(&mut r, &mut pool, 3, &[3], &[1]);
@@ -2291,7 +2336,8 @@ mod tests {
         r.attach_state_with_pool(&s1, BLOCK_TOKENS, &mut pool)
             .expect("room");
         let n = &r.nodes[at(&r, &s1) as usize];
-        assert!(!n.shared && !n.superseded && n.shared_hits == 0);
+        assert!(!n.shared && n.shared_hits == 0);
+        assert_eq!(n.reach, 1);
         assert_eq!(n.writer, r.slot_seq[4]);
     }
 
