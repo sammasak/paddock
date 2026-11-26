@@ -7435,7 +7435,11 @@ mod usage_tests {
         };
         let mut g = PinnedSlots(Some((0, 0)));
         publish_model_counters(&g, &m);
-        assert_eq!(slots(&m), (0, 0, 0), "the per-pass publish takes no device sync");
+        assert_eq!(
+            slots(&m),
+            (0, 0, 0),
+            "the per-pass publish takes no device sync"
+        );
         // warm-up: a seated cache that has served nothing is armed at 0
         refresh_model_mem(&g, &m, &mut None, MODEL_MEM_REFRESH);
         assert_eq!(slots(&m), (1, 0, 0));
