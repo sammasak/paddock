@@ -362,6 +362,20 @@ pub async fn run(
             "qwen35 prefill chunk set by the config"
         );
     }
+    let pr = cfg.prefix_resume;
+    paddock_engine::gpu_model::qwen35::set_resume_gate(
+        paddock_engine::gpu_model::qwen35::ResumeGateCfg {
+            min_cache_prefix: pr.min_cache_prefix,
+            resume_live_max: pr.resume_live_max,
+        },
+    );
+    if pr.min_cache_prefix.is_some() || pr.resume_live_max.is_some() {
+        tracing::info!(
+            min_cache_prefix = pr.min_cache_prefix,
+            resume_live_max = pr.resume_live_max,
+            "qwen35 prefix-resume gate set by the config"
+        );
+    }
     if let Some(mib) = cfg.graph_scratch_mib {
         paddock_engine::kv_plan::set_graph_scratch_mib(mib);
         tracing::info!(
