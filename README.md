@@ -348,6 +348,23 @@ open .build/Paddock.app
 `apps/macos/README.md` has the toolchain it needs, the supported chips and what
 each check covers.
 
+## Building with Nix
+
+On x86_64-linux the flake builds the CPU-only runner and the CUDA kernel pack as
+separate outputs; neither needs a GPU to build.
+
+```sh
+nix build .#paddock-runner      # the runner, no CUDA toolkit involved
+nix build .#paddock-cuda-sm86   # the kernel pack for sm_86 (alias of .#paddock-cuda-pack)
+nix flake check                 # Nix formatting plus evaluation of every output
+nix develop                     # a shell with the pinned Rust toolchain and native tools
+```
+
+The CUDA build needs a machine with enough memory: about 6.5 GiB peak and about
+12 minutes on a 12 thread host. It has not been run in CI. For other
+architectures, override `cudaArches` in `nix/cuda-pack.nix`, for example
+`cudaArches = [ "86" "120" ]`.
+
 ## Benchmarking
 
 Use [aiperf](https://github.com/ai-dynamo/aiperf), NVIDIA's load generator, for
