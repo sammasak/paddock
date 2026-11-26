@@ -92,6 +92,9 @@ struct Node {
     reach_key: u64,
     /// Resumes of this checkpoint by a sequence other than its writer.
     shared_hits: u32,
+    /// The sequence counter ([`PagedRadix::begin_seq`]) at its latest shared
+    /// hit: held only while that is within [`SHARED_STALE_SEQS`] of now.
+    shared_seq: u64,
     /// The checkpoint is SHARED across sequences ([`PagedRadix::note_resume`]):
     /// never stolen for another checkpoint, given up for a live context only
     /// after every plain checkpoint and anchor.
@@ -149,6 +152,8 @@ pub struct PagedRadix {
     /// state pool). Empty until `set_state_capacity` - text-only / non-hybrid
     /// models never checkpoint state.
     state_free: Vec<u32>,
+    /// How many checkpoint indices exist: what [`Self::shared_cap`] scales by.
+    state_slots: u32,
     /// Admission control on the state pool: once a checkpoint belongs to a
     /// prefix that has recurred, stop stealing it - let the pool fill and hold.
     ///
@@ -233,8 +238,13 @@ fn reach_of(prompt: &[u32], cut: usize) -> usize {
 
 /// At most this many shared checkpoints ([`PagedRadix::note_resume`]) are
 /// protected per radix. A system prompt and tool block shared across agent
-/// sessions needs one; two leave room for a second agent family.
+/// sessions needs one; two leave room for a second agent family. A small
+/// pool protects fewer ([`PagedRadix::shared_cap`]).
 pub const SHARED_CKPT_CAP: usize = 2;
+
+/// A shared checkpoint no other sequence resumed while this many sequences
+/// began is held no longer: a stale shared cut cannot keep its index for ever.
+const SHARED_STALE_SEQS: u64 = 256;
 
 /// Checkpoints as cache, not reservation (issue #33).
 ///
@@ -288,6 +298,7 @@ impl PagedRadix {
                 reach: 0,
                 reach_key: 0,
                 shared_hits: 0,
+                shared_seq: 0,
                 shared: false,
                 tkey: None,
                 low: false,
@@ -295,6 +306,7 @@ impl PagedRadix {
             free_nodes: Vec::new(),
             clock: 0,
             state_free: Vec::new(),
+            state_slots: 0,
             protect_proven: false,
             st_writes: 0,
             st_steals: 0,
@@ -423,11 +435,13 @@ impl PagedRadix {
     /// diverges sooner branches off - a new agent session resuming the
     /// back-off cut of the system prompt it shares - so the checkpoint is
     /// SHARED and held against steals while
-    /// it ranks among the [`SHARED_CKPT_CAP`] most resumed shared ones (ties:
+    /// it ranks among the [`Self::shared_cap`] most resumed shared ones (ties:
     /// the most recently used). Past the cap the lowest-ranked one turns
     /// plain; when that is the newcomer, each held one loses a hit, so a
-    /// prefix nobody resumes any more gives way. A checkpoint with no known
-    /// writer (a tier restore) is claimed by its first resumer. A
+    /// prefix nobody resumes any more gives way, and one no other sequence
+    /// resumed for [`SHARED_STALE_SEQS`] sequences is held no longer. A
+    /// checkpoint with no known writer (a tier restore) is claimed by its
+    /// first resumer with a sequence. A
     /// background slot, or a background checkpoint, changes nothing.
     pub fn note_resume(&mut self, slot: usize, tokens: &[u32], pos: usize) {
         if self.slot_is_low(slot) {
@@ -446,23 +460,34 @@ impl PagedRadix {
         if n.low {
             return;
         }
-        if n.writer == 0 && seq != 0 && tokens.len() > pos {
+        if n.writer == 0 {
             // a tier restore or other unstamped cut: the first resumer
-            // claims it, as if its own prompt had cut there
-            let reach = reach_of(tokens, pos);
-            let n = &mut self.nodes[node as usize];
-            n.writer = seq;
-            n.reach = u32::try_from(reach).unwrap_or(u32::MAX);
-            n.reach_key = hash_block(&tokens[..reach]);
+            // claims it, as if its own prompt had cut there; a slot with no
+            // sequence leaves it unknown, and unknown is never shared
+            if seq != 0 && tokens.len() > pos {
+                let reach = reach_of(tokens, pos);
+                let n = &mut self.nodes[node as usize];
+                n.writer = seq;
+                n.reach = u32::try_from(reach).unwrap_or(u32::MAX);
+                n.reach_key = hash_block(&tokens[..reach]);
+            }
             return;
         }
         let upto = n.reach as usize;
-        if n.writer != 0 && tokens.len() >= upto && hash_block(&tokens[..upto]) == n.reach_key {
+        if tokens.len() >= upto && hash_block(&tokens[..upto]) == n.reach_key {
             self.slot_seq[slot] = n.writer;
             return;
         }
+        let now = self.next_seq;
+        for n in &mut self.nodes {
+            if n.shared && now.saturating_sub(n.shared_seq) > SHARED_STALE_SEQS {
+                n.shared = false;
+                n.shared_hits = 0;
+            }
+        }
         let n = &mut self.nodes[node as usize];
         n.shared_hits = n.shared_hits.saturating_add(1);
+        n.shared_seq = now;
         n.shared = true;
         let held: Vec<usize> = (0..self.nodes.len())
             .filter(|&i| {
@@ -470,7 +495,7 @@ impl PagedRadix {
                 n.alive && n.shared && n.state_blk.is_some()
             })
             .collect();
-        if held.len() > SHARED_CKPT_CAP
+        if held.len() > self.shared_cap()
             && let Some(&low) = held
                 .iter()
                 .min_by_key(|&&i| (self.nodes[i].shared_hits, self.nodes[i].ckpt_used))
@@ -491,6 +516,7 @@ impl PagedRadix {
     /// exist at once is whatever the pool can spare.
     pub fn set_state_paged(&mut self, max_ckpts: u32, pages_per_ckpt: usize) {
         self.state_free = (0..max_ckpts).rev().collect();
+        self.state_slots = max_ckpts;
         self.paged = Some(PagedState {
             pages_per_ckpt: pages_per_ckpt.max(1),
             pages: vec![Vec::new(); max_ckpts as usize],
@@ -548,6 +574,20 @@ impl PagedRadix {
     /// to `0..n` (call once at pool setup, alongside the device state pool alloc).
     pub fn set_state_capacity(&mut self, n: u32) {
         self.state_free = (0..n).rev().collect();
+        self.state_slots = n;
+    }
+
+    /// How many shared checkpoints [`Self::note_resume`] holds: a quarter of
+    /// the checkpoint indices, at most [`SHARED_CKPT_CAP`], so most of a small
+    /// pool stays for each session's own cuts (none held below 4 indices).
+    fn shared_cap(&self) -> usize {
+        SHARED_CKPT_CAP.min(self.state_slots as usize / 4)
+    }
+
+    /// A shared checkpoint still held against steals: within
+    /// [`SHARED_STALE_SEQS`] sequences of its latest shared hit.
+    fn holds(&self, n: &Node) -> bool {
+        n.shared && self.next_seq.saturating_sub(n.shared_seq) <= SHARED_STALE_SEQS
     }
 
     fn tick(&mut self) -> u64 {
@@ -953,7 +993,7 @@ impl PagedRadix {
             .iter()
             .enumerate()
             .filter(|(i, n)| {
-                *i != 0 && *i as u32 != spare && n.alive && n.state_blk.is_some() && !n.shared
+                *i != 0 && *i as u32 != spare && n.alive && n.state_blk.is_some() && !self.holds(n)
             })
             .min_by_key(|(_, n)| {
                 (
@@ -989,6 +1029,7 @@ impl PagedRadix {
         n.reach = 0;
         n.reach_key = 0;
         n.shared_hits = 0;
+        n.shared_seq = 0;
         n.shared = false;
         if let Some(p) = self.paged.as_mut() {
             p.attached[idx as usize] = false;
@@ -1099,7 +1140,7 @@ impl PagedRadix {
             .min_by_key(|(_, n)| {
                 (
                     !n.low,
-                    n.shared,
+                    self.holds(n),
                     n.anchor,
                     if paged { n.ckpt_used } else { n.last_used },
                 )
@@ -1156,7 +1197,7 @@ impl PagedRadix {
             .nodes
             .iter()
             .enumerate()
-            .filter(|(i, n)| *i != 0 && n.alive && n.state_blk.is_some() && !n.shared)
+            .filter(|(i, n)| *i != 0 && n.alive && n.state_blk.is_some() && !self.holds(n))
             .min_by_key(|(_, n)| (!n.low, n.anchor, protect && n.recurred, n.last_used))
             .map(|(i, _)| i)
         else {
@@ -1164,7 +1205,7 @@ impl PagedRadix {
             if self
                 .nodes
                 .iter()
-                .any(|n| n.alive && n.shared && n.state_blk.is_some())
+                .any(|n| n.alive && self.holds(n) && n.state_blk.is_some())
             {
                 self.st_refused += 1;
             }
@@ -1235,6 +1276,7 @@ impl PagedRadix {
                 reach: 0,
                 reach_key: 0,
                 shared_hits: 0,
+                shared_seq: 0,
                 shared: false,
                 tkey: self.nodes[node as usize].tkey.map(|k| k.child(chunk)),
                 low,
@@ -1420,6 +1462,7 @@ impl PagedRadix {
                 reach: 0,
                 reach_key: 0,
                 shared_hits: 0,
+                shared_seq: 0,
                 shared: false,
                 tkey,
                 low: false,
@@ -2577,39 +2620,123 @@ mod tests {
 
     #[test]
     fn with_every_checkpoint_shared_an_admission_is_refused_not_stolen() {
-        for paged in [false, true] {
-            let mut pool = KvPool::with_blocks(64);
-            let mut r = PagedRadix::new();
-            if paged {
-                r.set_state_paged(2, 1);
-            } else {
-                r.set_state_capacity(2);
-            }
-            // two system prompts, each cut by its first session inside the
-            // prompt and resumed by another session that diverges there
-            let mut held = Vec::new();
-            for sys in [1u32, 2] {
-                let (toks, got) = session(&mut r, &mut pool, 0, &[sys, sys + 10], &[1]);
-                r.begin_seq(1, &[]);
-                r.note_resume(1, &block_toks(sys), BLOCK_TOKENS);
-                held.push((toks, got[0].expect("room")));
-            }
-            assert_eq!(shared_held(&r), 2);
-            let t = prefill(&mut pool, 1);
-            let c: Vec<u32> = [block_toks(9), vec![7]].concat();
-            r.insert(&c, t.blocks(), &mut pool);
-            let got = if paged {
-                r.attach_state_with_pool(&c, BLOCK_TOKENS, &mut pool)
-            } else {
-                r.attach_state(&c, BLOCK_TOKENS)
-            };
-            assert!(got.is_none(), "refused (paged {paged})");
-            let (_, steals, refused) = r.state_stats();
-            assert_eq!((steals, refused), (0, 1), "paged {paged}");
-            for (toks, idx) in &held {
-                assert_eq!(r.match_full(toks).ckpt, Some((BLOCK_TOKENS, *idx)));
-            }
+        // Eight indices hold two shared cuts; the pool has pages for no more
+        // and nothing else to free, so a third prompt's cut is refused.
+        let mut pool = KvPool::with_blocks(64);
+        let mut r = PagedRadix::new();
+        r.set_state_paged(8, 1);
+        let mut held = Vec::new();
+        for sys in [1u32, 2] {
+            let (toks, got) = session(&mut r, &mut pool, 0, &[sys, sys + 10], &[1]);
+            r.begin_seq(1, &[]);
+            r.note_resume(1, &block_toks(sys), BLOCK_TOKENS);
+            // a live slot still reads the prompt's tail: not a dead leaf
+            pool.retain(r.block_at(&toks, 2 * BLOCK_TOKENS).expect("tail"));
+            held.push((toks, got[0].expect("room")));
         }
+        assert_eq!(shared_held(&r), 2);
+        let t = prefill(&mut pool, 1);
+        let c: Vec<u32> = [block_toks(9), vec![7]].concat();
+        r.insert(&c, t.blocks(), &mut pool);
+        let _rest: Vec<BlockId> = (0..pool.free_blocks())
+            .map(|_| pool.alloc().expect("free"))
+            .collect();
+        assert!(r.attach_state_with_pool(&c, BLOCK_TOKENS, &mut pool).is_none());
+        let (_, steals, refused) = r.state_stats();
+        assert_eq!((steals, refused), (0, 1));
+        for (toks, idx) in &held {
+            assert_eq!(r.match_full(toks).ckpt, Some((BLOCK_TOKENS, *idx)));
+        }
+    }
+
+    /// Three prompts, each cut once by its first session and resumed by
+    /// another: how many of their cuts are held.
+    fn shared_of_three(paged: bool, slots: u32) -> usize {
+        let mut pool = KvPool::with_blocks(256);
+        let mut r = PagedRadix::new();
+        if paged {
+            r.set_state_paged(slots, 1);
+        } else {
+            r.set_state_capacity(slots);
+        }
+        for sys in [1u32, 2, 3] {
+            let (_, got) = session(&mut r, &mut pool, 0, &[sys, sys + 10], &[1]);
+            assert!(got[0].is_some());
+            hit(&mut r, sys, 1);
+        }
+        shared_held(&r)
+    }
+
+    #[test]
+    fn the_shared_cap_is_a_quarter_of_the_checkpoints_at_most_two() {
+        for paged in [false, true] {
+            assert_eq!(shared_of_three(paged, 3), 0, "3 protect nothing");
+            assert_eq!(shared_of_three(paged, 4), 1, "4 protect one");
+            assert_eq!(shared_of_three(paged, 8), 2, "8 protect two");
+            assert_eq!(shared_of_three(paged, 64), SHARED_CKPT_CAP);
+        }
+    }
+
+    #[test]
+    fn per_session_checkpoints_still_admit_with_the_shared_cap_reached() {
+        let mut pool = KvPool::with_blocks(256);
+        let mut r = PagedRadix::new();
+        r.set_state_capacity(8);
+        let a = shared_prompt(&mut r, &mut pool, 1, 2);
+        let b = shared_prompt(&mut r, &mut pool, 2, 2);
+        assert_eq!(shared_held(&r), 2);
+        for seed in 100..120 {
+            let (_, got) = session(&mut r, &mut pool, 2, &[seed, seed + 50], &[1]);
+            assert!(got[0].is_some(), "a session's own cut is admitted");
+        }
+        let (_, steals, refused) = r.state_stats();
+        assert!(steals > 0);
+        assert_eq!(refused, 0);
+        assert!(r.nodes[a as usize].state_blk.is_some() && r.nodes[b as usize].state_blk.is_some());
+    }
+
+    #[test]
+    fn a_shared_cut_nobody_resumes_for_long_ages_out() {
+        let mut pool = KvPool::with_blocks(256);
+        let mut r = PagedRadix::new();
+        r.set_state_capacity(8);
+        let old = shared_prompt(&mut r, &mut pool, 1, 3);
+        let kept = shared_prompt(&mut r, &mut pool, 2, 3);
+        for _ in 0..SHARED_STALE_SEQS {
+            r.begin_seq(5, &[]);
+        }
+        assert!(r.holds(&r.nodes[kept as usize]), "just within the window");
+        r.begin_seq(5, &[]);
+        assert!(!r.holds(&r.nodes[old as usize]), "stale: no longer held");
+        hit(&mut r, 2, 1);
+        assert!(r.holds(&r.nodes[kept as usize]), "resumed again");
+        // a newcomer takes the stale one's place in the cap...
+        let new = shared_prompt(&mut r, &mut pool, 3, 1);
+        assert!(r.nodes[new as usize].shared, "one hit gets in");
+        assert!(!r.nodes[old as usize].shared && r.nodes[old as usize].shared_hits == 0);
+        assert_eq!(shared_held(&r), SHARED_CKPT_CAP);
+        // ...and its index goes to the sessions' own cuts
+        for seed in 100..120 {
+            session(&mut r, &mut pool, 2, &[seed, seed + 50], &[1]);
+        }
+        assert!(r.nodes[old as usize].state_blk.is_none(), "stolen");
+        assert!(r.nodes[kept as usize].state_blk.is_some() && r.nodes[new as usize].state_blk.is_some());
+    }
+
+    #[test]
+    fn an_unstamped_checkpoint_resumed_by_a_slot_without_a_sequence_is_not_shared() {
+        let mut pool = KvPool::with_blocks(64);
+        let mut r = PagedRadix::new();
+        r.set_state_paged(8, 1);
+        let (a, _) = session(&mut r, &mut pool, 3, &[1, 2, 10], &[2]);
+        let x = r.node_at(&a, 2 * BLOCK_TOKENS).expect("cut");
+        let idx = r.take_state(x).expect("demoted");
+        assert!(r.attach_state_at(&a, 2 * BLOCK_TOKENS, idx), "restored");
+        assert_eq!(r.slot_seq[1], 0, "slot 1 never began a sequence");
+        let b: Vec<u32> = [1, 2, 20].iter().flat_map(|&s| block_toks(s)).collect();
+        r.note_resume(1, &b, 2 * BLOCK_TOKENS);
+        let n = &r.nodes[x as usize];
+        assert_eq!((shared_held(&r), n.shared_hits, n.writer), (0, 0, 0));
     }
 
     #[test]
