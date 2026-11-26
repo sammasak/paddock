@@ -3797,6 +3797,15 @@ mod resume_gate_tests {
     }
 
     #[test]
+    fn non_default_thresholds_move_both_boundaries() {
+        // min 1024, live max 4: slots 4 resumes from 32, slots 5 from 1024
+        assert!(resume_worth_it(32, 4, 1024, 4));
+        assert!(!resume_worth_it(1023, 5, 1024, 4));
+        assert!(resume_worth_it(1024, 5, 1024, 4));
+        assert!(!resume_worth_it(512, 13, 1024, 12));
+    }
+
+    #[test]
     fn config_beats_env_beats_default() {
         assert_eq!(gate_threshold(Some(256), Some("1024"), 512), 256);
         assert_eq!(gate_threshold(None, Some("1024"), 512), 1024);

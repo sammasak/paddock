@@ -362,7 +362,7 @@ pub async fn run(
             "qwen35 prefill chunk set by the config"
         );
     }
-    let pr = cfg.prefix_resume;
+    let pr = cfg.prefix_resume.checked()?;
     paddock_engine::gpu_model::qwen35::set_resume_gate(
         paddock_engine::gpu_model::qwen35::ResumeGateCfg {
             min_cache_prefix: pr.min_cache_prefix,

@@ -202,8 +202,10 @@
 
 # qwen35 multi-turn resume gate. A cached prefix resumes when its checkpoint
 # is at least min_cache_prefix tokens deep, or on any serve with at most
-# resume_live_max slots (where the per-slot restore stays cheap). Unset = the
-# env vars below, else 512 / 12.
+# resume_live_max slots (where the per-slot restore stays cheap).
+# min_cache_prefix (32 or more) is also the floor for multimodal resumes and
+# the shared-prefix cuts. Unset = the env vars below, else 512 / 12; here the
+# file wins over the env, and the env is read by dev builds only.
 # Env: PADDOCK_MIN_CACHE_PREFIX, PADDOCK_RESUME_LIVE_MAX
 # [prefix_resume]
 # min_cache_prefix = 512
