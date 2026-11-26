@@ -22,10 +22,10 @@
 //! and the KV page footprint. `ttft_ms` runs from arrival at the edge to the
 //! engine's first sampled token (tokenize + queue + prefill), not to the first
 //! response byte: a stream's SSE preamble goes out before prefill finishes.
-//! A chat stream that ends before the engine's stats arrive (a stop string,
-//! a disconnect) ends it where the handler received its first token. Only a
-//! request without a token falls back to the first byte, so every success
-//! still carries one TTFT sample.
+//! A chat, messages or completions stream that ends before the engine's stats
+//! arrive (a stop string, a disconnect, an error) ends it where the handler
+//! received its first token. Only a request without a token falls back to the
+//! first byte, so every success still carries one TTFT sample.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -122,7 +122,7 @@ pub struct EventRecord {
     #[serde(rename = "paddock.kv_pages", skip_serializing_if = "Option::is_none")]
     pub kv_pages: Option<u64>,
     /// Arrival at the edge to the engine's first sampled token (tokenize +
-    /// queue + prefill); a chat stream cut before the engine's stats arrived
+    /// queue + prefill); a stream cut before the engine's stats arrived
     /// ends it at the handler's receipt of that token. A request without a
     /// token (embeddings, audio, an engine error or a disconnect before the
     /// first one) falls back to the first response-body byte.
@@ -1009,27 +1009,150 @@ mod tests {
         assert_eq!(r.finish_reasons, ["stop"]);
     }
 
-    /// A streamed chat answer through the real handler and recording body:
-    /// the SSE preamble leaves at once, the first token can arrive `DELAY`
-    /// later. Returns the test's sender and the body, its preamble read.
-    async fn chat_stream(stop: &[&str]) -> (TokenTx, RecordingForTest) {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let metrics = crate::metrics::Metrics::new("i".into(), Default::default(), None);
-        let mut r = RecordingForTest::new(metrics, None, |scope| {
-            crate::chat::stream_for_test(scope, stop, vec![rx])
-        });
-        assert!(r.frame().await.expect("preamble").contains("assistant"));
-        // header time, far enough under DELAY that it cannot pass for it
-        assert!(r.t0().elapsed() < DELAY / 2, "{:?}", r.t0().elapsed());
-        tokio::time::sleep(DELAY).await;
-        (tx, r)
+    /// The streaming endpoints that stamp their first token's receipt.
+    #[derive(Clone, Copy, Debug)]
+    enum Endpoint {
+        Chat,
+        Messages,
+        Completions,
+    }
+    const ENDPOINTS: [Endpoint; 3] = [Endpoint::Chat, Endpoint::Messages, Endpoint::Completions];
+
+    /// What the stop-string exit records as its finish reason.
+    fn stop_reason(e: Endpoint) -> &'static str {
+        match e {
+            Endpoint::Messages => "stop_sequence",
+            Endpoint::Chat | Endpoint::Completions => "stop",
+        }
     }
 
     type TokenTx = tokio::sync::mpsc::UnboundedSender<paddock_engine::service::TokenEvent>;
-    const DELAY: Duration = Duration::from_millis(120);
+
+    /// The gap the tests open between instants they compare. Sleeping only
+    /// bounds a gap from below, so every bound is a captured instant and a
+    /// loaded host stretches the gaps without breaking an assertion.
+    const DELAY: Duration = Duration::from_millis(20);
+
+    /// One streamed answer through `e`'s real handler and the recording body.
+    struct Stream {
+        tx: TokenTx,
+        r: RecordingForTest,
+        marks: Marks,
+    }
+
+    /// The instants a stream's TTFT is checked against.
+    #[derive(Clone, Copy)]
+    struct Marks {
+        t0: Instant,
+        /// Taken once the preamble is out: a first-byte fallback is no later.
+        header: Instant,
+    }
+
+    impl Stream {
+        async fn new(e: Endpoint, stop: &[&str]) -> Self {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let metrics = crate::metrics::Metrics::new("i".into(), Default::default(), None);
+            let mut r = RecordingForTest::new(metrics, None, |scope| match e {
+                Endpoint::Chat => crate::chat::stream_for_test(scope, stop, vec![rx]),
+                Endpoint::Messages => crate::messages::stream_for_test(scope, stop, rx),
+                Endpoint::Completions => crate::completions::stream_for_test(scope, stop, vec![rx]),
+            });
+            let t0 = r.t0();
+            // chat's role delta, message_start and ping; completions sends none
+            idle(&mut r).await;
+            let header = Instant::now();
+            Stream {
+                tx,
+                r,
+                marks: Marks { t0, header },
+            }
+        }
+
+        /// After `DELAY`, a first token that decodes to no text yet (half of
+        /// `é`), so no endpoint sends a frame for it. Returns the instants
+        /// around its receipt: sent, and seen once the handler went idle.
+        async fn first_token(&mut self) -> (Instant, Instant) {
+            tokio::time::sleep(DELAY).await;
+            let sent = Instant::now();
+            self.tx.send(token(8)).unwrap();
+            idle(&mut self.r).await;
+            let seen = Instant::now();
+            // the exit's frames come `DELAY` after the receipt, so a
+            // first-frame fallback taken there cannot pass for it
+            tokio::time::sleep(DELAY).await;
+            (sent, seen)
+        }
+
+        /// Drop the body (a client that left, if it had not ended) and
+        /// return its record.
+        fn finish(self) -> (Arc<EventRecord>, Marks) {
+            (self.r.finish(), self.marks)
+        }
+    }
+
+    impl Marks {
+        fn ms(self, t: Instant) -> u64 {
+            t.duration_since(self.t0).as_millis() as u64
+        }
+
+        /// The TTFT lies within the first token's receipt, past the header.
+        fn assert_first_token(
+            self,
+            e: Endpoint,
+            rec: &EventRecord,
+            (sent, seen): (Instant, Instant),
+        ) {
+            let ttft = rec
+                .ttft_ms
+                .unwrap_or_else(|| panic!("{e:?}: no TTFT sample"));
+            assert!(
+                self.ms(sent) > self.ms(self.header),
+                "{e:?}: DELAY opens the gap"
+            );
+            assert!(
+                (self.ms(sent)..=self.ms(seen)).contains(&ttft),
+                "{e:?}: {ttft} ms, the token arrived in {}..={} ms",
+                self.ms(sent),
+                self.ms(seen)
+            );
+            assert!(ttft <= rec.duration_ms, "{e:?}");
+        }
+
+        /// The documented first-byte fallback: no later than the header for
+        /// an endpoint with a preamble. Completions has none, so a stream
+        /// without a frame has no sample.
+        fn assert_first_byte(self, e: Endpoint, rec: &EventRecord, framed: bool) {
+            match (e, framed) {
+                (Endpoint::Completions, false) => assert_eq!(rec.ttft_ms, None, "{e:?}"),
+                (Endpoint::Completions, true) => {
+                    assert!(
+                        rec.ttft_ms.is_some_and(|ms| ms > self.ms(self.header)),
+                        "{e:?}"
+                    )
+                }
+                _ => assert!(
+                    rec.ttft_ms.is_some_and(|ms| ms <= self.ms(self.header)),
+                    "{e:?}: {:?} ms, header at {} ms",
+                    rec.ttft_ms,
+                    self.ms(self.header)
+                ),
+            }
+        }
+    }
+
+    /// Read frames until the handler has gone `DELAY` without one.
+    async fn idle(r: &mut RecordingForTest) {
+        while let Ok(Some(_)) = tokio::time::timeout(DELAY, r.frame()).await {}
+    }
 
     fn token(id: u32) -> paddock_engine::service::TokenEvent {
         paddock_engine::service::TokenEvent::Token { id, logprobs: None }
+    }
+
+    fn engine_error() -> paddock_engine::service::TokenEvent {
+        paddock_engine::service::TokenEvent::Error(paddock_engine::service::EngineError::internal(
+            "boom",
+        ))
     }
 
     async fn drain(r: &mut RecordingForTest) -> Vec<String> {
@@ -1042,71 +1165,83 @@ mod tests {
 
     #[tokio::test]
     async fn a_stop_string_exit_ends_ttft_at_the_first_token_not_the_header() {
-        let (tx, mut r) = chat_stream(&["ll"]).await;
-        // "he" then "ll": the stop string hits and n == 1 leaves the handler
-        // without waiting for the engine's Done
-        tx.send(token(4)).unwrap();
-        tx.send(token(5)).unwrap();
-        let frames = drain(&mut r).await;
-        assert!(frames.iter().any(|f| f.contains("\"stop\"")), "{frames:?}");
-        let rec = r.finish();
-        assert!(!rec.client_disconnected);
-        assert_eq!(rec.finish_reasons, ["stop"]);
-        let ttft = rec.ttft_ms.expect("a TTFT sample");
-        assert!(ttft >= DELAY.as_millis() as u64, "header time: {ttft} ms");
-        assert!(ttft <= rec.duration_ms);
+        for e in ENDPOINTS {
+            let mut s = Stream::new(e, &["ll"]).await;
+            let at = s.first_token().await;
+            // "é", "he" then "ll": the stop string hits and the handler leaves
+            // without waiting for the engine's Done
+            for id in [9, 4, 5] {
+                s.tx.send(token(id)).unwrap();
+            }
+            let frames = drain(&mut s.r).await;
+            assert!(frames.iter().any(|f| f.contains("é")), "{e:?}: {frames:?}");
+            let (rec, marks) = s.finish();
+            assert!(!rec.client_disconnected, "{e:?}");
+            assert_eq!(rec.finish_reasons, [stop_reason(e)], "{e:?}");
+            marks.assert_first_token(e, &rec, at);
+        }
     }
 
     #[tokio::test]
     async fn a_disconnect_after_the_first_token_keeps_its_arrival() {
-        let (tx, mut r) = chat_stream(&[]).await;
-        tx.send(token(4)).unwrap();
-        assert!(r.frame().await.expect("delta").contains("he"));
-        let rec = r.finish();
-        assert!(rec.client_disconnected);
-        assert!(rec.ttft_ms.is_some_and(|ms| ms >= DELAY.as_millis() as u64));
+        for e in ENDPOINTS {
+            let mut s = Stream::new(e, &[]).await;
+            let at = s.first_token().await;
+            let (rec, marks) = s.finish();
+            assert!(rec.client_disconnected, "{e:?}");
+            marks.assert_first_token(e, &rec, at);
+        }
     }
 
-    /// No token at all: the documented first-byte fallback, one sample per
-    /// request, no panic - on an engine error and on a client that left.
+    #[tokio::test]
+    async fn an_engine_error_after_the_first_token_keeps_its_arrival() {
+        for e in ENDPOINTS {
+            let mut s = Stream::new(e, &[]).await;
+            let at = s.first_token().await;
+            s.tx.send(engine_error()).unwrap();
+            drain(&mut s.r).await;
+            let (rec, marks) = s.finish();
+            marks.assert_first_token(e, &rec, at);
+        }
+    }
+
+    /// No token at all: the documented first-byte fallback, at most one
+    /// sample per request, no panic - on an engine error and on a client
+    /// that left.
     #[tokio::test]
     async fn a_stream_without_a_token_falls_back_to_its_first_byte() {
-        let (tx, mut r) = chat_stream(&["ll"]).await;
-        tx.send(paddock_engine::service::TokenEvent::Error(
-            paddock_engine::service::EngineError::internal("boom"),
-        ))
-        .unwrap();
-        let frames = drain(&mut r).await;
-        assert!(
-            frames.iter().any(|f| f.contains("engine_error")),
-            "{frames:?}"
-        );
-        let rec = r.finish();
-        assert!(rec.ttft_ms.is_some_and(|ms| ms < DELAY.as_millis() as u64));
+        for e in ENDPOINTS {
+            let mut s = Stream::new(e, &["ll"]).await;
+            tokio::time::sleep(DELAY).await;
+            s.tx.send(engine_error()).unwrap();
+            assert!(!drain(&mut s.r).await.is_empty(), "{e:?}");
+            let (rec, marks) = s.finish();
+            marks.assert_first_byte(e, &rec, true);
 
-        let (_tx, r) = chat_stream(&[]).await;
-        let rec = r.finish();
-        assert!(rec.client_disconnected);
-        assert!(rec.ttft_ms.is_some_and(|ms| ms < DELAY.as_millis() as u64));
+            let (rec, marks) = Stream::new(e, &[]).await.finish();
+            assert!(rec.client_disconnected, "{e:?}");
+            marks.assert_first_byte(e, &rec, false);
+        }
     }
 
-    /// The handler's receipt never displaces the engine's earlier stamp.
+    /// The handler's receipt never displaces the engine's earlier stamp,
+    /// hand-set here so no clock reading decides the result.
     #[tokio::test]
     async fn the_done_path_keeps_the_engine_first_token() {
-        let (tx, mut r) = chat_stream(&[]).await;
-        let t0 = r.t0();
-        tx.send(token(4)).unwrap();
-        tx.send(paddock_engine::service::TokenEvent::Done(
-            paddock_engine::service::FinishReason::Length,
-            paddock_engine::service::RunStats {
-                prefilled_at: Some(t0 + Duration::from_millis(40)),
-                ..Default::default()
-            },
-        ))
-        .unwrap();
-        drain(&mut r).await;
-        let rec = r.finish();
-        assert_eq!(rec.finish_reasons, ["length"]);
-        assert_eq!(rec.ttft_ms, Some(40));
+        for e in ENDPOINTS {
+            let mut s = Stream::new(e, &[]).await;
+            s.first_token().await;
+            s.tx.send(paddock_engine::service::TokenEvent::Done(
+                paddock_engine::service::FinishReason::Length,
+                paddock_engine::service::RunStats {
+                    prefilled_at: Some(s.marks.t0 + Duration::from_millis(1)),
+                    ..Default::default()
+                },
+            ))
+            .unwrap();
+            drain(&mut s.r).await;
+            let (rec, _) = s.finish();
+            assert_eq!(rec.ttft_ms, Some(1), "{e:?}");
+        }
     }
 }

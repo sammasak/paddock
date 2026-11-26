@@ -1877,6 +1877,11 @@ fn stream_body(
                     ctx.prompt_len = ctx.prompt_len.max(rows as usize);
                 }
                 Some(TokenEvent::Token { id: t, .. }) => {
+                    // the first token, for a stream that never sees its Done
+                    // (the stop-string break below, a disconnect, an error)
+                    if ids.is_empty() {
+                        ctx.scope.token_seen();
+                    }
                     ids.push(t);
                     let raw = sd.push(&ctx.tokenizer, t);
                     let parsed = ctx.parse_raw(&raw);
@@ -3285,6 +3290,10 @@ fn stream_mcp_agent(
                         }
                     }
                     Some(TokenEvent::Token { id: t, .. }) => {
+                        // each round's first token; the earliest one stands
+                        if ids.is_empty() {
+                            scope.token_seen();
+                        }
                         ids.push(t);
                         let raw = sd.push(&tokenizer, t);
                         let mut parsed = parse(dialect, &raw, thinking_open, hints.as_ref());
@@ -3559,6 +3568,33 @@ where
                 .event(Event::default().event("ping").data(r#"{"type": "ping"}"#)),
         )
         .into_response()
+}
+
+/// The plain streaming handler over `rx` with no model behind it: the chat
+/// tests' vocabulary, the Plain dialect and the client's `stop` strings.
+#[cfg(test)]
+pub(crate) fn stream_for_test(
+    scope: crate::events::EventScope,
+    stop: &[&str],
+    rx: UnboundedReceiver<TokenEvent>,
+) -> axum::body::Body {
+    let ctx = Ctx {
+        id: "msg_t".into(),
+        model_id: "m1".into(),
+        tokenizer: crate::chat::tokenizer_for_test(),
+        prompt_len: 16,
+        dialect: Dialect::Plain,
+        thinking_open: false,
+        hints: None,
+        single_tool_call: false,
+        stop_strings: stop.iter().map(|s| (*s).to_owned()).collect(),
+        omit_thinking: false,
+        context_management: None,
+        compaction: None,
+        ocr: None,
+        scope,
+    };
+    stream_response(ctx, rx).into_body()
 }
 
 fn ev(name: &str, data: Value) -> Result<Event, std::convert::Infallible> {
