@@ -22,7 +22,7 @@
 //! and the KV page footprint. `ttft_ms` runs from arrival at the edge to the
 //! engine's first sampled token (tokenize + queue + prefill), not to the first
 //! response byte: a stream's SSE preamble goes out before prefill finishes.
-//! A chat, messages or completions stream that ends before the engine's stats
+//! A chat, messages, completions or responses stream that ends before the engine's stats
 //! arrive (a stop string, a disconnect, an error) ends it where the handler
 //! received its first token. Only a request without a token falls back to the
 //! first byte, so every success still carries one TTFT sample.
@@ -125,7 +125,8 @@ pub struct EventRecord {
     /// queue + prefill); a stream cut before the engine's stats arrived
     /// ends it at the handler's receipt of that token. A request without a
     /// token (embeddings, audio, an engine error or a disconnect before the
-    /// first one) falls back to the first response-body byte.
+    /// first one) falls back to the first response-body byte. A completions
+    /// stream that ends before sending any frame has no sample at all.
     #[serde(rename = "paddock.ttft_ms", skip_serializing_if = "Option::is_none")]
     pub ttft_ms: Option<u64>,
     /// Output tokens over the post-first-token window - the edge view of decode
@@ -1015,14 +1016,23 @@ mod tests {
         Chat,
         Messages,
         Completions,
+        Responses,
     }
-    const ENDPOINTS: [Endpoint; 3] = [Endpoint::Chat, Endpoint::Messages, Endpoint::Completions];
+    const ENDPOINTS: [Endpoint; 4] = [
+        Endpoint::Chat,
+        Endpoint::Messages,
+        Endpoint::Completions,
+        Endpoint::Responses,
+    ];
+    /// The endpoints with a client `stop` parameter (responses has none).
+    const STOP_ENDPOINTS: [Endpoint; 3] =
+        [Endpoint::Chat, Endpoint::Messages, Endpoint::Completions];
 
     /// What the stop-string exit records as its finish reason.
     fn stop_reason(e: Endpoint) -> &'static str {
         match e {
             Endpoint::Messages => "stop_sequence",
-            Endpoint::Chat | Endpoint::Completions => "stop",
+            Endpoint::Chat | Endpoint::Completions | Endpoint::Responses => "stop",
         }
     }
 
@@ -1056,9 +1066,11 @@ mod tests {
                 Endpoint::Chat => crate::chat::stream_for_test(scope, stop, vec![rx]),
                 Endpoint::Messages => crate::messages::stream_for_test(scope, stop, rx),
                 Endpoint::Completions => crate::completions::stream_for_test(scope, stop, vec![rx]),
+                Endpoint::Responses => crate::responses::stream_for_test(scope, rx),
             });
             let t0 = r.t0();
-            // chat's role delta, message_start and ping; completions sends none
+            // chat's role delta, message_start and ping, response.created and
+            // in_progress; completions sends none
             idle(&mut r).await;
             let header = Instant::now();
             Stream {
@@ -1165,7 +1177,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_stop_string_exit_ends_ttft_at_the_first_token_not_the_header() {
-        for e in ENDPOINTS {
+        for e in STOP_ENDPOINTS {
             let mut s = Stream::new(e, &["ll"]).await;
             let at = s.first_token().await;
             // "é", "he" then "ll": the stop string hits and the handler leaves
@@ -1221,6 +1233,47 @@ mod tests {
             let (rec, marks) = Stream::new(e, &[]).await.finish();
             assert!(rec.client_disconnected, "{e:?}");
             marks.assert_first_byte(e, &rec, false);
+        }
+    }
+
+    /// The messages agent loop has no CPU-only stream (each round submits
+    /// to the model's engine), so its rounds' receipts drive
+    /// `messages::agent_token` behind a preamble frame here: a stream that
+    /// ends in round 1 without a Done keeps round 0's first token, and a
+    /// loop without a token falls back to its first byte.
+    #[tokio::test]
+    async fn an_agent_loop_keeps_its_first_rounds_token() {
+        for tokens in [true, false] {
+            let metrics = crate::metrics::Metrics::new("i".into(), Default::default(), None);
+            let mut scope = EventScope::default();
+            let mut r = RecordingForTest::new(metrics, None, |s| {
+                scope = s;
+                axum::body::Body::from("event: message_start\n\n")
+            });
+            let t0 = r.t0();
+            r.frame().await.expect("the preamble");
+            let marks = Marks {
+                t0,
+                header: Instant::now(),
+            };
+            let e = Endpoint::Messages;
+            if !tokens {
+                marks.assert_first_byte(e, &r.finish(), true);
+                continue;
+            }
+            tokio::time::sleep(DELAY).await;
+            let sent = Instant::now();
+            let mut round0 = Vec::new();
+            crate::messages::agent_token(&scope, &mut round0, 8);
+            let seen = Instant::now();
+            tokio::time::sleep(DELAY).await;
+            crate::messages::agent_token(&scope, &mut round0, 9);
+            let mut round1 = Vec::new();
+            for t in [4, 5] {
+                crate::messages::agent_token(&scope, &mut round1, t);
+            }
+            assert_eq!((round0, round1), (vec![8, 9], vec![4, 5]));
+            marks.assert_first_token(e, &r.finish(), (sent, seen));
         }
     }
 

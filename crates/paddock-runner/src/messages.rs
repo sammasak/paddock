@@ -3290,11 +3290,7 @@ fn stream_mcp_agent(
                         }
                     }
                     Some(TokenEvent::Token { id: t, .. }) => {
-                        // each round's first token; the earliest one stands
-                        if ids.is_empty() {
-                            scope.token_seen();
-                        }
-                        ids.push(t);
+                        agent_token(&scope, &mut ids, t);
                         let raw = sd.push(&tokenizer, t);
                         let mut parsed = parse(dialect, &raw, thinking_open, hints.as_ref());
                         if single { parsed.tool_calls.truncate(1); parsed.complete_calls = parsed.complete_calls.min(1); }
@@ -3595,6 +3591,16 @@ pub(crate) fn stream_for_test(
         scope,
     };
     stream_response(ctx, rx).into_body()
+}
+
+/// An agent round's receipt of token `t` into its `ids`: the round's first
+/// token stamps the scope, for a stream that never sees its Done; across
+/// rounds the earliest stamp stands.
+pub(crate) fn agent_token(scope: &crate::events::EventScope, ids: &mut Vec<u32>, t: u32) {
+    if ids.is_empty() {
+        scope.token_seen();
+    }
+    ids.push(t);
 }
 
 fn ev(name: &str, data: Value) -> Result<Event, std::convert::Infallible> {

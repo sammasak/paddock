@@ -1550,6 +1550,39 @@ fn stream_response(meta: Meta, rx: UnboundedReceiver<TokenEvent>) -> Response {
     streaming_response(response_events(meta, rx))
 }
 
+/// The streaming handler over `rx` with no model behind it: the chat tests'
+/// vocabulary and the Plain dialect.
+#[cfg(test)]
+pub(crate) fn stream_for_test(
+    scope: crate::events::EventScope,
+    rx: UnboundedReceiver<TokenEvent>,
+) -> axum::body::Body {
+    let meta = Meta {
+        id: "resp_t".into(),
+        model_id: "m1".into(),
+        tokenizer: crate::chat::tokenizer_for_test(),
+        prompt_len: 16,
+        text_prompt_len: 16,
+        audio_rows: 0,
+        dialect: Dialect::Plain,
+        thinking_open: false,
+        hints: None,
+        single_tool_call: false,
+        instructions: None,
+        max_output_tokens: 16,
+        max_tool_calls: None,
+        temperature: 1.0,
+        top_p: 1.0,
+        tools: json!([]),
+        tool_choice: json!("auto"),
+        text_format: json!({"type": "text"}),
+        ex: Extras::default(),
+        want_logprobs: false,
+        scope,
+    };
+    stream_response(meta, rx).into_body()
+}
+
 /// The typed event stream of one generation (`stream_response`'s body; a
 /// compacting request runs its summarization inside the stream first and
 /// then hands over to this).
@@ -1623,6 +1656,11 @@ fn response_events(
                     meta.prompt_len = meta.prompt_len.max(rows as usize);
                 }
                 Some(TokenEvent::Token { id: t, logprobs }) => {
+                    // the first token, for a stream that never sees its Done
+                    // (a disconnect, an engine error)
+                    if ids.is_empty() {
+                        meta.scope.token_seen();
+                    }
                     if meta.want_logprobs
                         && let Some(lp) = &logprobs
                     {
