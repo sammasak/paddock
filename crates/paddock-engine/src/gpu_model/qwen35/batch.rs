@@ -592,6 +592,7 @@ impl GpuQwen35 {
                     .unwrap_or(0)
                     .max(1) as u32;
                 pr.set_state_paged(max_ckpts, pages_per_ckpt);
+                pr.set_state_guaranteed((demand.ckpt_blocks / pages_per_ckpt) as u32);
                 tracing::info!(
                     pages_per_checkpoint = pages_per_ckpt,
                     guaranteed = demand.ckpt_blocks / pages_per_ckpt,

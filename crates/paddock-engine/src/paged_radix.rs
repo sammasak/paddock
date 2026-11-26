@@ -92,7 +92,7 @@ struct Node {
     reach_key: u64,
     /// Resumes of this checkpoint by a sequence other than its writer.
     shared_hits: u32,
-    /// The sequence counter ([`PagedRadix::begin_seq`]) at its latest shared
+    /// The new-sequence count (`PagedRadix::new_seqs`) at its latest shared
     /// hit: held only while that is within [`SHARED_STALE_SEQS`] of now.
     shared_seq: u64,
     /// The checkpoint is SHARED across sequences ([`PagedRadix::note_resume`]):
@@ -195,6 +195,11 @@ pub struct PagedRadix {
     /// Each slot's current sequence id ([`Self::begin_seq`]); 0 = none yet.
     slot_seq: Vec<u64>,
     next_seq: u64,
+    /// Admissions not (yet) known to continue an older sequence: what a
+    /// shared checkpoint ages by, so a busy conversation's own turns do not.
+    new_seqs: u64,
+    /// The slot's admission still counts in `new_seqs`.
+    slot_fresh: Vec<bool>,
     /// Each slot's admitted prompt ([`Self::begin_seq`]).
     slot_prompt: Vec<Vec<u32>>,
     /// The last [`Self::insert_for`], consumed by the next attach. A
@@ -242,8 +247,9 @@ fn reach_of(prompt: &[u32], cut: usize) -> usize {
 /// pool protects fewer ([`PagedRadix::shared_cap`]).
 pub const SHARED_CKPT_CAP: usize = 2;
 
-/// A shared checkpoint no other sequence resumed while this many sequences
-/// began is held no longer: a stale shared cut cannot keep its index for ever.
+/// A shared checkpoint no other sequence resumed while this many new
+/// sequences began (a continuing turn does not count) is held no longer: a
+/// stale shared cut cannot keep its index for ever.
 const SHARED_STALE_SEQS: u64 = 256;
 
 /// Checkpoints as cache, not reservation (issue #33).
@@ -315,6 +321,8 @@ impl PagedRadix {
             slot_low: Vec::new(),
             slot_seq: Vec::new(),
             next_seq: 0,
+            new_seqs: 0,
+            slot_fresh: Vec::new(),
             slot_prompt: Vec::new(),
             last_insert: None,
         }
@@ -418,10 +426,13 @@ impl PagedRadix {
     pub fn begin_seq(&mut self, slot: usize, prompt: &[u32]) {
         if self.slot_seq.len() <= slot {
             self.slot_seq.resize(slot + 1, 0);
+            self.slot_fresh.resize(slot + 1, false);
             self.slot_prompt.resize(slot + 1, Vec::new());
         }
         self.next_seq += 1;
         self.slot_seq[slot] = self.next_seq;
+        self.new_seqs += 1;
+        self.slot_fresh[slot] = true;
         self.slot_prompt[slot].clear();
         self.slot_prompt[slot].extend_from_slice(prompt);
     }
@@ -476,9 +487,12 @@ impl PagedRadix {
         let upto = n.reach as usize;
         if tokens.len() >= upto && hash_block(&tokens[..upto]) == n.reach_key {
             self.slot_seq[slot] = n.writer;
+            if std::mem::take(&mut self.slot_fresh[slot]) {
+                self.new_seqs -= 1; // a next turn, not a new sequence
+            }
             return;
         }
-        let now = self.next_seq;
+        let now = self.new_seqs;
         for n in &mut self.nodes {
             if n.shared && now.saturating_sub(n.shared_seq) > SHARED_STALE_SEQS {
                 n.shared = false;
@@ -569,6 +583,14 @@ impl PagedRadix {
         (self.st_writes, self.st_steals, self.st_refused)
     }
 
+    /// Scale the shared cap ([`Self::shared_cap`]) by `n` checkpoints instead
+    /// of the indices: the paged backing's `max_ckpts` only bounds
+    /// bookkeeping, while `n` is what the plan guarantees will fit. Call after
+    /// [`Self::set_state_paged`].
+    pub fn set_state_guaranteed(&mut self, n: u32) {
+        self.state_slots = n;
+    }
+
     /// Enable DeltaNet state checkpoints (hybrid models): `n` state-pool indices
     /// become available for `attach_state`. Idempotent-ish - resets the free-list
     /// to `0..n` (call once at pool setup, alongside the device state pool alloc).
@@ -587,7 +609,7 @@ impl PagedRadix {
     /// A shared checkpoint still held against steals: within
     /// [`SHARED_STALE_SEQS`] sequences of its latest shared hit.
     fn holds(&self, n: &Node) -> bool {
-        n.shared && self.next_seq.saturating_sub(n.shared_seq) <= SHARED_STALE_SEQS
+        n.shared && self.new_seqs.saturating_sub(n.shared_seq) <= SHARED_STALE_SEQS
     }
 
     fn tick(&mut self) -> u64 {
@@ -2734,6 +2756,35 @@ mod tests {
         assert!(
             r.nodes[kept as usize].state_blk.is_some() && r.nodes[new as usize].state_blk.is_some()
         );
+    }
+
+    #[test]
+    fn a_conversations_own_turns_do_not_age_a_shared_cut() {
+        let mut pool = KvPool::with_blocks(256);
+        let mut r = PagedRadix::new();
+        r.set_state_capacity(8);
+        let kept = shared_prompt(&mut r, &mut pool, 1, 2);
+        let (a, _) = session(&mut r, &mut pool, 3, &[50, 51, 52], &[2]);
+        let writer = r.slot_seq[3];
+        let turn: Vec<u32> = [&a[..], &block_toks(60)[..]].concat();
+        for _ in 0..2 * SHARED_STALE_SEQS {
+            r.begin_seq(3, &turn);
+            r.note_resume(3, &turn, 2 * BLOCK_TOKENS);
+        }
+        assert_eq!(r.slot_seq[3], writer, "every turn continued A");
+        assert!(r.holds(&r.nodes[kept as usize]), "next turns are not new");
+    }
+
+    #[test]
+    fn a_paged_pool_scales_the_cap_by_its_guaranteed_checkpoints() {
+        let mut pool = KvPool::with_blocks(256);
+        let mut r = PagedRadix::new();
+        r.set_state_paged(64, 1);
+        r.set_state_guaranteed(3);
+        for sys in [1u32, 2] {
+            shared_prompt(&mut r, &mut pool, sys, 1);
+        }
+        assert_eq!(shared_held(&r), 0, "3 guaranteed protect nothing");
     }
 
     #[test]
