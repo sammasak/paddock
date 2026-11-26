@@ -903,6 +903,20 @@ pub trait Generator: Send {
         None
     }
 
+    /// The hybrid prefix cache's checkpoint ledger since load:
+    /// `(state writes, LRU steals, refused admissions)`. None without one.
+    /// Host counters only; read once per scheduler pass.
+    fn prefix_state_stats(&self) -> Option<(u64, u64, u64)> {
+        None
+    }
+
+    /// MoE expert slot cache `(hits, misses)` over routed rows since load.
+    /// None without a cache, and on caches whose counters need a device
+    /// sync to read: this is read once per scheduler pass.
+    fn moe_slot_stats(&self) -> Option<(u64, u64)> {
+        None
+    }
+
     /// Free-on-completion hook (P5b): `occupied[k]` is whether slot `k` still
     /// holds a live sequence. A paged backend returns idle slots' KV blocks to
     /// the shared pool so the freed memory is immediately available to new
@@ -1570,6 +1584,17 @@ impl Generator for crate::gpu_model::qwen35::GpuQwen35 {
     }
     fn tier_report(&self) -> Option<crate::kv_tier::TierReport> {
         crate::gpu_model::qwen35::GpuQwen35::tier_report_impl(self)
+    }
+    fn prefix_state_stats(&self) -> Option<(u64, u64, u64)> {
+        crate::gpu_model::qwen35::GpuQwen35::prefix_state_stats(self)
+    }
+    fn moe_slot_stats(&self) -> Option<(u64, u64)> {
+        // the pinned cache's counters live on the device (a sync to read);
+        // only the disk backing's host counters are cheap enough per pass
+        self.moe_disk_stats().map(|s| {
+            let misses = s.misses + s.tier_hits;
+            (s.rows.saturating_sub(misses), misses)
+        })
     }
     fn reset(&mut self) {
         crate::gpu_model::qwen35::GpuQwen35::reset(self);

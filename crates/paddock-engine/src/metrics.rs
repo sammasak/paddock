@@ -172,4 +172,101 @@ pub struct EngineMetrics {
     /// derived reader-side.
     pub weights_mem_bytes: AtomicU64,
     pub kv_mem_bytes: AtomicU64,
+    /// Requests submitted and not yet admitted to a slot for the first time:
+    /// the span `RunStats::queued_ms` measures. Held up by [`QueueTicket`]. A
+    /// preempted sequence already had its slot and is not counted here.
+    pub requests_waiting: AtomicU32,
+    /// Hybrid prefix cache checkpoint ledger, monotonic since load: state
+    /// snapshots written, checkpoints stolen by LRU, admissions refused.
+    /// `prefix_state_armed` is 1 once a model reported it.
+    pub prefix_state_armed: AtomicU8,
+    pub prefix_state_writes: AtomicU64,
+    pub prefix_state_steals: AtomicU64,
+    pub prefix_state_refused: AtomicU64,
+    /// MoE expert slot cache, monotonic since load: routed rows found in a
+    /// slot vs. rows whose expert had to be brought in. `moe_slots_armed` is 1
+    /// once a model reported it.
+    pub moe_slots_armed: AtomicU8,
+    pub moe_slot_hits: AtomicU64,
+    pub moe_slot_misses: AtomicU64,
+}
+
+impl EngineMetrics {
+    /// `(writes, steals, refused)` from `PagedRadix::state_stats`.
+    pub fn store_prefix_state(&self, (writes, steals, refused): (u64, u64, u64)) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.prefix_state_writes.store(writes, Relaxed);
+        self.prefix_state_steals.store(steals, Relaxed);
+        self.prefix_state_refused.store(refused, Relaxed);
+        self.prefix_state_armed.store(1, Relaxed);
+    }
+
+    /// `(hits, misses)` of the expert slot cache.
+    pub fn store_moe_slots(&self, (hits, misses): (u64, u64)) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.moe_slot_hits.store(hits, Relaxed);
+        self.moe_slot_misses.store(misses, Relaxed);
+        self.moe_slots_armed.store(1, Relaxed);
+    }
+}
+
+/// One request's place in [`EngineMetrics::requests_waiting`]: counted on
+/// creation, uncounted on drop, so a request refused or dropped before it
+/// reaches a slot cannot leak the gauge.
+pub struct QueueTicket(std::sync::Arc<EngineMetrics>);
+
+impl QueueTicket {
+    pub fn new(metrics: std::sync::Arc<EngineMetrics>) -> Self {
+        metrics
+            .requests_waiting
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        QueueTicket(metrics)
+    }
+}
+
+impl Drop for QueueTicket {
+    fn drop(&mut self) {
+        self.0
+            .requests_waiting
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering::Relaxed;
+
+    #[test]
+    fn counters_round_trip_and_tickets_never_leak() {
+        let m = Arc::new(EngineMetrics::default());
+        assert_eq!(m.prefix_state_armed.load(Relaxed), 0);
+        m.store_prefix_state((7, 3, 2));
+        assert_eq!(
+            (
+                m.prefix_state_armed.load(Relaxed),
+                m.prefix_state_writes.load(Relaxed),
+                m.prefix_state_steals.load(Relaxed),
+                m.prefix_state_refused.load(Relaxed),
+            ),
+            (1, 7, 3, 2)
+        );
+        m.store_moe_slots((90, 10));
+        assert_eq!(
+            (
+                m.moe_slots_armed.load(Relaxed),
+                m.moe_slot_hits.load(Relaxed),
+                m.moe_slot_misses.load(Relaxed),
+            ),
+            (1, 90, 10)
+        );
+        let a = QueueTicket::new(m.clone());
+        let b = QueueTicket::new(m.clone());
+        assert_eq!(m.requests_waiting.load(Relaxed), 2);
+        drop(a);
+        assert_eq!(m.requests_waiting.load(Relaxed), 1);
+        drop(b);
+        assert_eq!(m.requests_waiting.load(Relaxed), 0);
+    }
 }

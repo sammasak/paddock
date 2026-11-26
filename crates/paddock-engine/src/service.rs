@@ -19,7 +19,7 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::generator::{CanvasStatus, CanvasTickReq, FinishSample, GenError, Generator, RowSample};
-use crate::metrics::{EngineMetrics, PHASE_DECODE, PHASE_IDLE, PHASE_PREFILL};
+use crate::metrics::{EngineMetrics, PHASE_DECODE, PHASE_IDLE, PHASE_PREFILL, QueueTicket};
 use crate::sampler::{
     Sampler, SamplingParams, TokenConstraint, compute_logprobs, pick_next, pick_verify_row,
 };
@@ -111,9 +111,10 @@ pub struct GenRequest {
     /// pre-penalty distribution) to every Token event. Such sequences never
     /// ride speculative rounds (spec picks skip host logits entirely).
     pub logprobs: Option<u8>,
-    /// Stamped by [`Engine::submit`] - the queue-wait anchor for `RunStats`.
+    /// Stamped by [`Engine::submit`] - the queue-wait anchor for `RunStats`,
+    /// and the request's place in `requests_waiting` until admission takes it.
     /// Callers leave it None; a direct `run_request` (warmup) has no queue.
-    pub submitted: Option<std::time::Instant>,
+    pub submitted: Option<Submitted>,
     /// A block-diffusion STRUCTURED READ instead of a generation: after the
     /// prompt is prefilled, the seeded canvas is run once and each
     /// position's probability of every label id comes back on the request's
@@ -129,6 +130,41 @@ pub struct GenRequest {
     /// waiting live request, and a live request that finds no free slot takes
     /// this one's (it is recomputed later) - see `service/admission.rs`.
     pub background: bool,
+}
+
+/// When a request was submitted, and its [`QueueTicket`] once it sits in an
+/// engine's queue: the gauge counts it until admission takes this out of the
+/// request (or the request drops).
+pub struct Submitted {
+    at: std::time::Instant,
+    ticket: Option<QueueTicket>,
+}
+
+impl Submitted {
+    /// The queue-wait anchor for a request that waits before it reaches an
+    /// engine (a residency lease); [`Engine::submit`] keeps it and adds the
+    /// ticket.
+    pub fn now() -> Self {
+        Submitted {
+            at: std::time::Instant::now(),
+            ticket: None,
+        }
+    }
+
+    /// Stamped now and counted in `metrics` from here: for a caller that
+    /// queues a request ahead of the engine (a residency lease), so the
+    /// gauge covers the same span `queued_ms` does.
+    pub fn queued(metrics: Arc<EngineMetrics>) -> Self {
+        Submitted {
+            at: std::time::Instant::now(),
+            ticket: Some(QueueTicket::new(metrics)),
+        }
+    }
+
+    /// Milliseconds queued until `admitted`; consumes the ticket.
+    fn waited_ms(self, admitted: std::time::Instant) -> u32 {
+        dur_ms(admitted.saturating_duration_since(self.at))
+    }
 }
 
 /// The structured read's inputs and its reply channel (see
@@ -993,6 +1029,7 @@ impl Engine {
                         match rx.recv_timeout(std::time::Duration::from_millis(250)) {
                             Ok(req) => {
                                 run_request(generator.as_mut(), req, &metrics);
+                                publish_model_counters(generator.as_ref(), &metrics);
                                 refresh_model_mem(
                                     generator.as_ref(),
                                     &metrics,
@@ -1075,7 +1112,10 @@ impl Engine {
     }
 
     pub fn submit(&self, mut req: GenRequest) -> Result<(), String> {
-        req.submitted.get_or_insert_with(std::time::Instant::now);
+        req.submitted
+            .get_or_insert_with(Submitted::now)
+            .ticket
+            .get_or_insert_with(|| QueueTicket::new(self.metrics.clone()));
         dump::tap(&mut req);
         self.tx
             .send(req)
@@ -1340,7 +1380,7 @@ fn run_batched_diffusion(
         while let Some(k) = slots.iter().position(Option::is_none) {
             let idle =
                 slots.iter().all(Option::is_none) && pending.is_empty() && mm_pending.is_empty();
-            let req = if idle {
+            let mut req = if idle {
                 match rx.recv_timeout(std::time::Duration::from_millis(250)) {
                     Ok(r) => r,
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
@@ -1359,9 +1399,7 @@ fn run_batched_diffusion(
                 }
             };
             let t_admit = std::time::Instant::now();
-            let queued_ms = req
-                .submitted
-                .map_or(0, |t| dur_ms(t_admit.saturating_duration_since(t)));
+            let queued_ms = req.submitted.take().map_or(0, |t| t.waited_ms(t_admit));
             // what a canvas cannot carry, refused by name (the serial loop's
             // rules); a read's canvas is checked like the serial path's. An
             // image prompt prefills through the backend's multimodal slot
@@ -1714,6 +1752,20 @@ fn refresh_model_mem(
     }
 }
 
+/// Copy the family's cache ledgers (prefix checkpoints, MoE expert slots)
+/// into the published counters. Host counters only, so every pass can afford
+/// it; a family that reports neither leaves both families off `/metrics`.
+/// The serial loop calls it after each request, so there the counters lag
+/// by the request in flight.
+fn publish_model_counters(generator: &dyn Generator, metrics: &EngineMetrics) {
+    if let Some(s) = generator.prefix_state_stats() {
+        metrics.store_prefix_state(s);
+    }
+    if let Some(s) = generator.moe_slot_stats() {
+        metrics.store_moe_slots(s);
+    }
+}
+
 /// How often a serving loop refreshes the published device ledger.
 const MODEL_MEM_REFRESH: std::time::Duration = std::time::Duration::from_secs(1);
 
@@ -1790,14 +1842,12 @@ fn system_memory() -> Option<(u64, u64)> {
     }
 }
 
-fn run_request(generator: &mut dyn Generator, req: GenRequest, metrics: &EngineMetrics) {
+fn run_request(generator: &mut dyn Generator, mut req: GenRequest, metrics: &EngineMetrics) {
     generator.reset();
     // Phase anchors: the serial loop picks a request up as soon as the
     // previous one finishes, so queue = submit -> here.
     let t_admit = std::time::Instant::now();
-    let queued_ms = req
-        .submitted
-        .map_or(0, |s| dur_ms(t_admit.saturating_duration_since(s)));
+    let queued_ms = req.submitted.take().map_or(0, |s| s.waited_ms(t_admit));
 
     if req.prompt.is_empty() {
         let _ = req
@@ -1828,7 +1878,6 @@ fn run_request(generator: &mut dyn Generator, req: GenRequest, metrics: &EngineM
         )));
         return;
     }
-    let mut req = req;
     req.max_tokens = req.max_tokens.min(room);
 
     // telemetry: one active sequence, prefilling now; reset to idle on any exit.
@@ -2317,7 +2366,8 @@ impl Slot {
             mm: req.mm_chunks.take(),
             recompute: false,
             metrics,
-            submitted: req.submitted,
+            // admitted: dropping the ticket takes it off `requests_waiting`
+            submitted: req.submitted.take().map(|s| s.at),
             admitted: std::time::Instant::now(),
             prefill_done: None,
             chunk_started: None,
@@ -2781,7 +2831,10 @@ fn admit(
     let max_ctx = generator.max_context();
     if paddock_models::dev_var_os!("PADDOCK_REQ_TRACE").is_some() {
         tracing::info!(
-            queued_ms = req.submitted.map(|t| t.elapsed().as_secs_f64() * 1000.),
+            queued_ms = req
+                .submitted
+                .as_ref()
+                .map(|t| t.at.elapsed().as_secs_f64() * 1000.),
             "req-trace: admit {} tokens at {}",
             req.prompt.len(),
             trace_us()
@@ -3423,6 +3476,7 @@ fn run_batched(
         if let Some(rep) = generator.tier_report() {
             metrics.tier.store(&rep);
         }
+        publish_model_counters(generator, metrics);
         // P5b admission watermark: free blocks the pool has for new prefills this
         // tick (None = no pool -> admit by slots only). Decremented per admit by
         // the prompt's block estimate; the try_recv loop stops once it nears the

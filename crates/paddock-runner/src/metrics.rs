@@ -282,6 +282,21 @@ struct DurKey {
     error: Option<String>,
 }
 
+/// TTFT splits by prompt kind: `resumed` when any prompt token came from the
+/// prefix cache (`cached_tokens > 0`), `fresh` otherwise - a resumed agent
+/// turn and a cold prompt are different latency populations.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct TtftKey {
+    base: ReqKey,
+    resumed: bool,
+}
+
+impl TtftKey {
+    fn prompt_label(&self) -> &'static str {
+        if self.resumed { "resumed" } else { "fresh" }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 struct FailKey {
     base: ReqKey,
@@ -291,7 +306,7 @@ struct FailKey {
 #[derive(Default)]
 struct Reg {
     duration: HashMap<DurKey, Hist>,
-    ttft: HashMap<ReqKey, Hist>,
+    ttft: HashMap<TtftKey, Hist>,
     tpot: HashMap<ReqKey, Hist>,
     prompt_tokens: HashMap<ReqKey, u64>,
     cached_tokens: HashMap<ReqKey, u64>,
@@ -445,7 +460,10 @@ impl Metrics {
             // Success-only latency shape: a 401's ~0 ms TTFT is not a latency.
             if let Some(t) = o.ttft {
                 reg.ttft
-                    .entry(key.clone())
+                    .entry(TtftKey {
+                        base: key.clone(),
+                        resumed: o.cached_tokens.is_some_and(|n| n > 0),
+                    })
                     .or_default()
                     .observe(t.as_secs_f64(), o.trace.as_ref());
             }
@@ -560,6 +578,18 @@ impl Metrics {
             out.push_str(&format!(
                 "paddock_num_requests_running {}\n",
                 m.active_slots.load(Relaxed)
+            ));
+            meta(
+                &mut out,
+                "paddock_num_requests_waiting",
+                "gauge",
+                "Requests submitted and not yet admitted to a slot (queue depth; preempted sequences excluded)",
+                None,
+                om,
+            );
+            out.push_str(&format!(
+                "paddock_num_requests_waiting {}\n",
+                m.requests_waiting.load(Relaxed)
             ));
             meta(
                 &mut out,
@@ -901,6 +931,7 @@ impl Metrics {
                 "paddock_prefix_cache_hits_total {}\n",
                 m.prefill_tokens_cached.load(Relaxed)
             ));
+            render_cache_ledgers(&mut out, m, om);
         }
 
         if om {
@@ -927,24 +958,35 @@ impl Metrics {
                 write_hist(out, name, &labels, &map[k], om);
             }
         }
-        for (name, help, map) in [
-            (
-                "gen_ai_server_time_to_first_token_seconds",
-                "Time to first response-body byte (client-visible TTFT)",
-                &reg.ttft,
-            ),
-            (
-                "gen_ai_server_time_per_output_token_seconds",
-                "Engine decode wall clock per output token",
-                &reg.tpot,
-            ),
-        ] {
-            meta(out, name, "histogram", help, Some("seconds"), om);
-            let mut keys: Vec<_> = map.keys().collect();
-            keys.sort();
-            for k in keys {
-                write_hist(out, name, &req_labels(k), &map[k], om);
-            }
+        let name = "gen_ai_server_time_to_first_token_seconds";
+        meta(
+            out,
+            name,
+            "histogram",
+            "Time to first response-body byte (client-visible TTFT), by prompt \
+             kind (fresh | resumed from the prefix cache)",
+            Some("seconds"),
+            om,
+        );
+        let mut keys: Vec<_> = reg.ttft.keys().collect();
+        keys.sort();
+        for k in keys {
+            let labels = format!("{},prompt=\"{}\"", req_labels(&k.base), k.prompt_label());
+            write_hist(out, name, &labels, &reg.ttft[k], om);
+        }
+        let name = "gen_ai_server_time_per_output_token_seconds";
+        meta(
+            out,
+            name,
+            "histogram",
+            "Engine decode wall clock per output token",
+            Some("seconds"),
+            om,
+        );
+        let mut keys: Vec<_> = reg.tpot.keys().collect();
+        keys.sort();
+        for k in keys {
+            write_hist(out, name, &req_labels(k), &reg.tpot[k], om);
         }
     }
 
@@ -1011,6 +1053,46 @@ impl Metrics {
             "paddock_spec_decode_accepted_tokens_total {}\n",
             reg.spec_accepted
         ));
+    }
+}
+
+/// The hybrid prefix cache's checkpoint ledger and the MoE expert slot
+/// cache, each only once its model reported it - a dense model's `/metrics`
+/// carries neither rather than a confident zero.
+fn render_cache_ledgers(out: &mut String, m: &EngineMetrics, om: bool) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut c = |family: &str, help: &str, v: u64| {
+        counter_meta(out, family, help, om);
+        out.push_str(&format!("{family}_total {v}\n"));
+    };
+    if m.prefix_state_armed.load(Relaxed) == 1 {
+        c(
+            "paddock_prefix_state_writes",
+            "Recurrent-state checkpoints written into the prefix cache",
+            m.prefix_state_writes.load(Relaxed),
+        );
+        c(
+            "paddock_prefix_state_steals",
+            "Checkpoints evicted (LRU) to seat a newer one",
+            m.prefix_state_steals.load(Relaxed),
+        );
+        c(
+            "paddock_prefix_state_refused",
+            "Checkpoint admissions the cache policy refused",
+            m.prefix_state_refused.load(Relaxed),
+        );
+    }
+    if m.moe_slots_armed.load(Relaxed) == 1 {
+        c(
+            "paddock_moe_expert_slot_hits",
+            "Routed MoE rows served from a resident expert slot (rows minus slot loads; disk-backed experts only)",
+            m.moe_slot_hits.load(Relaxed),
+        );
+        c(
+            "paddock_moe_expert_slot_misses",
+            "Experts loaded into a slot on a miss (disk reads plus host-tier copies; disk-backed experts only)",
+            m.moe_slot_misses.load(Relaxed),
+        );
     }
 }
 
@@ -1177,8 +1259,9 @@ impl Metrics {
                 e.requests += cum;
                 e.duration_seconds_sum += h.sum;
             }
+            // the prompt-kind split merges back: the rollup has no such column
             for (k, h) in &reg.ttft {
-                let e = out.entry(k.clone()).or_insert_with(|| blank(k));
+                let e = out.entry(k.base.clone()).or_insert_with(|| blank(&k.base));
                 let mut cum = 0u64;
                 for i in 0..15 {
                     cum += h.buckets[i];
@@ -1505,6 +1588,114 @@ mod tests {
             model: Some("m1"),
             ..Default::default()
         }
+    }
+
+    /// The value of the one sample line starting with `prefix`.
+    fn sample(s: &str, prefix: &str) -> u64 {
+        let hits: Vec<&str> = s.lines().filter(|l| l.starts_with(prefix)).collect();
+        assert_eq!(hits.len(), 1, "want one `{prefix}` line in:\n{s}");
+        hits[0]
+            .rsplit(' ')
+            .next()
+            .and_then(|v| v.parse().ok())
+            .expect("integer sample")
+    }
+
+    #[test]
+    fn ttft_splits_fresh_and_resumed_prompts() {
+        let m = Metrics::new("i".into(), ModelIds::default(), None);
+        // fresh: no cached tokens (absent or zero), 15 ms -> le=0.02
+        for cached in [None, Some(0)] {
+            let mut o = obs("/v1/chat/completions", 200, 50);
+            o.ttft = Some(Duration::from_millis(15));
+            o.cached_tokens = cached;
+            m.observe(&o);
+        }
+        // resumed: cached tokens above zero, 500 ms -> le=0.64
+        let mut o = obs("/v1/chat/completions", 200, 900);
+        o.ttft = Some(Duration::from_millis(500));
+        o.cached_tokens = Some(4096);
+        m.observe(&o);
+        let s = m.render(Format::Classic, 0);
+        let b = "gen_ai_server_time_to_first_token_seconds_bucket{gen_ai_operation_name=\"chat\",\
+                 gen_ai_provider_name=\"paddock\",gen_ai_request_model=\"m1\",origin=\"live\"";
+        assert_eq!(
+            sample(&s, &format!("{b},prompt=\"fresh\",le=\"0.02\"}}")),
+            2
+        );
+        assert_eq!(
+            sample(&s, &format!("{b},prompt=\"fresh\",le=\"+Inf\"}}")),
+            2
+        );
+        assert_eq!(
+            sample(&s, &format!("{b},prompt=\"resumed\",le=\"0.32\"}}")),
+            0
+        );
+        assert_eq!(
+            sample(&s, &format!("{b},prompt=\"resumed\",le=\"0.64\"}}")),
+            1
+        );
+        assert_eq!(
+            sample(&s, &format!("{b},prompt=\"resumed\",le=\"+Inf\"}}")),
+            1
+        );
+        // one HELP/TYPE pair for both splits
+        assert_eq!(
+            s.matches("# TYPE gen_ai_server_time_to_first_token_seconds histogram")
+                .count(),
+            1
+        );
+        // the usage rollup has no prompt column: the splits merge back
+        let snap = m.usage_snapshot();
+        assert_eq!(snap.series.len(), 1);
+        assert_eq!(snap.series[0].ttft[14], 3);
+    }
+
+    #[test]
+    fn cache_ledgers_and_queue_depth_render_with_help_and_type() {
+        use paddock_engine::metrics::QueueTicket;
+        let eng = Arc::new(EngineMetrics::default());
+        let m = Metrics::new("i".into(), ModelIds::default(), Some(eng.clone()));
+        // a model that reported neither ledger exports neither
+        let s = m.render(Format::Classic, 0);
+        assert!(!s.contains("paddock_prefix_state_"));
+        assert!(!s.contains("paddock_moe_expert_slot_"));
+        assert_eq!(sample(&s, "paddock_num_requests_waiting "), 0);
+
+        eng.store_prefix_state((7, 3, 2));
+        eng.store_moe_slots((90, 10));
+        let _queued = [QueueTicket::new(eng.clone()), QueueTicket::new(eng.clone())];
+        let families = [
+            ("paddock_prefix_state_writes_total", 7),
+            ("paddock_prefix_state_steals_total", 3),
+            ("paddock_prefix_state_refused_total", 2),
+            ("paddock_moe_expert_slot_hits_total", 90),
+            ("paddock_moe_expert_slot_misses_total", 10),
+        ];
+        let s = m.render(Format::Classic, 0);
+        for (name, v) in families {
+            assert!(s.contains(&format!("# HELP {name} ")), "{name} HELP");
+            assert!(
+                s.contains(&format!("# TYPE {name} counter\n")),
+                "{name} TYPE"
+            );
+            assert_eq!(sample(&s, &format!("{name} ")), v, "{name}");
+        }
+        assert!(s.contains("# HELP paddock_num_requests_waiting "));
+        assert!(s.contains("# TYPE paddock_num_requests_waiting gauge\n"));
+        assert_eq!(sample(&s, "paddock_num_requests_waiting "), 2);
+        // OpenMetrics names the counter family without _total
+        let om = m.render(Format::OpenMetrics, 0);
+        for (name, _) in families {
+            let family = name.trim_end_matches("_total");
+            assert!(
+                om.contains(&format!("# TYPE {family} counter\n")),
+                "{family}"
+            );
+        }
+        drop(_queued);
+        let s = m.render(Format::Classic, 0);
+        assert_eq!(sample(&s, "paddock_num_requests_waiting "), 0);
     }
 
     #[test]
