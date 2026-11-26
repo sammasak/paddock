@@ -375,8 +375,10 @@ impl Demand {
 
     /// The same shape with the mandatory checkpoint pages made evictable and
     /// the expert slot cache taking the whole surplus above full context, for
-    /// a caller whose [`Self::plan`] refused: `None` when there is no cache
-    /// floor or no checkpoint pages to trade. A lost checkpoint costs a
+    /// a caller whose [`Self::plan`] refused at every shape it will try
+    /// (qwen35: every prefill chunk): `None` when there is no cache floor or
+    /// no checkpoint pages to trade. It trades whether the pages crowd out
+    /// the floor or the context itself; full context is never traded. A lost checkpoint costs a
     /// re-prefill of that turn; the cache it pays for is every decoded token
     /// (35B-A3B at 2048 x 16 on 8 GB: 0.98 GiB of checkpoints refused the
     /// 8-slot floor; 14 slots decode 25.4 tok/s, 16 slots 26.6). The pages

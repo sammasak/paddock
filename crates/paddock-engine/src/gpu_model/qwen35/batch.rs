@@ -89,16 +89,25 @@ impl GpuQwen35 {
         // cannot seat the configuration beside that scratch, the prefill chunk
         // steps down (8192 -> 4096 -> ...) and the scratch shrinks with it - a
         // smaller chunk is slower prefill, a refused server is no server.
+        // Only when every chunk refuses does the plan trade the live turns'
+        // checkpoint pages for the expert slot cache floor, again from the top
+        // chunk: guaranteed checkpoints outrank a wider prefill chunk.
         let mut chunk = super::chunk_tick_rows();
+        let mut trade_ckpts = false;
         loop {
             let rows = self.serving_scratch_rows(chunk, requested);
             self.scratch = None;
             self.exec.trim_mem_pool();
             self.ensure_scratch(rows)?;
-            match self.enable_batch_at(requested, chunk)? {
+            match self.enable_batch_at(requested, chunk, trade_ckpts)? {
                 Ok(width) => {
                     self.cap_picture_at_pass();
                     return Ok(width);
+                }
+                Err(_) if !trade_ckpts && chunk <= super::PREFILL_CHUNK_ROWS_MIN => {
+                    self.release_batch_attempt();
+                    trade_ckpts = true;
+                    chunk = super::chunk_tick_rows();
                 }
                 Err(refusal) if chunk > super::PREFILL_CHUNK_ROWS_MIN => {
                     tracing::warn!(
@@ -136,6 +145,7 @@ impl GpuQwen35 {
         &mut self,
         max_batch: usize,
         chunk: usize,
+        trade_ckpts: bool,
     ) -> Result<Result<usize, String>, GpuModelError> {
         let (max_batch, spec_live_cap) = self.width_by_vram(max_batch);
         // spec live degraded to buy width (see width_by_vram) - ensure_serve_spec
@@ -329,6 +339,7 @@ impl GpuQwen35 {
         // the 35B-A3B: ledger 40 MiB over plan; the backbone's 835 allocations
         // 0.08 GB); 256 MiB cost two slots, 25.4 instead of 26.6 tok/s.
         const MOE_CACHE_MARGIN: u64 = 64 << 20;
+        let slot_price = self.moe_cache_slot_price().map_or(0, |(price, _)| price);
         let (expert_cache_floor, expert_cache_max) = match self.moe_cache_slot_price() {
             Some((price, experts))
                 if explicit_pool_pin.is_none()
@@ -400,15 +411,20 @@ impl GpuQwen35 {
         // A shape refused only because the live turns' checkpoint pages crowd
         // out the slot cache floor serves with those pages evictable and the
         // cache, not retention, taking the surplus (kv_plan::ckpts_yield_to_cache).
+        // PADDOCK_KV_STATE_CKPTS pins the count as mandatory: no trade then.
+        let trade = trade_ckpts && paddock_models::dev_var_os!("PADDOCK_KV_STATE_CKPTS").is_none();
         let (demand, plan) = match demand.plan(grant) {
             Ok(p) => (demand, p),
-            Err(e) => match demand.ckpts_yield_to_cache() {
+            Err(e) => match demand.ckpts_yield_to_cache().filter(|_| trade) {
                 Some(d) => match d.plan(grant) {
                     Ok(p) => {
-                        tracing::info!(
-                            ckpt_pages = demand.ckpt_blocks,
-                            "qwen35: the live turns' checkpoints ride evictable pages so the \
-                             expert slot cache keeps its floor and the surplus"
+                        tracing::warn!(
+                            guaranteed_before = demand.ckpt_blocks / pages_per_ckpt.max(1),
+                            guaranteed_after = 0,
+                            refusal = %e.message,
+                            "qwen35: the live turns' checkpoints ride evictable pages (a lost \
+                             one re-prefills its turn) so the expert slot cache keeps its \
+                             floor and the surplus above full context"
                         );
                         (d, p)
                     }
@@ -847,9 +863,11 @@ impl GpuQwen35 {
         // [moe_offload]: the slot cache takes the plan's cache term, less the
         // allocator margin - the operator's levers stay max_ctx and
         // max_batch, exactly as for the KV pool.
-        if !self.moe_cache_active() {
-            self.enable_moe_cache(moe_cache_budget.saturating_sub(MOE_CACHE_MARGIN))?;
-        }
+        let seated = if self.moe_cache_active() {
+            0
+        } else {
+            self.enable_moe_cache(moe_cache_budget.saturating_sub(MOE_CACHE_MARGIN))?
+        };
         let overlap_on = paddock_models::dev_var!("PADDOCK_OVERLAP")
             .map(|v| v != "0")
             .unwrap_or(true);
@@ -874,13 +892,8 @@ impl GpuQwen35 {
         // adds only what that reserve names - graphs, the decode arena, the
         // lazily seated spec state (its own reserve) - so a later reading of
         // the ledger against `expected` is the same check under load.
-        // a seated slot cache is charged too: its term is planned VRAM like the
-        // pool (without a cache that term is only the grant's unspent rest)
-        let cache_term = if self.moe_cache_active() {
-            moe_cache_budget
-        } else {
-            0
-        };
+        // the slot cache this call seated is charged too, at what it holds
+        let cache_term = seated as u64 * slot_price;
         let expected = ledger_at_plan + plan_reserved + cache_term;
         let actual = self.exec.process_mem_used().unwrap_or(0);
         tracing::info!(
