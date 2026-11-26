@@ -556,6 +556,11 @@ fn stream_response(
                     meta.prompt_len = meta.prompt_len.max(rows as usize);
                 }
                 TokenEvent::Token { id: t, logprobs } => {
+                    // the first token, for a stream that never sees its Done
+                    // (a stop string, a disconnect, an engine error)
+                    if cs[i].ids == 0 {
+                        meta.scope.token_seen();
+                    }
                     // echo rides out as the first delta on each choice, so a
                     // client concatenating deltas rebuilds prompt+completion
                     // exactly as the non-streaming body returns it
@@ -662,6 +667,28 @@ fn stream_response(
     Sse::new(sse)
         .keep_alive(KeepAlive::default())
         .into_response()
+}
+
+/// The streaming handler over `rxs` with no model behind it: the chat
+/// tests' vocabulary, no echo or logprobs, and the client's `stop` strings.
+#[cfg(test)]
+pub(crate) fn stream_for_test(
+    scope: crate::events::EventScope,
+    stop: &[&str],
+    rxs: Vec<UnboundedReceiver<TokenEvent>>,
+) -> axum::body::Body {
+    let meta = ResponseMeta {
+        id: "cmpl-t".into(),
+        model_id: "m1".into(),
+        tokenizer: crate::chat::tokenizer_for_test(),
+        prompt_len: 16,
+        prompt_chars: 16,
+        logprobs: false,
+        echo: None,
+        scope,
+    };
+    let stop = stop.iter().map(|s| (*s).to_owned()).collect();
+    stream_response(meta, rxs, stop, false).into_body()
 }
 
 fn chunk_json(

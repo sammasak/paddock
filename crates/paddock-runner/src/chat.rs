@@ -2863,15 +2863,11 @@ fn chunk(
     .to_string()
 }
 
-/// The streaming handler over `rxs` with no model behind it: a hand-built
-/// byte-level vocabulary (`h e l o he ll hell hello`), the Plain dialect and
-/// the client's `stop` strings.
+/// A hand-built byte-level vocabulary for the stream handlers' tests:
+/// `h e l o he ll hell hello`, then the two halves of `é` (ids 8 and 9), so a
+/// first token can decode to no text yet.
 #[cfg(test)]
-pub(crate) fn stream_for_test(
-    scope: crate::events::EventScope,
-    stop: &[&str],
-    rxs: Vec<UnboundedReceiver<TokenEvent>>,
-) -> axum::body::Body {
+pub(crate) fn tokenizer_for_test() -> Arc<paddock_tokenizer::GgufTokenizer> {
     use paddock_models::gguf::{GgufFile, Value};
     let strs = |v: &[&str]| Value::Array(v.iter().map(|s| Value::Str((*s).into())).collect());
     let gguf = GgufFile {
@@ -2882,7 +2878,7 @@ pub(crate) fn stream_for_test(
             ("tokenizer.ggml.pre", Value::Str("gpt-4o".into())),
             (
                 "tokenizer.ggml.tokens",
-                strs(&["h", "e", "l", "o", "he", "ll", "hell", "hello"]),
+                strs(&["h", "e", "l", "o", "he", "ll", "hell", "hello", "Ã", "©"]),
             ),
             (
                 "tokenizer.ggml.merges",
@@ -2895,10 +2891,22 @@ pub(crate) fn stream_for_test(
         tensors: vec![],
         data_offset: 0,
     };
+    Arc::new(paddock_tokenizer::GgufTokenizer::from_gguf(&gguf).expect("tokenizer"))
+}
+
+/// The streaming handler over `rxs` with no model behind it: the
+/// [`tokenizer_for_test`] vocabulary, the Plain dialect and the client's
+/// `stop` strings.
+#[cfg(test)]
+pub(crate) fn stream_for_test(
+    scope: crate::events::EventScope,
+    stop: &[&str],
+    rxs: Vec<UnboundedReceiver<TokenEvent>>,
+) -> axum::body::Body {
     let meta = Meta {
         id: "chatcmpl-t".into(),
         model_id: "m1".into(),
-        tokenizer: Arc::new(paddock_tokenizer::GgufTokenizer::from_gguf(&gguf).expect("tokenizer")),
+        tokenizer: tokenizer_for_test(),
         prompt_len: 16,
         text_prompt_len: 16,
         dialect: Dialect::Plain,
