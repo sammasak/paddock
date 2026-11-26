@@ -183,9 +183,10 @@ pub struct EngineMetrics {
     pub prefix_state_writes: AtomicU64,
     pub prefix_state_steals: AtomicU64,
     pub prefix_state_refused: AtomicU64,
-    /// MoE expert slot cache, monotonic since load: routed rows found in a
-    /// slot vs. rows whose expert had to be brought in. `moe_slots_armed` is 1
-    /// once a model reported it.
+    /// MoE expert slot cache (pinned or disk-backed), monotonic since load:
+    /// routed rows found in a slot vs. rows whose expert had to be brought in.
+    /// `moe_slots_armed` is 1 once a model with a seated cache reported it,
+    /// at 0 from warm-up on.
     pub moe_slots_armed: AtomicU8,
     pub moe_slot_hits: AtomicU64,
     pub moe_slot_misses: AtomicU64,

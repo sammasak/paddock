@@ -23,6 +23,23 @@ impl crate::generator::Generator for Qwen4ExpGpu {
         self.exec.process_mem_used()
     }
 
+    fn moe_slot_stats_synced(&self) -> Option<(u64, u64)> {
+        let seated = self
+            .layers
+            .iter()
+            .any(|l| matches!(&l.moe.seats, ExpertSeats::Kq { cache: Some(_), .. }));
+        if !seated {
+            return None;
+        }
+        match self.moe_cache_stats() {
+            Ok((rows, misses)) => Some((rows.saturating_sub(misses), misses)),
+            Err(e) => {
+                tracing::warn!("MoE slot cache counters unreadable: {e}");
+                None
+            }
+        }
+    }
+
     fn reply_pin(&mut self, slot: usize) {
         Qwen4ExpGpu::reply_pin(self, slot);
     }
