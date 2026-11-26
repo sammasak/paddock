@@ -22,6 +22,8 @@
 //! and the KV page footprint. `ttft_ms` runs from arrival at the edge to the
 //! engine's first sampled token (tokenize + queue + prefill), not to the first
 //! response byte: a stream's SSE preamble goes out before prefill finishes.
+//! Only a request without an engine token falls back to the first byte, so
+//! every success still carries one TTFT sample.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -117,11 +119,13 @@ pub struct EventRecord {
     /// on the serial (non-paged) engine.
     #[serde(rename = "paddock.kv_pages", skip_serializing_if = "Option::is_none")]
     pub kv_pages: Option<u64>,
-    /// Edge-measured time to first response-body byte. For streaming this is
-    /// the client-visible TTFT (queue + tokenize + prefill + first decode).
+    /// Arrival at the edge to the engine's first sampled token (tokenize +
+    /// queue + prefill). A request that reported no token (embeddings,
+    /// audio, an engine error or a disconnect before the engine's stats
+    /// arrived) falls back to the first response-body byte.
     #[serde(rename = "paddock.ttft_ms", skip_serializing_if = "Option::is_none")]
     pub ttft_ms: Option<u64>,
-    /// Output tokens over the post-first-byte window - the edge view of decode
+    /// Output tokens over the post-first-token window - the edge view of decode
     /// rate. Streaming responses only (non-streamed compute is not separable
     /// at the edge).
     #[serde(
@@ -430,12 +434,13 @@ struct Pending {
 }
 
 impl Pending {
-    fn finalize(self, completed: bool) {
+    fn finalize(self, first_frame: Option<Duration>, completed: bool) {
         let duration = self.t0.elapsed();
         let cells = self.scope.take();
         let ttft = cells
             .first_token
-            .map(|t| t.saturating_duration_since(self.t0));
+            .map(|t| t.saturating_duration_since(self.t0))
+            .or(first_frame);
         let ttft_ms = ttft.map(|d| d.as_millis() as u64);
         // Edge decode rate: tokens over the post-first-token window. Streaming
         // only - a non-streamed response holds every byte until the end.
@@ -502,12 +507,14 @@ impl Pending {
     }
 }
 
-/// Response body that emits the event record when dropped - i.e. when the
-/// body finished streaming, the client disconnected, or the response was
-/// discarded.
+/// Response body that timestamps its first data frame (the TTFT fallback for
+/// a request without an engine token) and emits the event record when
+/// dropped - i.e. when the body finished streaming, the client disconnected,
+/// or the response was discarded.
 struct RecordingBody {
     inner: axum::body::Body,
     pending: Option<Pending>,
+    first_frame: Option<Duration>,
     /// The stream was polled to its natural end (`Ready(None)`). A body
     /// dropped without reaching it - and not already at end-of-stream - is a
     /// client that vanished mid-response: the `disconnect` accounting bit.
@@ -525,8 +532,17 @@ impl http_body::Body for RecordingBody {
         // axum's Body is Unpin (boxed inner stream) - safe projection.
         let this = self.get_mut();
         let poll = std::pin::Pin::new(&mut this.inner).poll_frame(cx);
-        if let std::task::Poll::Ready(None) = &poll {
-            this.completed = true;
+        match &poll {
+            std::task::Poll::Ready(None) => this.completed = true,
+            std::task::Poll::Ready(Some(Ok(f))) => {
+                if this.first_frame.is_none()
+                    && f.is_data()
+                    && let Some(p) = &this.pending
+                {
+                    this.first_frame = Some(p.t0.elapsed());
+                }
+            }
+            _ => {}
         }
         poll
     }
@@ -547,7 +563,7 @@ impl Drop for RecordingBody {
             // without a final Ready(None) poll - that is a completion too;
             // only a drop with bytes still owed is a disconnect.
             let completed = self.completed || http_body::Body::is_end_stream(&self.inner);
-            p.finalize(completed);
+            p.finalize(self.first_frame, completed);
         }
     }
 }
@@ -639,6 +655,7 @@ pub async fn events_mw(
         axum::body::Body::new(RecordingBody {
             inner: body,
             pending: Some(pending),
+            first_frame: None,
             completed: false,
         }),
     )
@@ -646,14 +663,14 @@ pub async fn events_mw(
 
 /// One request through the middleware's recording body, with the edge
 /// arrival at `t0`: a stream whose SSE preamble is polled out first (header
-/// time), then the engine's `stats` are folded in and the body ends. Returns
-/// the record; the observation lands in `metrics`.
+/// time), then each generation's engine `stats` are folded in and the body
+/// ends. Returns the record; the observation lands in `metrics`.
 #[cfg(test)]
 pub(crate) fn record_stream_for_test(
     metrics: Arc<crate::metrics::Metrics>,
     t0: Instant,
     cached: usize,
-    stats: &paddock_engine::service::RunStats,
+    stats: &[paddock_engine::service::RunStats],
 ) -> Arc<EventRecord> {
     let ring = EventRing::new();
     let scope = EventScope::live();
@@ -677,6 +694,7 @@ pub(crate) fn record_stream_for_test(
             status: 200,
             stream: true,
         }),
+        first_frame: None,
         completed: false,
     };
     let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
@@ -685,7 +703,9 @@ pub(crate) fn record_stream_for_test(
         matches!(first, std::task::Poll::Ready(Some(Ok(_)))),
         "the preamble frame"
     );
-    scope.phases(stats);
+    for s in stats {
+        scope.phases(s);
+    }
     while let std::task::Poll::Ready(Some(_)) =
         http_body::Body::poll_frame(std::pin::Pin::new(&mut body), &mut cx)
     {}
@@ -833,7 +853,7 @@ mod tests {
             status: 200,
             stream: false,
         };
-        p.finalize(true);
+        p.finalize(None, true);
         let (_, _, events) = ring.since(0, 10);
         let r = &events[0];
         assert_eq!(
@@ -878,7 +898,7 @@ mod tests {
             status: 200,
             stream: false,
         };
-        p.finalize(true);
+        p.finalize(None, true);
         let (_, _, events) = ring.since(0, 10);
         let v = serde_json::to_value(&events[0]).unwrap();
         // "never rode spec" / "no paged pool" must be absent, not zero
@@ -910,7 +930,7 @@ mod tests {
             status: 200,
             stream: false,
         };
-        p.finalize(true);
+        p.finalize(None, true);
         let (_, _, events) = ring.since(0, 10);
         let r = &events[0];
         assert_eq!(r.model.as_deref(), Some("m"));

@@ -211,6 +211,17 @@ impl EngineMetrics {
     }
 }
 
+/// A failed slot cache counter readback: warned once per process, then at
+/// debug, since the refresh that hits it runs every second.
+pub(crate) fn warn_slot_readback(e: &dyn std::fmt::Display) {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::debug!("MoE slot cache counters unreadable: {e}");
+    } else {
+        tracing::warn!("MoE slot cache counters unreadable: {e} (further failures at debug)");
+    }
+}
+
 /// One request's place in [`EngineMetrics::requests_waiting`]: counted on
 /// creation, uncounted on drop, so a request refused or dropped before it
 /// reaches a slot cannot leak the gauge.
