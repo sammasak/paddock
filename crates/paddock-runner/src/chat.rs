@@ -76,8 +76,8 @@ fn openai_body(e: &EngineError) -> (StatusCode, ErrorBody) {
 
 /// A context overflow opens with OpenAI's own sentence, numbers included:
 /// Pi and other OpenAI clients compact their history on it (or on the
-/// `context_length_exceeded` code) and read N and M out of it. The engine's
-/// levers (pages, detail, --max-ctx) follow in parentheses.
+/// `context_length_exceeded` code). The engine's levers (pages, detail,
+/// --max-ctx) follow in parentheses.
 fn openai_message(e: &EngineError) -> String {
     match e.overflow {
         Some((got, max)) => format!(
@@ -90,7 +90,9 @@ fn openai_message(e: &EngineError) -> String {
 }
 
 /// The over-window refusal for chat completions and completions: the
-/// OpenAI envelope with `param: "messages"`, as OpenAI's own carries.
+/// OpenAI envelope with `param: "messages"`, as OpenAI's chat refusal
+/// carries. Completions takes the same param on purpose, so one client-side
+/// match covers both.
 pub(crate) fn overflow_err(e: &EngineError) -> Response {
     let (status, mut body) = openai_body(e);
     body.error.param = Some("messages".to_owned());
@@ -106,15 +108,22 @@ pub(crate) fn refuse_overflow(
     e: &EngineError,
     envelope: fn(&EngineError) -> Response,
 ) -> Response {
-    let (got, max) = e.overflow.unwrap_or_default();
-    tracing::warn!(
-        route,
-        prompt_tokens = got,
-        max_ctx = max,
-        "prompt exceeds the context window; refused with 400 context_length_exceeded"
-    );
-    crate::metrics::context_length_refused();
+    note_overflow(route, e);
     envelope(e)
+}
+
+/// The WARN and count of [`refuse_overflow`], alone: for the streaming
+/// messages agent loop, whose refusal is an SSE `error` event on an open 200.
+pub(crate) fn note_overflow(route: &'static str, e: &EngineError) {
+    if let Some((got, max)) = e.overflow {
+        tracing::warn!(
+            route,
+            prompt_tokens = got,
+            max_ctx = max,
+            "prompt exceeds the context window; refused with context_length_exceeded"
+        );
+    }
+    crate::metrics::context_length_refused();
 }
 
 /// Rows the engine actually admits for a prompt: the pad-free text stream

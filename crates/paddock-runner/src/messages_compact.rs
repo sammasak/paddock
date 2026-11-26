@@ -130,7 +130,7 @@ async fn anth_summary_pass(
     // error stands where the whole render is past the window, else the
     // compaction failed (null block) and the request proceeds uncompacted
     let give_up = |whole: &Rendered, rows, cached, out| match gate(whole, state.max_ctx) {
-        Some(e) => Err(engine_err(&e)),
+        Some(e) => Err(crate::chat::refuse_overflow("messages", &e, engine_err)),
         None => Ok(summary_pass(None, rows, cached, out)),
     };
     if gate(&whole, budget).is_none() {
@@ -602,7 +602,7 @@ async fn compact(
         prepared.mm_chunks.as_deref(),
         state.max_ctx,
     ) {
-        return Err(engine_err(&e));
+        return Err(crate::chat::refuse_overflow("messages", &e, engine_err));
     }
     let ctx = Ctx {
         id: id.to_owned(),
