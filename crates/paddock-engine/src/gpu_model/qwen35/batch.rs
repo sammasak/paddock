@@ -417,35 +417,37 @@ impl GpuQwen35 {
             expert_cache_share: if expert_cache_floor > 0 { 0.5 } else { 0.0 },
             expert_cache_max,
             ckpts_pinned: crate::ckpt_pages::ckpts_pin().is_some(),
+            pages_per_ckpt,
             ..Default::default()
         };
         // On the trade pass (every chunk refused, see enable_batch_sized) a
         // refused shape with a slot cache floor and mandatory checkpoint pages
-        // is planned again with those pages moved into the evictable want and
-        // the cache taking the whole surplus above full context
-        // (kv_plan::ckpts_yield_to_cache). The checkpoints then compete for the
-        // pool's free pages; at 35B-A3B 2048 x 16 they thrash and multi-turn
-        // resume stops. A PADDOCK_KV_STATE_CKPTS pin is never traded.
-        let tradable = demand.ckpts_yield_to_cache().is_some();
+        // is planned again keeping one resumable turn per live session that
+        // fits beside the floor and full context; the other checkpoints join
+        // the evictable want and the cache takes the surplus above the kept
+        // ones (kv_plan::ckpts_yield_to_cache). If not one turn fits, the trade
+        // refuses with the shapes that serve both. A PADDOCK_KV_STATE_CKPTS pin
+        // is never traded.
+        let tradable = demand.tradable();
         let (demand, plan) = match demand.plan(grant) {
             Ok(p) => (demand, p),
-            Err(e) => match demand.ckpts_yield_to_cache().filter(|_| trade_ckpts) {
-                Some(d) => match d.plan(grant) {
+            Err(e) => match demand.ckpts_yield_to_cache(grant).filter(|_| trade_ckpts) {
+                Some(Ok(d)) => match d.plan(grant) {
                     Ok(p) => {
                         tracing::warn!(
                             chunk_rows = chunk,
                             guaranteed_before = demand.ckpt_blocks / pages_per_ckpt.max(1),
-                            guaranteed_after = 0,
+                            guaranteed_after = d.ckpt_blocks / pages_per_ckpt.max(1),
                             refusal = %e.message,
-                            "qwen35: the live turns' checkpoints are evictable now (a lost one \
-                             re-prefills its turn; with few free pages multi-turn resume stops) \
-                             so the expert slot cache keeps its floor and the surplus above \
-                             full context"
+                            "qwen35: the live turns' checkpoints are cut to one resumable turn \
+                             per session that fits (the rest are evictable; a lost one \
+                             re-prefills its turn) so the expert slot cache keeps its floor"
                         );
                         (d, p)
                     }
                     Err(_) => return Ok(Err((e.message, false))),
                 },
+                Some(Err(w)) => return Ok(Err((w.message, false))),
                 None => return Ok(Err((e.message, tradable && !trade_ckpts))),
             },
         };

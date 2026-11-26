@@ -198,6 +198,9 @@ pub struct Demand {
     /// (`PADDOCK_KV_STATE_CKPTS`): those pages are what is being measured, so
     /// [`Self::ckpts_yield_to_cache`] never trades them.
     pub ckpts_pinned: bool,
+    /// Pool blocks one checkpoint spans (0: the family keeps none in pages),
+    /// what [`Self::ckpts_yield_to_cache`] prices a resumable turn at.
+    pub pages_per_ckpt: usize,
 }
 
 impl Default for Demand {
@@ -220,6 +223,7 @@ impl Default for Demand {
             expert_cache_share: 0.0,
             expert_cache_max: u64::MAX,
             ckpts_pinned: false,
+            pages_per_ckpt: 0,
         }
     }
 }
@@ -378,27 +382,91 @@ impl Demand {
         Err(self.wont_fit(grant))
     }
 
-    /// The same shape with the mandatory checkpoint pages made evictable and
-    /// the expert slot cache taking the whole surplus above full context, for
-    /// a caller whose [`Self::plan`] refused at every shape it will try
-    /// (qwen35: every prefill chunk, see [`next_attempt`]): `None` when there
-    /// is no cache floor, no checkpoint pages, or the count is pinned. It
-    /// trades whether the pages crowd out the floor or the context itself;
-    /// full context is never traded. The cache it buys is every decoded token
-    /// (35B-A3B at 2048 x 16 on 8 GB: 0.98 GiB of checkpoints refused the
-    /// 8-slot floor; traded, 17 slots decode 27.2 tok/s). The cost is resume:
-    /// the checkpoints then compete for the pool's free pages, and where one
-    /// is a large share of the pool (402 of 2048 blocks there) they thrash
-    /// and multi-turn sessions re-prefill every turn.
-    pub fn ckpts_yield_to_cache(&self) -> Option<Demand> {
-        (self.expert_cache_floor > 0 && self.ckpt_blocks > 0 && !self.ckpts_pinned).then(|| {
-            Demand {
-                ckpt_blocks: 0,
-                retention_blocks: self.retention_blocks + self.ckpt_blocks,
-                expert_cache_share: 1.0,
-                ..self.clone()
+    /// Bytes one resumable turn's checkpoints take in the pool.
+    fn turn_bytes(&self) -> u64 {
+        crate::ckpt_pages::CKPTS_PER_TURN * self.pages_per_ckpt as u64 * self.block_bytes.max(1)
+    }
+
+    /// Resumable turns that fit at `slots` x `blocks_per_slot` beside the slot
+    /// cache floor and full context, at most one per session.
+    fn turns_beside_floor(&self, grant: u64, slots: usize, blocks_per_slot: usize) -> u64 {
+        let context = slots as u64 * blocks_per_slot as u64 * self.block_bytes.max(1);
+        let room = self
+            .kv_bytes(grant, slots)
+            .and_then(|kv| kv.checked_sub(self.expert_cache_floor + context))
+            .unwrap_or(0);
+        (room / self.turn_bytes().max(1)).min(slots as u64)
+    }
+
+    /// A checkpoint trade can change this shape's plan: it has an expert
+    /// slot cache floor, mandatory checkpoint pages, a known page count per
+    /// checkpoint, and no operator pin.
+    pub fn tradable(&self) -> bool {
+        self.expert_cache_floor > 0
+            && self.ckpt_blocks > 0
+            && self.pages_per_ckpt > 0
+            && !self.ckpts_pinned
+    }
+
+    /// The same shape keeping one resumable turn per live session that fits
+    /// beside the slot cache floor and full context, for a caller whose
+    /// [`Self::plan`] refused at every shape it will try (qwen35: every
+    /// prefill chunk, see [`next_attempt`]). Of the mandatory checkpoints it
+    /// keeps `min(slots, turns that fit) x CKPTS_PER_TURN` (never more than
+    /// it had); the rest join the evictable want, and the slot cache takes
+    /// only the surplus above the kept ones. `None`: not [`Self::tradable`].
+    /// `Some(Err)`: not even one turn fits beside the floor; the refusal
+    /// names the reachable max_ctx and max_batch shapes.
+    ///
+    /// Why one turn each and not none: with none (35B-A3B, 2048 x 16, 8 GB)
+    /// a checkpoint is 402 of the pool's 2048 blocks, the cuts of one turn
+    /// steal each other, and no multi-turn session resumed (0 cached tokens
+    /// on 40 later turns) although 17 slots decoded 27.2 tok/s.
+    pub fn ckpts_yield_to_cache(&self, grant: u64) -> Option<Result<Demand, WontFit>> {
+        if !self.tradable() {
+            return None;
+        }
+        let ckpts = (self.ckpt_blocks / self.pages_per_ckpt) as u64;
+        let turns = self.turns_beside_floor(grant, self.slots, self.blocks_per_slot);
+        if turns == 0 {
+            // the shapes where every session keeps its turn beside the floor
+            let mut shapes = Vec::new();
+            if let Some(n) = (1..self.slots)
+                .rev()
+                .find(|&n| self.turns_beside_floor(grant, n, self.blocks_per_slot) >= n as u64)
+            {
+                shapes.push(format!("lower max_batch to <={n}"));
             }
-        })
+            if let Some(b) = (1..self.blocks_per_slot)
+                .rev()
+                .find(|&b| self.turns_beside_floor(grant, self.slots, b) >= self.slots as u64)
+            {
+                shapes.push(format!("lower max_ctx to <={}", b * BLOCK_TOKENS));
+            }
+            shapes.push("raise vram_budget".into());
+            return Some(Err(WontFit {
+                message: format!(
+                    "{} cannot keep the {:.2} GiB expert slot cache floor, full context and one \
+                     resumable turn ({} checkpoints, {:.2} GiB) per session at max_ctx {} x \
+                     max_batch {}: {}.",
+                    self.family,
+                    gib(self.expert_cache_floor),
+                    crate::ckpt_pages::CKPTS_PER_TURN,
+                    gib(self.turn_bytes()),
+                    self.max_ctx,
+                    self.slots,
+                    shapes.join(", or ")
+                ),
+            }));
+        }
+        let kept =
+            (turns * crate::ckpt_pages::CKPTS_PER_TURN).min(ckpts) as usize * self.pages_per_ckpt;
+        Some(Ok(Demand {
+            ckpt_blocks: kept,
+            retention_blocks: self.retention_blocks + (self.ckpt_blocks - kept),
+            expert_cache_share: 1.0,
+            ..self.clone()
+        }))
     }
 
     /// Plan, or - when nothing fits - the smallest runnable shape instead of a
@@ -674,26 +742,59 @@ mod tests {
     /// Qwen3.6-35B-A3B, experts pinned in host RAM, max_ctx 2048 x max_batch
     /// 16 on an 8 GB RTX 3070 (vram_budget 7500), figures from its refused
     /// start: the 16 live turns' checkpoints (0.98 GiB) crowd out the 8-slot
-    /// cache floor, so the plan refuses; with them evictable it keeps full
-    /// context and the cache seats at least the 16 slots that decode 26.6
-    /// tok/s.
+    /// cache floor, so the plan refuses. The trade keeps the one resumable
+    /// turn per session that fits beside the floor and full context (3 turns,
+    /// 9 checkpoints) and gives the cache what is left above them.
     #[test]
-    fn a_35b_a3b_at_2048_x_16_trades_checkpoints_for_slots() {
+    fn a_35b_a3b_at_2048_x_16_keeps_a_resumable_turn_per_session() {
         let (d, grant, price, margin) = a3b_2048_x_16();
         let e = d
             .plan(grant)
             .expect_err("checkpoints + context + floor exceed the grant");
         assert!(e.message.contains("resume checkpoints"), "{}", e.message);
         let y = d
-            .ckpts_yield_to_cache()
-            .expect("a cache floor and checkpoints to trade");
+            .ckpts_yield_to_cache(grant)
+            .expect("a cache floor and checkpoints to trade")
+            .expect("one turn fits beside the floor");
+        assert_eq!(y.ckpt_blocks, 9 * 402, "3 turns x 3 checkpoints kept");
+        assert_eq!(
+            y.ckpt_blocks + y.retention_blocks,
+            d.ckpt_blocks + d.retention_blocks
+        );
         let p = y.plan(grant).expect("the traded shape plans");
         assert_eq!(p.slots, 16);
-        assert_eq!(p.pool_blocks, 16 * 128, "full context, nothing more");
+        assert_eq!(
+            p.pool_blocks,
+            16 * 128 + 9 * 402,
+            "full context + the kept turns"
+        );
         assert!(!p.shared);
         let slots = (p.expert_cache_bytes - margin) / price;
-        assert!(slots >= 16, "{slots} slots");
+        assert!(slots >= 8, "the floor holds: {slots} slots");
         assert!(p.pool_bytes + p.slot_bytes + y.fixed() + p.expert_cache_bytes <= grant);
+    }
+
+    /// When not even one resumable turn fits beside the slot cache floor and
+    /// full context, the trade refuses and names the shapes that serve both.
+    #[test]
+    fn no_room_for_one_turn_beside_the_floor_refuses_with_the_shapes() {
+        let (d, grant, _, _) = a3b_2048_x_16();
+        // 0.6 GiB less: context + floor fit, one turn (0.18 GiB) does not
+        let grant = grant - 6 * GIB / 10;
+        let e = d
+            .ckpts_yield_to_cache(grant)
+            .expect("tradable")
+            .expect_err("no turn fits");
+        assert!(e.message.contains("one resumable turn"), "{}", e.message);
+        // 5 sessions keep their turns beside the floor; a shorter context
+        // alone never frees the 16 turns' 2.9 GiB, so it is not offered
+        assert!(
+            e.message.contains("lower max_batch to <=5"),
+            "{}",
+            e.message
+        );
+        assert!(!e.message.contains("lower max_ctx"), "{}", e.message);
+        assert!(e.message.contains("raise vram_budget"), "{}", e.message);
     }
 
     /// A refusal no trade can help stays a refusal: without a cache floor
@@ -710,7 +811,7 @@ mod tests {
         // without the floor, context + checkpoints still exceed a smaller grant
         let grant = grant - 4 * GIB / 10;
         assert!(plain.plan(grant).is_err());
-        assert!(plain.ckpts_yield_to_cache().is_none());
+        assert!(!plain.tradable());
         assert_eq!(next_attempt(512, 512, 1024, false, false), None);
         // the ladder: halve first, keeping the pass; trade once from the top
         assert_eq!(
@@ -738,7 +839,8 @@ mod tests {
             ..d
         };
         assert!(pinned.plan(grant).is_err());
-        assert!(pinned.ckpts_yield_to_cache().is_none());
+        assert!(!pinned.tradable());
+        assert!(pinned.ckpts_yield_to_cache(grant).is_none());
     }
 
     /// The 35B-A3B shape above: (demand, grant, slot price, margin).
@@ -755,6 +857,7 @@ mod tests {
             block_bytes: g(1.676483154296875) / 10987,
             per_slot_bytes: g(0.9962539672851563) / 16,
             ckpt_blocks: 16 * 402,
+            pages_per_ckpt: 402,
             retention_blocks: 80 * 402,
             floor_blocks_per_slot: 128,
             reserves: vec![
