@@ -286,10 +286,9 @@ impl GpuQwen35 {
         let start = if paged {
             let mut m = {
                 let bs = self.batch.as_mut().expect("batch");
-                bs.paged_prefix
-                    .as_mut()
-                    .expect("prefix checked above")
-                    .match_full(tokens)
+                let pr = bs.paged_prefix.as_mut().expect("prefix checked above");
+                pr.begin_seq(slot, tokens);
+                pr.match_full(tokens)
             };
             // TIER (D5 park/wake): the restore is consulted and PARKED at
             // admission (`tier_prefix_loading`) - by the time prefill runs,
@@ -345,6 +344,7 @@ impl GpuQwen35 {
                         bs.tables[slot].share_prefix(&m.blocks[..pos / BLOCK_TOKENS], pool);
                     }
                     self.restore_paged_state(slot, idx)?;
+                    self.note_resume(slot, tokens, pos);
                     start = pos;
                     state_idx = Some(idx);
                 }
@@ -643,10 +643,9 @@ impl GpuQwen35 {
         if paged {
             let m = {
                 let bs = self.batch.as_mut().expect("batch");
-                bs.paged_prefix
-                    .as_mut()
-                    .expect("prefix checked above")
-                    .match_full(keys)
+                let pr = bs.paged_prefix.as_mut().expect("prefix checked above");
+                pr.begin_seq(slot, keys);
+                pr.match_full(keys)
             };
             if paddock_models::dev_var_os!("PADDOCK_PREFIX_STATS").is_some() {
                 tracing::info!(
@@ -668,6 +667,7 @@ impl GpuQwen35 {
                     bs.tables[slot].share_prefix(&m.blocks[..pos / BLOCK_TOKENS], pool);
                 }
                 self.restore_paged_state(slot, idx)?;
+                self.note_resume(slot, keys, pos);
                 start = pos;
                 // multimodal prefills don't run the drafter warm today, so a
                 // resumed mm slot must not keep a stale warm flag from its
@@ -3095,7 +3095,7 @@ impl GpuQwen35 {
             let radix = bs.paged_prefix.as_mut().expect("prefix checked above");
             let pool = bs.pool.as_mut().expect("prefix requires the pool");
             let blocks = bs.tables[slot].blocks()[..cut / BLOCK_TOKENS].to_vec();
-            radix.insert_for(slot, &seq[..cut], &blocks, pool);
+            radix.insert_reply_for(slot, &seq[..cut], &blocks, pool);
             if !radix.attach_state_at(&seq, cut, idx) {
                 radix.recycle_state(idx);
                 bs.seq[slot] = seq;
@@ -3160,6 +3160,14 @@ impl GpuQwen35 {
     pub(crate) fn set_slot_background(&mut self, slot: usize, on: bool) {
         if let Some(radix) = self.batch.as_mut().and_then(|bs| bs.paged_prefix.as_mut()) {
             radix.set_slot_low(slot, on);
+        }
+    }
+
+    /// `slot` resumed at boundary `pos`: a checkpoint another sequence wrote
+    /// is shared and held against steals (`PagedRadix::note_resume`).
+    fn note_resume(&mut self, slot: usize, tokens: &[u32], pos: usize) {
+        if let Some(radix) = self.batch.as_mut().and_then(|bs| bs.paged_prefix.as_mut()) {
+            radix.note_resume(slot, tokens, pos);
         }
     }
 
