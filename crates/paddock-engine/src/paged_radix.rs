@@ -2641,7 +2641,10 @@ mod tests {
         let _rest: Vec<BlockId> = (0..pool.free_blocks())
             .map(|_| pool.alloc().expect("free"))
             .collect();
-        assert!(r.attach_state_with_pool(&c, BLOCK_TOKENS, &mut pool).is_none());
+        assert!(
+            r.attach_state_with_pool(&c, BLOCK_TOKENS, &mut pool)
+                .is_none()
+        );
         let (_, steals, refused) = r.state_stats();
         assert_eq!((steals, refused), (0, 1));
         for (toks, idx) in &held {
@@ -2720,7 +2723,9 @@ mod tests {
             session(&mut r, &mut pool, 2, &[seed, seed + 50], &[1]);
         }
         assert!(r.nodes[old as usize].state_blk.is_none(), "stolen");
-        assert!(r.nodes[kept as usize].state_blk.is_some() && r.nodes[new as usize].state_blk.is_some());
+        assert!(
+            r.nodes[kept as usize].state_blk.is_some() && r.nodes[new as usize].state_blk.is_some()
+        );
     }
 
     #[test]
