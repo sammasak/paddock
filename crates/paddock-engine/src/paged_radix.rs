@@ -2705,14 +2705,22 @@ mod tests {
         r.set_state_capacity(8);
         let old = shared_prompt(&mut r, &mut pool, 1, 3);
         let kept = shared_prompt(&mut r, &mut pool, 2, 3);
-        for _ in 0..SHARED_STALE_SEQS {
+        // other sequences run; only `kept` is resumed again, halfway
+        for k in 0..SHARED_STALE_SEQS {
+            if k == SHARED_STALE_SEQS / 2 {
+                hit(&mut r, 2, 1);
+            }
             r.begin_seq(5, &[]);
         }
-        assert!(r.holds(&r.nodes[kept as usize]), "just within the window");
-        r.begin_seq(5, &[]);
+        assert!(
+            r.holds(&r.nodes[kept as usize]),
+            "resumed within the window"
+        );
         assert!(!r.holds(&r.nodes[old as usize]), "stale: no longer held");
-        hit(&mut r, 2, 1);
-        assert!(r.holds(&r.nodes[kept as usize]), "resumed again");
+        assert_eq!(
+            r.nodes[kept as usize].shared_hits, 4,
+            "a refresh, not a reset"
+        );
         // a newcomer takes the stale one's place in the cap...
         let new = shared_prompt(&mut r, &mut pool, 3, 1);
         assert!(r.nodes[new as usize].shared, "one hit gets in");
