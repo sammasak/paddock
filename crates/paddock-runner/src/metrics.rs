@@ -35,6 +35,7 @@
 //!   request-unique can become a label.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -1037,6 +1038,17 @@ impl Metrics {
                 reg.failures[k]
             ));
         }
+        counter_meta(
+            out,
+            "paddock_request_refused",
+            "Requests refused at the edge before any prefill or queue admission, by reason \
+             (context_length: the prompt is longer than max_ctx)",
+            om,
+        );
+        out.push_str(&format!(
+            "paddock_request_refused_total{{reason=\"context_length\"}} {}\n",
+            CONTEXT_LENGTH_REFUSALS.load(Ordering::Relaxed)
+        ));
         render_web_spend(out, om);
         counter_meta(
             out,
@@ -1099,6 +1111,21 @@ fn render_cache_ledgers(out: &mut String, m: &EngineMetrics, om: bool) {
             m.moe_slot_misses.load(Relaxed),
         );
     }
+}
+
+/// Over-window prompts refused by the chat, messages and completions edges.
+/// Whole-runner like the web spend below: the reason is the only label, so a
+/// refusal carries no model, route or caller identity.
+static CONTEXT_LENGTH_REFUSALS: AtomicU64 = AtomicU64::new(0);
+
+/// Count one edge refusal of a prompt longer than max_ctx.
+pub fn context_length_refused() {
+    CONTEXT_LENGTH_REFUSALS.fetch_add(1, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(crate) fn context_length_refusals() -> u64 {
+    CONTEXT_LENGTH_REFUSALS.load(Ordering::Relaxed)
 }
 
 // ── web-search spend  ───────────────────────────────────────────
@@ -1604,6 +1631,17 @@ mod tests {
             .next()
             .and_then(|v| v.parse().ok())
             .expect("integer sample")
+    }
+
+    /// The edge refusal counter renders under its one fixed label and moves
+    /// with each refusal (other tests refuse concurrently, so at least one).
+    #[test]
+    fn context_length_refusals_render_under_a_fixed_reason() {
+        let m = Metrics::new("i".into(), ModelIds::default(), None);
+        let line = "paddock_request_refused_total{reason=\"context_length\"}";
+        let before = sample(&m.render(Format::Classic, 0), line);
+        context_length_refused();
+        assert!(sample(&m.render(Format::Classic, 0), line) > before);
     }
 
     #[test]

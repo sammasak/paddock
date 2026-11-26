@@ -807,6 +807,28 @@ fn a_context_overflow_speaks_anthropics_words() {
     assert_eq!(anthropic_message(&EngineError::invalid("nope")), "nope");
 }
 
+/// One token past the window is a 400 in Anthropic's envelope, carrying
+/// both numbers; a window minus a reply budget and an empty prompt pass.
+#[tokio::test]
+async fn an_over_window_messages_prompt_is_anthropics_400() {
+    let e = crate::chat::overflow(16_385, 0, 0, 16_384).expect("one past the window");
+    let r = crate::chat::refuse_overflow("messages", &e, engine_err);
+    let (status, v) = crate::chat::refusal_json(r).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(v["type"], "error");
+    assert_eq!(v["error"]["type"], "invalid_request_error");
+    assert_eq!(
+        v["error"]["message"],
+        "prompt is too long: 16385 tokens > 16384 maximum"
+    );
+    for fits in [16_384 - 4_096, 16_384, 0] {
+        assert!(
+            crate::chat::overflow(fits, 0, 0, 16_384).is_none(),
+            "{fits}"
+        );
+    }
+}
+
 #[test]
 fn a_misplaced_system_message_is_a_400_not_a_render() {
     let first = vec![

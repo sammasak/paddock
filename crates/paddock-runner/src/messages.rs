@@ -1583,7 +1583,7 @@ pub async fn handle(
         prepared.mm_chunks.as_deref(),
         state.max_ctx,
     ) {
-        return engine_err(&e);
+        return crate::chat::refuse_overflow("messages", &e, engine_err);
     }
     let ctx = Ctx {
         id: format!("msg_{}", uuid::Uuid::new_v4().simple()),
