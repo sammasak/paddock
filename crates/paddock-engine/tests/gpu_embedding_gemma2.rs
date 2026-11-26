@@ -294,6 +294,20 @@ fn picture(name: &str) -> MmChunk {
     }
 }
 
+/// The picture the admission tests feed, or a skip when the reference
+/// directory is not on this machine.
+fn house() -> Option<MmChunk> {
+    let path = reference_dir().join("media280-prep/originals/house.jpg");
+    if !path.is_file() {
+        common::missing(&format!(
+            "EmbeddingGemma 2 test picture {} (record it with the media oracle script)",
+            path.display()
+        ));
+        return None;
+    }
+    Some(picture("house.jpg"))
+}
+
 struct MediaCase {
     name: String,
     ids: Vec<Vec<u32>>,
@@ -494,7 +508,9 @@ fn embeddinggemma2_refuses_mismatched_media() {
     use paddock_engine::gpu_model::embedding_gemma2::media::{
         AUDIO_TOKEN, BOI_TOKEN, EOI_TOKEN, IMAGE_TOKEN,
     };
-    let house = picture("house.jpg");
+    let Some(house) = house() else {
+        return;
+    };
     let block = |n: usize| {
         let mut s = vec![2, BOI_TOKEN];
         s.extend(std::iter::repeat_n(IMAGE_TOKEN, n));
@@ -761,8 +777,11 @@ fn embeddinggemma2_refuses_mismatched_audio() {
         m.validate_media(&[block(775)], &[vec![long]]).is_err(),
         "past 30 s"
     );
+    let Some(house) = house() else {
+        return;
+    };
     assert!(
-        m.validate_media(&[block(25)], &[vec![picture("house.jpg")]])
+        m.validate_media(&[block(25)], &[vec![house]])
             .is_err(),
         "a picture in an audio run"
     );
@@ -993,7 +1012,9 @@ fn embeddinggemma2_video_frames_take_the_frame_budget() {
     let Some(mut m) = load_with_pictures(2048) else {
         return;
     };
-    let house = picture("house.jpg");
+    let Some(house) = house() else {
+        return;
+    };
     let MmChunk::Image { w, h, .. } = &house else {
         unreachable!()
     };
