@@ -781,8 +781,7 @@ fn embeddinggemma2_refuses_mismatched_audio() {
         return;
     };
     assert!(
-        m.validate_media(&[block(25)], &[vec![house]])
-            .is_err(),
+        m.validate_media(&[block(25)], &[vec![house]]).is_err(),
         "a picture in an audio run"
     );
 }

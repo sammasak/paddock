@@ -68,7 +68,9 @@ fn min_cache_prefix() -> usize {
     *V.get_or_init(|| {
         gate_threshold(
             resume_gate_cfg().min_cache_prefix,
-            paddock_models::dev_var!("PADDOCK_MIN_CACHE_PREFIX").ok().as_deref(),
+            paddock_models::dev_var!("PADDOCK_MIN_CACHE_PREFIX")
+                .ok()
+                .as_deref(),
             // 512, not 32. Measured at wide batch with 128-token prompts, so
             // every hit resumed: resumes on runs slower AND bimodal, resumes
             // off via this floor runs faster and tight - while INSERTS still
@@ -97,7 +99,9 @@ fn resume_live_max() -> usize {
     *V.get_or_init(|| {
         gate_threshold(
             resume_gate_cfg().resume_live_max,
-            paddock_models::dev_var!("PADDOCK_RESUME_LIVE_MAX").ok().as_deref(),
+            paddock_models::dev_var!("PADDOCK_RESUME_LIVE_MAX")
+                .ok()
+                .as_deref(),
             RESUME_LIVE_MAX_DEFAULT,
         )
     })
@@ -3757,7 +3761,12 @@ mod resume_gate_tests {
     };
 
     fn gate(pos: usize, slots: usize) -> bool {
-        resume_worth_it(pos, slots, MIN_CACHE_PREFIX_DEFAULT, RESUME_LIVE_MAX_DEFAULT)
+        resume_worth_it(
+            pos,
+            slots,
+            MIN_CACHE_PREFIX_DEFAULT,
+            RESUME_LIVE_MAX_DEFAULT,
+        )
     }
 
     #[test]
