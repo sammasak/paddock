@@ -84,19 +84,55 @@ pub fn set_moe_offload(cfg: MoeOffloadCfg) {
     let _ = MOE_OFFLOAD.set(cfg);
 }
 
-/// The armed config; `PADDOCK_MOE_HOST=1` is the development switch that
-/// enables it without a config file (tests, bring-up), and
-/// `PADDOCK_MOE_DISK` (see [`moe_disk_artifact`]) implies it.
+/// The `[moe_offload]` development switches (tests, bring-up), read here
+/// and nowhere else. Each wins over the armed config; read on every call
+/// because the GPU tests set them between loads.
+struct DevVars {
+    /// `PADDOCK_MOE_HOST=1`: offload on without a config file.
+    host: bool,
+    /// `PADDOCK_MOE_DENSE_HOST=<names>`, same names as the config key.
+    dense_host: Option<DenseHost>,
+    /// `PADDOCK_MOE_DISK=<artifact>`, implies `host`.
+    disk: Option<std::path::PathBuf>,
+    /// `PADDOCK_MOE_DISK_VERIFY_ONCE`: on unless `0`.
+    disk_verify_once: Option<bool>,
+    /// `PADDOCK_MOE_DISK_HOST_MB`, in bytes.
+    disk_host_bytes: Option<u64>,
+    /// `PADDOCK_MOE_CACHE_SLOTS`: per-layer slot count.
+    cache_slots: Option<usize>,
+}
+
+fn dev_vars() -> DevVars {
+    use paddock_models::{dev_var, dev_var_os};
+    DevVars {
+        host: dev_var_os!("PADDOCK_MOE_HOST").is_some(),
+        dense_host: dev_var!("PADDOCK_MOE_DENSE_HOST")
+            .ok()
+            .and_then(|v| DenseHost::parse(v.split(',').filter(|s| !s.is_empty())).ok()),
+        disk: dev_var_os!("PADDOCK_MOE_DISK")
+            .filter(|v| !v.is_empty())
+            .map(Into::into),
+        disk_verify_once: dev_var_os!("PADDOCK_MOE_DISK_VERIFY_ONCE").map(|v| v != "0"),
+        disk_host_bytes: dev_var!("PADDOCK_MOE_DISK_HOST_MB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(|mb| mb.saturating_mul(1 << 20)),
+        cache_slots: dev_var!("PADDOCK_MOE_CACHE_SLOTS")
+            .ok()
+            .and_then(|v| v.parse().ok()),
+    }
+}
+
+/// The armed config, under the development switches: `PADDOCK_MOE_HOST=1`
+/// enables it without a config file, and `PADDOCK_MOE_DISK` (see
+/// [`moe_disk_artifact`]) implies it.
 pub fn moe_offload() -> MoeOffloadCfg {
     let mut c = MOE_OFFLOAD.get().copied().unwrap_or_default();
-    // development switch for the gates, same names as the config key
-    if let Some(v) = paddock_models::dev_var!("PADDOCK_MOE_DENSE_HOST")
-        .ok()
-        .and_then(|v| DenseHost::parse(v.split(',').filter(|s| !s.is_empty())).ok())
-    {
+    let dev = dev_vars();
+    if let Some(v) = dev.dense_host {
         c.dense_host = v;
     }
-    if paddock_models::dev_var_os!("PADDOCK_MOE_HOST").is_some() || moe_disk_artifact().is_some() {
+    if dev.host || moe_disk_artifact().is_some() {
         c.enabled = true;
     }
     c
@@ -127,28 +163,24 @@ pub fn set_moe_disk(cfg: MoeDiskCfg) {
 /// load, and families without `[moe_offload]` ignore it as they ignore
 /// `PADDOCK_MOE_HOST`.
 pub fn moe_disk_artifact() -> Option<std::path::PathBuf> {
-    paddock_models::dev_var_os!("PADDOCK_MOE_DISK")
-        .filter(|v| !v.is_empty())
-        .map(Into::into)
+    dev_vars()
+        .disk
         .or_else(|| MOE_DISK.get().map(|c| c.artifact.clone()))
 }
 
 /// Verify-once for the disk backing: `[moe_offload] verify_once`, or
 /// `PADDOCK_MOE_DISK_VERIFY_ONCE=1` (development switch, wins).
 pub(crate) fn moe_disk_verify_once() -> bool {
-    match paddock_models::dev_var_os!("PADDOCK_MOE_DISK_VERIFY_ONCE") {
-        Some(v) => v != "0",
-        None => MOE_DISK.get().is_some_and(|c| c.verify_once),
-    }
+    dev_vars()
+        .disk_verify_once
+        .unwrap_or_else(|| MOE_DISK.get().is_some_and(|c| c.verify_once))
 }
 
 /// Bytes of the disk backing's host tier: `[moe_offload] host_cache_gb`, or
 /// `PADDOCK_MOE_DISK_HOST_MB` (development switch, wins).
 pub(crate) fn moe_disk_host_bytes() -> u64 {
-    paddock_models::dev_var!("PADDOCK_MOE_DISK_HOST_MB")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .map(|mb| mb.saturating_mul(1 << 20))
+    dev_vars()
+        .disk_host_bytes
         .unwrap_or_else(|| MOE_DISK.get().map_or(0, |c| c.host_cache_bytes))
 }
 
@@ -156,9 +188,7 @@ pub(crate) fn moe_disk_host_bytes() -> u64 {
 /// count, overriding the auto size (the same instrument class as
 /// PADDOCK_KV_POOL_BLOCKS). 0 = no cache (pure zero-copy).
 pub fn moe_cache_slots_pin() -> Option<usize> {
-    paddock_models::dev_var!("PADDOCK_MOE_CACHE_SLOTS")
-        .ok()
-        .and_then(|v| v.parse().ok())
+    dev_vars().cache_slots
 }
 
 /// Geometry of a repacked expert plane, independent of its backing address.
