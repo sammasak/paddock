@@ -1108,6 +1108,13 @@ impl GpuQwen35 {
         Some(pool.free_blocks() + evictable)
     }
 
+    /// The prefix cache's `(state writes, LRU steals, refused admissions)`
+    /// since load - the numbers the chunk publish's PADDOCK_PREFIX_STATS line
+    /// prints, for `/metrics`. None with the prefix cache off.
+    pub fn prefix_state_stats(&self) -> Option<(u64, u64, u64)> {
+        Some(self.batch.as_ref()?.paged_prefix.as_ref()?.state_stats())
+    }
+
     /// Number of DeltaNet (linear-attention) layers.
     pub(super) fn n_linear_layers(&self) -> usize {
         self.layers

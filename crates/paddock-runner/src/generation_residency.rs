@@ -4,12 +4,12 @@ use crate::residency::{Config, LoadPolicy, Pool, Snapshot};
 use paddock_engine::{
     generator::VisionBudget,
     metrics::EngineMetrics,
-    service::{Engine, EngineError, GenRequest, TokenEvent},
+    service::{Engine, EngineError, GenRequest, Submitted, TokenEvent},
 };
 use std::{
     path::{Path, PathBuf},
     sync::{Arc, atomic::Ordering::Relaxed},
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, SystemTime},
 };
 
 #[derive(Clone)]
@@ -114,7 +114,7 @@ impl Handle {
             .try_acquire_owned()
             .map_err(|_| "model_unavailable: residency queue is full or closing".to_owned())?;
         let r = r.clone();
-        req.submitted.get_or_insert_with(Instant::now);
+        req.submitted.get_or_insert_with(Submitted::now);
         let caller = req.events.clone();
         tokio::spawn(async move {
             let _permit = permit;
