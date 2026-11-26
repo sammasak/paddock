@@ -2586,7 +2586,8 @@ fn stream_response(mut meta: Meta, rxs: Vec<UnboundedReceiver<TokenEvent>>) -> R
                 }
                 TokenEvent::Token { id, logprobs } => {
                     // the first token, for a stream that never sees its Done
-                    // (the n == 1 stop-string break below, a disconnect)
+                    // (the n == 1 stop-string break below, a disconnect, an
+                    // engine error)
                     if cs.ids.is_empty() {
                         meta.scope.token_seen();
                     }
