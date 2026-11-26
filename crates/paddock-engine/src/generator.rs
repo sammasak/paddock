@@ -917,6 +917,15 @@ pub trait Generator: Send {
         None
     }
 
+    /// [`Self::moe_slot_stats`] including caches whose counters live on the
+    /// device (the pinned slot cache): the same `(hits, misses)`, read with a
+    /// stream sync, so the serving loop calls it at most once a second.
+    /// `Some((0, 0))` from the moment a cache is seated, so `/metrics` tells
+    /// a cache that has served nothing from no cache.
+    fn moe_slot_stats_synced(&self) -> Option<(u64, u64)> {
+        self.moe_slot_stats()
+    }
+
     /// Free-on-completion hook (P5b): `occupied[k]` is whether slot `k` still
     /// holds a live sequence. A paged backend returns idle slots' KV blocks to
     /// the shared pool so the freed memory is immediately available to new
@@ -1595,6 +1604,17 @@ impl Generator for crate::gpu_model::qwen35::GpuQwen35 {
             let misses = s.misses + s.tier_hits;
             (s.rows.saturating_sub(misses), misses)
         })
+    }
+    fn moe_slot_stats_synced(&self) -> Option<(u64, u64)> {
+        // a slot miss is a disk read or a host tier hit on the disk backing,
+        // a fill from the pinned mirror otherwise
+        match self.moe_cache_stats() {
+            Ok(s) => s.map(|(rows, misses)| (rows.saturating_sub(misses), misses)),
+            Err(e) => {
+                tracing::warn!("MoE slot cache counters unreadable: {e}");
+                None
+            }
+        }
     }
     fn reset(&mut self) {
         crate::gpu_model::qwen35::GpuQwen35::reset(self);
