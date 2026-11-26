@@ -34,7 +34,7 @@ impl crate::generator::Generator for Qwen4ExpGpu {
         match self.moe_cache_stats() {
             Ok((rows, misses)) => Some((rows.saturating_sub(misses), misses)),
             Err(e) => {
-                tracing::warn!("MoE slot cache counters unreadable: {e}");
+                crate::metrics::warn_slot_readback(&e);
                 None
             }
         }

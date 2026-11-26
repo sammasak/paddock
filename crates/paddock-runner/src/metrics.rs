@@ -192,8 +192,10 @@ pub struct Observation<'a> {
     pub duration: Duration,
     /// Arrival at the edge to the engine's first sampled token (tokenize +
     /// queue + prefill), streamed or not. Not the first response byte: a
-    /// stream's SSE preamble leaves before prefill ends. None when the request
-    /// generated no token.
+    /// stream's SSE preamble leaves before prefill ends. A request without an
+    /// engine token (embeddings, audio) falls back to its first body byte, so
+    /// every success has one sample - the manager's overflow bucket is
+    /// `successes - sum(ttft_h)`.
     pub ttft: Option<Duration>,
     /// Engine-measured decode wall clock - TPOT's numerator.
     pub decode_ms: Option<u64>,
@@ -1667,8 +1669,10 @@ mod tests {
             prefilled_at: Some(t0 + Duration::from_millis(ms)),
             ..RunStats::default()
         };
-        let fresh = crate::events::record_stream_for_test(m.clone(), t0, 0, &stats(300));
-        let resumed = crate::events::record_stream_for_test(m.clone(), t0, 4096, &stats(90));
+        // an agent loop's second round does not move the first token
+        let fresh =
+            crate::events::record_stream_for_test(m.clone(), t0, 0, &[stats(300), stats(2000)]);
+        let resumed = crate::events::record_stream_for_test(m.clone(), t0, 4096, &[stats(90)]);
         assert_eq!((fresh.ttft_ms, resumed.ttft_ms), (Some(300), Some(90)));
         let s = m.render(Format::Classic, 0);
         let b = "gen_ai_server_time_to_first_token_seconds_bucket{gen_ai_operation_name=\"chat\",\
@@ -1679,13 +1683,18 @@ mod tests {
         assert_eq!((at("fresh", "0.01"), at("resumed", "0.01")), (0, 0));
         assert_eq!((at("fresh", "0.16"), at("fresh", "0.32")), (0, 1));
         assert_eq!((at("resumed", "0.08"), at("resumed", "0.16")), (0, 1));
-        // a request whose engine sampled no token observes none
-        let none = crate::events::record_stream_for_test(m.clone(), t0, 0, &RunStats::default());
-        assert_eq!(none.ttft_ms, None);
+        // a request without an engine token (embeddings, audio) falls back
+        // to its first byte, so every success still has one sample
+        let none = crate::events::record_stream_for_test(m.clone(), t0, 0, &[RunStats::default()]);
+        assert!(
+            none.ttft_ms.is_some_and(|ms| ms < 300),
+            "{:?}",
+            none.ttft_ms
+        );
         let s = m.render(Format::Classic, 0);
         assert_eq!(
             sample(&s, &format!("{b},prompt=\"fresh\",le=\"+Inf\"}}")),
-            1
+            2
         );
     }
 

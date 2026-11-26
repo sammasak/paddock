@@ -1611,7 +1611,7 @@ impl Generator for crate::gpu_model::qwen35::GpuQwen35 {
         match self.moe_cache_stats() {
             Ok(s) => s.map(|(rows, misses)| (rows.saturating_sub(misses), misses)),
             Err(e) => {
-                tracing::warn!("MoE slot cache counters unreadable: {e}");
+                crate::metrics::warn_slot_readback(&e);
                 None
             }
         }

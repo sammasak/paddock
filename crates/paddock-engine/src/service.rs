@@ -304,7 +304,8 @@ pub struct RunStats {
     pub prefill_ms: u32,
     /// prefill done -> finish: the decode-phase wall clock.
     pub decode_ms: u32,
-    /// When the prompt finished prefilling and its first token was sampled:
+    /// When the request's first token was sampled (next-token: the prompt's
+    /// prefill finished; block diffusion: its first block was accepted):
     /// where the serving layer's time to first token ends. None on a request
     /// that generates no token (a structured read).
     pub prefilled_at: Option<std::time::Instant>,
@@ -1261,12 +1262,15 @@ fn run_request_diffusion(
         None
     };
     let t_prefilled = std::time::Instant::now();
-    let stats = |t_prefilled: std::time::Instant| RunStats {
+    // a canvas's first token exists once its first block is accepted, not
+    // when the prompt is in KV
+    let mut first_block: Option<std::time::Instant> = None;
+    let stats = |t_prefilled: std::time::Instant, first_block| RunStats {
         sampled_stop: false,
         queued_ms,
         prefill_ms: dur_ms(t_prefilled.saturating_duration_since(t_admit)),
         decode_ms: dur_ms(t_prefilled.elapsed()),
-        prefilled_at: Some(t_prefilled),
+        prefilled_at: first_block,
         spec_drafted: 0,
         spec_accepted: 0,
         kv_pages: 0,
@@ -1285,9 +1289,10 @@ fn run_request_diffusion(
                 return;
             }
         };
+        first_block.get_or_insert_with(std::time::Instant::now);
         for &id in &block {
             if req.stop_tokens.contains(&id) {
-                finish_sampled_stop(&req.events, metrics, stats(t_prefilled));
+                finish_sampled_stop(&req.events, metrics, stats(t_prefilled, first_block));
                 return;
             }
             if req
@@ -1313,9 +1318,10 @@ fn run_request_diffusion(
         }
         base += block.len();
     }
-    let _ = req
-        .events
-        .send(TokenEvent::Done(FinishReason::Length, stats(t_prefilled)));
+    let _ = req.events.send(TokenEvent::Done(
+        FinishReason::Length,
+        stats(t_prefilled, first_block),
+    ));
 }
 
 /// The batched loop for a BLOCK-DIFFUSION backend (DiffusionGemma): up to
@@ -1356,6 +1362,8 @@ fn run_batched_diffusion(
         queued_ms: u32,
         t_admit: std::time::Instant,
         t_prefilled: std::time::Instant,
+        /// When the first block was accepted: the first token. None on a read.
+        first_block: Option<std::time::Instant>,
     }
     impl DSlot {
         fn stats(&self) -> RunStats {
@@ -1364,7 +1372,7 @@ fn run_batched_diffusion(
                 queued_ms: self.queued_ms,
                 prefill_ms: dur_ms(self.t_prefilled.saturating_duration_since(self.t_admit)),
                 decode_ms: dur_ms(self.t_prefilled.elapsed()),
-                prefilled_at: Some(self.t_prefilled),
+                prefilled_at: self.first_block,
                 spec_drafted: 0,
                 spec_accepted: 0,
                 kv_pages: 0,
@@ -1493,6 +1501,7 @@ fn run_batched_diffusion(
                 queued_ms,
                 t_admit,
                 t_prefilled: t_admit,
+                first_block: None,
             });
             match req.mm_chunks {
                 Some(chunks) => mm_pending.push((k, chunks)),
@@ -1691,6 +1700,7 @@ fn run_batched_diffusion(
                     continue;
                 }
             };
+            s.first_block.get_or_insert_with(std::time::Instant::now);
             generator.canvas_close(h);
             s.canvas = None;
             s.steps = 0;
@@ -7440,7 +7450,7 @@ mod usage_tests {
             (0, 0, 0),
             "the per-pass publish takes no device sync"
         );
-        // warm-up: a seated cache that has served nothing is armed at 0
+        // the warm-up refresh arms a seated cache; here it has served nothing
         refresh_model_mem(&g, &m, &mut None, MODEL_MEM_REFRESH);
         assert_eq!(slots(&m), (1, 0, 0));
         let mut seen = None;
