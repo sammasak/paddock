@@ -194,6 +194,13 @@ pub struct Demand {
     /// Bytes the slot cache can use at most (every expert resident, or the
     /// operator's cap). The share never takes the pool's blocks past it.
     pub expert_cache_max: u64,
+    /// The checkpoint count is pinned by the operator
+    /// (`PADDOCK_KV_STATE_CKPTS`): those pages are what is being measured, so
+    /// [`Self::ckpts_yield_to_cache`] never trades them.
+    pub ckpts_pinned: bool,
+    /// Pool blocks one checkpoint spans (0: the family keeps none in pages),
+    /// what [`Self::ckpts_yield_to_cache`] prices a resumable turn at.
+    pub pages_per_ckpt: usize,
 }
 
 impl Default for Demand {
@@ -215,6 +222,8 @@ impl Default for Demand {
             expert_cache_floor: 0,
             expert_cache_share: 0.0,
             expert_cache_max: u64::MAX,
+            ckpts_pinned: false,
+            pages_per_ckpt: 0,
         }
     }
 }
@@ -371,6 +380,93 @@ impl Demand {
             });
         }
         Err(self.wont_fit(grant))
+    }
+
+    /// Bytes one resumable turn's checkpoints take in the pool.
+    fn turn_bytes(&self) -> u64 {
+        crate::ckpt_pages::CKPTS_PER_TURN * self.pages_per_ckpt as u64 * self.block_bytes.max(1)
+    }
+
+    /// Resumable turns that fit at `slots` x `blocks_per_slot` beside the slot
+    /// cache floor and full context, at most one per session.
+    fn turns_beside_floor(&self, grant: u64, slots: usize, blocks_per_slot: usize) -> u64 {
+        let context = slots as u64 * blocks_per_slot as u64 * self.block_bytes.max(1);
+        let room = self
+            .kv_bytes(grant, slots)
+            .and_then(|kv| kv.checked_sub(self.expert_cache_floor + context))
+            .unwrap_or(0);
+        (room / self.turn_bytes().max(1)).min(slots as u64)
+    }
+
+    /// A checkpoint trade can change this shape's plan: it has an expert
+    /// slot cache floor, mandatory checkpoint pages, a known page count per
+    /// checkpoint, and no operator pin.
+    pub fn tradable(&self) -> bool {
+        self.expert_cache_floor > 0
+            && self.ckpt_blocks > 0
+            && self.pages_per_ckpt > 0
+            && !self.ckpts_pinned
+    }
+
+    /// The same shape keeping one resumable turn per live session that fits
+    /// beside the slot cache floor and full context, for a caller whose
+    /// [`Self::plan`] refused at every shape it will try (qwen35: every
+    /// prefill chunk, see [`next_attempt`]). Of the mandatory checkpoints it
+    /// keeps `min(slots, turns that fit) x CKPTS_PER_TURN` (never more than
+    /// it had); the rest join the evictable want, and the slot cache takes
+    /// only the surplus above the kept ones. `None`: not [`Self::tradable`].
+    /// `Some(Err)`: not even one turn fits beside the floor; the refusal
+    /// names the reachable max_ctx and max_batch shapes.
+    ///
+    /// Why one turn each and not none: with none (35B-A3B, 2048 x 16, 8 GB)
+    /// a checkpoint is 402 of the pool's 2048 blocks, the cuts of one turn
+    /// steal each other, and no multi-turn session resumed (0 cached tokens
+    /// on 40 later turns) although 17 slots decoded 27.2 tok/s.
+    pub fn ckpts_yield_to_cache(&self, grant: u64) -> Option<Result<Demand, WontFit>> {
+        if !self.tradable() {
+            return None;
+        }
+        let ckpts = (self.ckpt_blocks / self.pages_per_ckpt) as u64;
+        let turns = self.turns_beside_floor(grant, self.slots, self.blocks_per_slot);
+        if turns == 0 {
+            // the shapes where every session keeps its turn beside the floor
+            let mut shapes = Vec::new();
+            if let Some(n) = (1..self.slots)
+                .rev()
+                .find(|&n| self.turns_beside_floor(grant, n, self.blocks_per_slot) >= n as u64)
+            {
+                shapes.push(format!("lower max_batch to <={n}"));
+            }
+            if let Some(b) = (1..self.blocks_per_slot)
+                .rev()
+                .find(|&b| self.turns_beside_floor(grant, self.slots, b) >= self.slots as u64)
+            {
+                shapes.push(format!("lower max_ctx to <={}", b * BLOCK_TOKENS));
+            }
+            shapes.push("raise vram_budget".into());
+            return Some(Err(WontFit {
+                message: format!(
+                    "{} cannot keep the {:.2} GiB expert slot cache floor, full context and one \
+                     resumable turn ({} checkpoints, {:.2} GiB) per session at max_ctx {} x \
+                     max_batch {}: {}.",
+                    self.family,
+                    gib(self.expert_cache_floor),
+                    crate::ckpt_pages::CKPTS_PER_TURN,
+                    gib(self.turn_bytes()),
+                    self.max_ctx,
+                    self.slots,
+                    shapes.join(", or ")
+                ),
+            }));
+        }
+        let kept =
+            (turns * crate::ckpt_pages::CKPTS_PER_TURN).min(ckpts) as usize * self.pages_per_ckpt;
+        Some(Ok(Demand {
+            ckpt_blocks: kept,
+            retention_blocks: self.retention_blocks + (self.ckpt_blocks - kept),
+            expert_cache_share: 1.0,
+            ..self.clone()
+        }))
     }
 
     /// Plan, or - when nothing fits - the smallest runnable shape instead of a
@@ -601,6 +697,27 @@ impl Plan {
     }
 }
 
+/// The next attempt after a refused plan at prefill chunk `chunk`: halve the
+/// chunk down to `min_chunk`, then, once and only when a trade is possible,
+/// walk the ladder again from `top_chunk` with the checkpoints traded
+/// ([`Demand::ckpts_yield_to_cache`]): guaranteed checkpoints outrank a
+/// wider chunk. `None`: the refusal stands.
+pub fn next_attempt(
+    chunk: usize,
+    min_chunk: usize,
+    top_chunk: usize,
+    traded: bool,
+    tradable: bool,
+) -> Option<(usize, bool)> {
+    if chunk > min_chunk {
+        Some((chunk / 2, traded))
+    } else if !traded && tradable {
+        Some((top_chunk, true))
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -620,6 +737,142 @@ mod tests {
             reserves: vec![Reserve::new("slack", GIB), Reserve::new("scratch", GIB)],
             ..Default::default()
         }
+    }
+
+    /// Qwen3.6-35B-A3B, experts pinned in host RAM, max_ctx 2048 x max_batch
+    /// 16 on an 8 GB RTX 3070 (vram_budget 7500), figures from its refused
+    /// start: the 16 live turns' checkpoints (0.98 GiB) crowd out the 8-slot
+    /// cache floor, so the plan refuses. The trade keeps the one resumable
+    /// turn per session that fits beside the floor and full context (3 turns,
+    /// 9 checkpoints) and gives the cache what is left above them.
+    #[test]
+    fn a_35b_a3b_at_2048_x_16_keeps_a_resumable_turn_per_session() {
+        let (d, grant, price, margin) = a3b_2048_x_16();
+        let e = d
+            .plan(grant)
+            .expect_err("checkpoints + context + floor exceed the grant");
+        assert!(e.message.contains("resume checkpoints"), "{}", e.message);
+        let y = d
+            .ckpts_yield_to_cache(grant)
+            .expect("a cache floor and checkpoints to trade")
+            .expect("one turn fits beside the floor");
+        assert_eq!(y.ckpt_blocks, 9 * 402, "3 turns x 3 checkpoints kept");
+        assert_eq!(
+            y.ckpt_blocks + y.retention_blocks,
+            d.ckpt_blocks + d.retention_blocks
+        );
+        let p = y.plan(grant).expect("the traded shape plans");
+        assert_eq!(p.slots, 16);
+        assert_eq!(
+            p.pool_blocks,
+            16 * 128 + 9 * 402,
+            "full context + the kept turns"
+        );
+        assert!(!p.shared);
+        let slots = (p.expert_cache_bytes - margin) / price;
+        assert!(slots >= 8, "the floor holds: {slots} slots");
+        assert!(p.pool_bytes + p.slot_bytes + y.fixed() + p.expert_cache_bytes <= grant);
+    }
+
+    /// When not even one resumable turn fits beside the slot cache floor and
+    /// full context, the trade refuses and names the shapes that serve both.
+    #[test]
+    fn no_room_for_one_turn_beside_the_floor_refuses_with_the_shapes() {
+        let (d, grant, _, _) = a3b_2048_x_16();
+        // 0.6 GiB less: context + floor fit, one turn (0.18 GiB) does not
+        let grant = grant - 6 * GIB / 10;
+        let e = d
+            .ckpts_yield_to_cache(grant)
+            .expect("tradable")
+            .expect_err("no turn fits");
+        assert!(e.message.contains("one resumable turn"), "{}", e.message);
+        // 5 sessions keep their turns beside the floor; a shorter context
+        // alone never frees the 16 turns' 2.9 GiB, so it is not offered
+        assert!(
+            e.message.contains("lower max_batch to <=5"),
+            "{}",
+            e.message
+        );
+        assert!(!e.message.contains("lower max_ctx"), "{}", e.message);
+        assert!(e.message.contains("raise vram_budget"), "{}", e.message);
+    }
+
+    /// A refusal no trade can help stays a refusal: without a cache floor
+    /// there is nothing to trade for, and the ladder ends at its last chunk.
+    #[test]
+    fn a_refusal_with_no_trade_possible_stays_a_refusal() {
+        let (d, grant, _, _) = a3b_2048_x_16();
+        let plain = Demand {
+            expert_cache_floor: 0,
+            expert_cache_share: 0.0,
+            expert_cache_max: u64::MAX,
+            ..d
+        };
+        // without the floor, context + checkpoints still exceed a smaller grant
+        let grant = grant - 4 * GIB / 10;
+        assert!(plain.plan(grant).is_err());
+        assert!(!plain.tradable());
+        assert_eq!(next_attempt(512, 512, 1024, false, false), None);
+        // the ladder: halve first, keeping the pass; trade once from the top
+        assert_eq!(
+            next_attempt(1024, 512, 1024, false, true),
+            Some((512, false))
+        );
+        assert_eq!(
+            next_attempt(512, 512, 1024, false, true),
+            Some((1024, true))
+        );
+        assert_eq!(next_attempt(1024, 512, 1024, true, true), Some((512, true)));
+        assert_eq!(
+            next_attempt(512, 512, 1024, true, true),
+            None,
+            "one trade pass only"
+        );
+    }
+
+    /// A pinned checkpoint count is what an A/B arm measures: never traded.
+    #[test]
+    fn a_checkpoint_pin_is_never_traded() {
+        let (d, grant, _, _) = a3b_2048_x_16();
+        let pinned = Demand {
+            ckpts_pinned: true,
+            ..d
+        };
+        assert!(pinned.plan(grant).is_err());
+        assert!(!pinned.tradable());
+        assert!(pinned.ckpts_yield_to_cache(grant).is_none());
+    }
+
+    /// The 35B-A3B shape above: (demand, grant, slot price, margin).
+    fn a3b_2048_x_16() -> (Demand, u64, u64, u64) {
+        let g = |x: f64| (x * GIB as f64) as u64;
+        let mib = |x: u64| x << 20;
+        let price: u64 = 80_740_352; // one slot across the 40 MoE layers
+        let margin = mib(64);
+        let d = Demand {
+            family: "qwen35",
+            max_ctx: 2048,
+            slots: 16,
+            blocks_per_slot: 128,
+            block_bytes: g(1.676483154296875) / 10987,
+            per_slot_bytes: g(0.9962539672851563) / 16,
+            ckpt_blocks: 16 * 402,
+            pages_per_ckpt: 402,
+            retention_blocks: 80 * 402,
+            floor_blocks_per_slot: 128,
+            reserves: vec![
+                Reserve::new("conv staging", g(0.50)),
+                Reserve::new("checkpoint staging", g(0.18)),
+                Reserve::new("prefill wave buffers", g(0.09)),
+                Reserve::new("graph pools + headroom", g(0.75)),
+            ],
+            when_short: WhenShort::Refuse,
+            expert_cache_floor: 8 * price + margin,
+            expert_cache_share: 0.5,
+            expert_cache_max: 256 * price + margin,
+            ..Default::default()
+        };
+        (d, g(4.201030107215047), price, margin)
     }
 
     /// The fallback must not walk past the grant.
