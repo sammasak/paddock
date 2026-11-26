@@ -1594,7 +1594,11 @@ mod tests {
     fn sample(s: &str, prefix: &str) -> u64 {
         let hits: Vec<&str> = s.lines().filter(|l| l.starts_with(prefix)).collect();
         assert_eq!(hits.len(), 1, "want one `{prefix}` line in:\n{s}");
-        hits[0].rsplit(' ').next().and_then(|v| v.parse().ok()).expect("integer sample")
+        hits[0]
+            .rsplit(' ')
+            .next()
+            .and_then(|v| v.parse().ok())
+            .expect("integer sample")
     }
 
     #[test]
@@ -1615,14 +1619,30 @@ mod tests {
         let s = m.render(Format::Classic, 0);
         let b = "gen_ai_server_time_to_first_token_seconds_bucket{gen_ai_operation_name=\"chat\",\
                  gen_ai_provider_name=\"paddock\",gen_ai_request_model=\"m1\",origin=\"live\"";
-        assert_eq!(sample(&s, &format!("{b},prompt=\"fresh\",le=\"0.02\"}}")), 2);
-        assert_eq!(sample(&s, &format!("{b},prompt=\"fresh\",le=\"+Inf\"}}")), 2);
-        assert_eq!(sample(&s, &format!("{b},prompt=\"resumed\",le=\"0.32\"}}")), 0);
-        assert_eq!(sample(&s, &format!("{b},prompt=\"resumed\",le=\"0.64\"}}")), 1);
-        assert_eq!(sample(&s, &format!("{b},prompt=\"resumed\",le=\"+Inf\"}}")), 1);
+        assert_eq!(
+            sample(&s, &format!("{b},prompt=\"fresh\",le=\"0.02\"}}")),
+            2
+        );
+        assert_eq!(
+            sample(&s, &format!("{b},prompt=\"fresh\",le=\"+Inf\"}}")),
+            2
+        );
+        assert_eq!(
+            sample(&s, &format!("{b},prompt=\"resumed\",le=\"0.32\"}}")),
+            0
+        );
+        assert_eq!(
+            sample(&s, &format!("{b},prompt=\"resumed\",le=\"0.64\"}}")),
+            1
+        );
+        assert_eq!(
+            sample(&s, &format!("{b},prompt=\"resumed\",le=\"+Inf\"}}")),
+            1
+        );
         // one HELP/TYPE pair for both splits
         assert_eq!(
-            s.matches("# TYPE gen_ai_server_time_to_first_token_seconds histogram").count(),
+            s.matches("# TYPE gen_ai_server_time_to_first_token_seconds histogram")
+                .count(),
             1
         );
         // the usage rollup has no prompt column: the splits merge back
@@ -1655,7 +1675,10 @@ mod tests {
         let s = m.render(Format::Classic, 0);
         for (name, v) in families {
             assert!(s.contains(&format!("# HELP {name} ")), "{name} HELP");
-            assert!(s.contains(&format!("# TYPE {name} counter\n")), "{name} TYPE");
+            assert!(
+                s.contains(&format!("# TYPE {name} counter\n")),
+                "{name} TYPE"
+            );
             assert_eq!(sample(&s, &format!("{name} ")), v, "{name}");
         }
         assert!(s.contains("# HELP paddock_num_requests_waiting "));
@@ -1665,7 +1688,10 @@ mod tests {
         let om = m.render(Format::OpenMetrics, 0);
         for (name, _) in families {
             let family = name.trim_end_matches("_total");
-            assert!(om.contains(&format!("# TYPE {family} counter\n")), "{family}");
+            assert!(
+                om.contains(&format!("# TYPE {family} counter\n")),
+                "{family}"
+            );
         }
         drop(_queued);
         let s = m.render(Format::Classic, 0);

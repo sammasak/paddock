@@ -2818,7 +2818,10 @@ fn admit(
     let max_ctx = generator.max_context();
     if paddock_models::dev_var_os!("PADDOCK_REQ_TRACE").is_some() {
         tracing::info!(
-            queued_ms = req.submitted.as_ref().map(|t| t.at.elapsed().as_secs_f64() * 1000.),
+            queued_ms = req
+                .submitted
+                .as_ref()
+                .map(|t| t.at.elapsed().as_secs_f64() * 1000.),
             "req-trace: admit {} tokens at {}",
             req.prompt.len(),
             trace_us()
