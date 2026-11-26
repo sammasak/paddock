@@ -3095,7 +3095,7 @@ impl GpuQwen35 {
             let radix = bs.paged_prefix.as_mut().expect("prefix checked above");
             let pool = bs.pool.as_mut().expect("prefix requires the pool");
             let blocks = bs.tables[slot].blocks()[..cut / BLOCK_TOKENS].to_vec();
-            radix.insert_for(slot, &seq[..cut], &blocks, pool);
+            radix.insert_reply_for(slot, &seq[..cut], &blocks, pool);
             if !radix.attach_state_at(&seq, cut, idx) {
                 radix.recycle_state(idx);
                 bs.seq[slot] = seq;
