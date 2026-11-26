@@ -151,6 +151,16 @@ impl Submitted {
         }
     }
 
+    /// Stamped now and counted in `metrics` from here: for a caller that
+    /// queues a request ahead of the engine (a residency lease), so the
+    /// gauge covers the same span `queued_ms` does.
+    pub fn queued(metrics: Arc<EngineMetrics>) -> Self {
+        Submitted {
+            at: std::time::Instant::now(),
+            ticket: Some(QueueTicket::new(metrics)),
+        }
+    }
+
     /// Milliseconds queued until `admitted`; consumes the ticket.
     fn waited_ms(self, admitted: std::time::Instant) -> u32 {
         dur_ms(admitted.saturating_duration_since(self.at))
@@ -1745,6 +1755,8 @@ fn refresh_model_mem(
 /// Copy the family's cache ledgers (prefix checkpoints, MoE expert slots)
 /// into the published counters. Host counters only, so every pass can afford
 /// it; a family that reports neither leaves both families off `/metrics`.
+/// The serial loop calls it after each request, so there the counters lag
+/// by the request in flight.
 fn publish_model_counters(generator: &dyn Generator, metrics: &EngineMetrics) {
     if let Some(s) = generator.prefix_state_stats() {
         metrics.store_prefix_state(s);
@@ -2354,6 +2366,7 @@ impl Slot {
             mm: req.mm_chunks.take(),
             recompute: false,
             metrics,
+            // admitted: dropping the ticket takes it off `requests_waiting`
             submitted: req.submitted.take().map(|s| s.at),
             admitted: std::time::Instant::now(),
             prefill_done: None,

@@ -583,7 +583,7 @@ impl Metrics {
                 &mut out,
                 "paddock_num_requests_waiting",
                 "gauge",
-                "Requests submitted to the engine and not yet holding a slot (queue depth)",
+                "Requests submitted and not yet admitted to a slot (queue depth; preempted sequences excluded)",
                 None,
                 om,
             );
@@ -1085,12 +1085,12 @@ fn render_cache_ledgers(out: &mut String, m: &EngineMetrics, om: bool) {
     if m.moe_slots_armed.load(Relaxed) == 1 {
         c(
             "paddock_moe_expert_slot_hits",
-            "Routed MoE rows served from a resident expert slot (rows minus slot loads)",
+            "Routed MoE rows served from a resident expert slot (rows minus slot loads; disk-backed experts only)",
             m.moe_slot_hits.load(Relaxed),
         );
         c(
             "paddock_moe_expert_slot_misses",
-            "Experts loaded into a slot on a miss (disk reads plus host-tier copies)",
+            "Experts loaded into a slot on a miss (disk reads plus host-tier copies; disk-backed experts only)",
             m.moe_slot_misses.load(Relaxed),
         );
     }

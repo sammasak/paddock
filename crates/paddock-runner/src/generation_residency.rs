@@ -114,7 +114,8 @@ impl Handle {
             .try_acquire_owned()
             .map_err(|_| "model_unavailable: residency queue is full or closing".to_owned())?;
         let r = r.clone();
-        req.submitted.get_or_insert_with(Submitted::now);
+        req.submitted
+            .get_or_insert_with(|| Submitted::queued(r.metrics.clone()));
         let caller = req.events.clone();
         tokio::spawn(async move {
             let _permit = permit;

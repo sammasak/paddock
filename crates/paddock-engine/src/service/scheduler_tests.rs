@@ -312,3 +312,88 @@ fn a_never_started_slot_yields_as_a_fresh_admission() {
     assert!(slot.recompute);
     assert_eq!(slot.prompt.len(), 41);
 }
+
+/// Records `requests_waiting` at every prefill: an admitted request must have
+/// left the gauge by the time its prompt runs.
+struct WaitingProbe {
+    metrics: Arc<EngineMetrics>,
+    seen: Vec<u32>,
+}
+impl Generator for WaitingProbe {
+    fn reset(&mut self) {}
+    fn vocab(&self) -> usize {
+        2
+    }
+    fn forward(&mut self, _: u32) -> Result<Vec<f32>, GenError> {
+        Ok(vec![0., 1.])
+    }
+    fn forward_prefill_batch(
+        &mut self,
+        items: &[(usize, Vec<u32>)],
+    ) -> Result<Vec<Vec<f32>>, GenError> {
+        self.seen.push(
+            self.metrics
+                .requests_waiting
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
+        Ok(items.iter().map(|_| vec![0., 1.]).collect())
+    }
+}
+
+#[test]
+fn queue_gauge_counts_submitted_requests_until_admission_or_refusal() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let metrics = Arc::new(EngineMetrics::default());
+    let (send, requests) = std::sync::mpsc::channel();
+    let mut receivers = Vec::new();
+    // an empty prompt refused at admission, then two that take both slots
+    for prompt in [vec![], vec![0; 16], vec![0; 16]] {
+        let (events, receiver) = tokio::sync::mpsc::unbounded_channel();
+        receivers.push(receiver);
+        send.send(GenRequest {
+            prompt,
+            max_tokens: 1,
+            sampler: SamplingParams::default(),
+            stop_tokens: vec![],
+            events,
+            mm_chunks: None,
+            constraint: None,
+            logprobs: None,
+            submitted: Some(Submitted::queued(metrics.clone())),
+            canvas_read: None,
+            user_turn: false,
+            background: false,
+        })
+        .unwrap();
+    }
+    drop(send);
+    assert_eq!(metrics.requests_waiting.load(Relaxed), 3);
+    let mut generator = WaitingProbe {
+        metrics: metrics.clone(),
+        seen: Vec::new(),
+    };
+    run_batched(
+        &mut generator,
+        &requests,
+        2,
+        2,
+        &metrics,
+        &ShutdownCtl::new(),
+        None,
+    );
+    assert!(!generator.seen.is_empty(), "the admitted prompts prefilled");
+    assert!(
+        generator.seen.iter().all(|&w| w == 0),
+        "admitted or refused requests left the gauge before prefill: {:?}",
+        generator.seen
+    );
+    assert_eq!(metrics.requests_waiting.load(Relaxed), 0);
+    let errors = receivers
+        .iter_mut()
+        .map(|r| {
+            std::iter::from_fn(|| r.try_recv().ok()).any(|e| matches!(e, TokenEvent::Error(_)))
+        })
+        .filter(|&refused| refused)
+        .count();
+    assert_eq!(errors, 1, "only the empty prompt is refused");
+}

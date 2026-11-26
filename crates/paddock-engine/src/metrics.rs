@@ -172,8 +172,9 @@ pub struct EngineMetrics {
     /// derived reader-side.
     pub weights_mem_bytes: AtomicU64,
     pub kv_mem_bytes: AtomicU64,
-    /// Requests submitted to the engine and not yet admitted to a slot: the
-    /// span `RunStats::queued_ms` measures. Held up by [`QueueTicket`].
+    /// Requests submitted and not yet admitted to a slot for the first time:
+    /// the span `RunStats::queued_ms` measures. Held up by [`QueueTicket`]. A
+    /// preempted sequence already had its slot and is not counted here.
     pub requests_waiting: AtomicU32,
     /// Hybrid prefix cache checkpoint ledger, monotonic since load: state
     /// snapshots written, checkpoints stolen by LRU, admissions refused.
