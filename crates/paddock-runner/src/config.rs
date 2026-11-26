@@ -54,6 +54,41 @@ pub struct MoeOffload {
     pub dense_host: Vec<String>,
 }
 
+/// `[moe_offload]` parsed against the rest of the config by
+/// [`Config::expert_offload`]: each backing carries only the keys legal
+/// for it, so the runner arms what it is handed and checks nothing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExpertOffload {
+    pub dense_host: paddock_engine::gpu::DenseHost,
+    pub backing: ExpertBacking,
+}
+
+/// Where the routed experts live.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExpertBacking {
+    /// In VRAM with the rest of the model (`enabled = false`).
+    Resident,
+    /// In page-locked host RAM behind the VRAM slot cache.
+    Pinned { vram_gb: Option<f64> },
+    /// In `artifact`, read on a miss; one sequence on the serial loop.
+    Disk {
+        vram_gb: Option<f64>,
+        artifact: PathBuf,
+        host_cache_gb: Option<f64>,
+        verify_once: bool,
+    },
+}
+
+impl ExpertBacking {
+    /// The slot cache cap when experts are offloaded, `None` when resident.
+    pub fn offload_vram_gb(&self) -> Option<Option<f64>> {
+        match self {
+            Self::Resident => None,
+            Self::Pinned { vram_gb } | Self::Disk { vram_gb, .. } => Some(*vram_gb),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -555,6 +590,76 @@ impl Config {
         }
     }
 
+    /// `[moe_offload]` as one typed value, after the env and CLI overlays (the
+    /// rules read `device` and `max_batch`). An illegal combination is an
+    /// error naming the key.
+    pub fn expert_offload(&self) -> Result<ExpertOffload, String> {
+        let mo = &self.moe_offload;
+        let dense_host =
+            paddock_engine::gpu::DenseHost::parse(mo.dense_host.iter().map(String::as_str))?;
+        let metal = self.device == "metal";
+        let backing = match &mo.disk_artifact {
+            Some(_) if metal => {
+                return Err(
+                    "[moe_offload] disk_artifact is CUDA-only (qwen35 MoE); remove it on Metal"
+                        .into(),
+                );
+            }
+            Some(_) if self.max_batch > 1 => {
+                return Err(format!(
+                    "[moe_offload] disk_artifact serves one sequence on the serial loop, but max_batch = {}: \
+                     set max_batch = 1, or drop disk_artifact to serve with pinned backing",
+                    self.max_batch
+                ));
+            }
+            Some(_) if !mo.enabled => {
+                return Err("[moe_offload] disk_artifact is set with enabled = false: \
+                     set enabled = true, or drop disk_artifact"
+                    .into());
+            }
+            Some(artifact) => ExpertBacking::Disk {
+                vram_gb: mo.vram_gb,
+                artifact: artifact.clone(),
+                host_cache_gb: mo.host_cache_gb,
+                verify_once: mo.verify_once,
+            },
+            None if mo.host_cache_gb.is_some() => {
+                return Err(
+                    "[moe_offload] host_cache_gb is set without disk_artifact: it sizes the \
+                     disk backing's host tier, so set disk_artifact or drop host_cache_gb"
+                        .into(),
+                );
+            }
+            None if mo.verify_once => {
+                return Err(
+                    "[moe_offload] verify_once is set without disk_artifact: it checks the \
+                     disk backing's records, so set disk_artifact or drop verify_once"
+                        .into(),
+                );
+            }
+            None if mo.enabled && metal => {
+                return Err(
+                    "[moe_offload] enabled: Metal MoE expert offload is not implemented".into(),
+                );
+            }
+            None if mo.enabled => ExpertBacking::Pinned {
+                vram_gb: mo.vram_gb,
+            },
+            None if mo.vram_gb.is_some() => {
+                return Err(
+                    "[moe_offload] vram_gb is set but enabled = false: experts stay VRAM-resident \
+                     and a model that does not fit will be refused. Set enabled = true, or drop vram_gb"
+                        .into(),
+                );
+            }
+            None => ExpertBacking::Resident,
+        };
+        Ok(ExpertOffload {
+            dense_host,
+            backing,
+        })
+    }
+
     /// The resolved web-search provider config, if a usable provider + key are
     /// declared. Unknown provider names are a loud None with a warning - a
     /// typo'd provider must not silently disable a declared capability.
@@ -998,6 +1103,103 @@ mod tests {
         // and the block is closed too: a typo inside it is not silently kept
         toml::from_str::<Config>("[catalog]\nmodel = \"tiny\"\nartefact = \"q8\"\n")
             .expect_err("an unknown key inside the block must fail like any other");
+    }
+
+    fn moe(toml: &str) -> Result<ExpertOffload, String> {
+        toml::from_str::<Config>(toml)
+            .expect("parse")
+            .expert_offload()
+    }
+
+    fn moe_err(toml: &str, key: &str) {
+        let e = moe(toml).expect_err(toml);
+        assert!(e.contains(&format!("[moe_offload] {key}")), "{e}");
+    }
+
+    #[test]
+    fn expert_offload_parses_each_backing() {
+        assert_eq!(moe("").unwrap().backing, ExpertBacking::Resident);
+        assert_eq!(
+            moe("[moe_offload]\nenabled = true\nvram_gb = 4.0\n")
+                .unwrap()
+                .backing,
+            ExpertBacking::Pinned { vram_gb: Some(4.0) }
+        );
+        let disk = moe(
+            "max_batch = 1\n[moe_offload]\nenabled = true\ndisk_artifact = \"/a.pdxa\"\n\
+             host_cache_gb = 3.0\nverify_once = true\n",
+        )
+        .unwrap();
+        assert_eq!(
+            disk.backing,
+            ExpertBacking::Disk {
+                vram_gb: None,
+                artifact: "/a.pdxa".into(),
+                host_cache_gb: Some(3.0),
+                verify_once: true,
+            }
+        );
+        let d = moe("[moe_offload]\ndense_host = [\"output\"]\n").unwrap();
+        assert!(d.dense_host.output && d.backing == ExpertBacking::Resident);
+    }
+
+    #[test]
+    fn disk_artifact_on_metal_is_refused() {
+        moe_err(
+            "device = \"metal\"\nmax_batch = 1\n[moe_offload]\nenabled = true\ndisk_artifact = \"/a\"\n",
+            "disk_artifact",
+        );
+    }
+
+    #[test]
+    fn disk_artifact_with_max_batch_above_one_is_refused() {
+        moe_err(
+            "max_batch = 2\n[moe_offload]\nenabled = true\ndisk_artifact = \"/a\"\n",
+            "disk_artifact",
+        );
+    }
+
+    #[test]
+    fn disk_artifact_with_offload_disabled_is_refused() {
+        moe_err(
+            "max_batch = 1\n[moe_offload]\ndisk_artifact = \"/a\"\n",
+            "disk_artifact",
+        );
+    }
+
+    #[test]
+    fn host_cache_gb_without_disk_artifact_is_refused() {
+        moe_err(
+            "[moe_offload]\nenabled = true\nhost_cache_gb = 3.0\n",
+            "host_cache_gb",
+        );
+    }
+
+    #[test]
+    fn verify_once_without_disk_artifact_is_refused() {
+        moe_err(
+            "[moe_offload]\nenabled = true\nverify_once = true\n",
+            "verify_once",
+        );
+    }
+
+    #[test]
+    fn expert_offload_on_metal_is_refused() {
+        moe_err(
+            "device = \"metal\"\n[moe_offload]\nenabled = true\n",
+            "enabled",
+        );
+    }
+
+    #[test]
+    fn vram_gb_with_offload_disabled_is_refused() {
+        moe_err("[moe_offload]\nvram_gb = 4.0\n", "vram_gb");
+    }
+
+    #[test]
+    fn an_unknown_dense_host_plane_is_refused() {
+        let e = moe("[moe_offload]\ndense_host = [\"lm_head\"]\n").unwrap_err();
+        assert!(e.contains("dense_host") && e.contains("lm_head"), "{e}");
     }
 
     #[test]

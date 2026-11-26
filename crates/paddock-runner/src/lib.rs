@@ -86,7 +86,7 @@ pub mod websearch;
 
 use std::sync::Arc;
 
-use config::Config;
+use config::{Config, ExpertBacking};
 use paddock_models::ModelStore;
 use paddock_models::mapped::MappedGguf;
 use routes::AppState;
@@ -181,26 +181,7 @@ pub async fn run(
 ) -> Result<(), Box<dyn std::error::Error>> {
     cfg.check_vram_budget()?;
     resolve_local_model(&mut cfg)?;
-    if cfg.moe_offload.disk_artifact.is_some() {
-        if cfg.device == "metal" {
-            return Err(
-                "[moe_offload] disk_artifact is CUDA-only (qwen35 MoE); remove it on Metal".into(),
-            );
-        }
-        if cfg.max_batch > 1 {
-            return Err(format!(
-                "[moe_offload] disk_artifact serves one sequence on the serial loop, but max_batch = {}: \
-                 set max_batch = 1, or drop disk_artifact to serve with pinned backing",
-                cfg.max_batch
-            )
-            .into());
-        }
-        if !cfg.moe_offload.enabled {
-            tracing::warn!(
-                "[moe_offload] disk_artifact is set with enabled = false - offload is on anyway"
-            );
-        }
-    }
+    let moe = cfg.expert_offload()?;
 
     if cfg.device == "metal" {
         let bonsai = cfg
@@ -219,9 +200,6 @@ pub async fn run(
         }
         if !matches!(cfg.kv_cache_dtype.as_str(), "auto" | "f16") && !native_f32 {
             return Err("Metal currently requires F16 KV (kv_cache_dtype = auto or f16)".into());
-        }
-        if cfg.moe_offload.enabled {
-            return Err("Metal MoE expert offload is not implemented".into());
         }
         if cfg.kv_offload.enabled
             && (!cfg.kv_offload.ram_gb.is_finite()
@@ -339,41 +317,34 @@ pub async fn run(
     }
     // [moe_offload]: armed the same way, read by the MoE families at load
     // (host-map the expert planes) and at enable_batch (seat the slot cache).
-    let mo = &cfg.moe_offload;
-    if !mo.enabled && mo.vram_gb.is_some() {
-        tracing::warn!(
-            "[moe_offload] vram_gb is set but enabled = false - experts stay VRAM-resident \
-             and a model that does not fit will be refused. Set enabled = true."
-        );
-    }
-    let dense_host =
-        paddock_engine::gpu::DenseHost::parse(mo.dense_host.iter().map(String::as_str))?;
+    let gib = |g: f64| (g.max(0.0) * (1u64 << 30) as f64) as u64;
+    let offload = moe.backing.offload_vram_gb();
     paddock_engine::gpu::set_moe_offload(paddock_engine::gpu::MoeOffloadCfg {
-        dense_host,
-        enabled: mo.enabled,
-        vram_bytes: mo
-            .vram_gb
-            .map(|g| (g.max(0.0) * (1u64 << 30) as f64) as u64),
+        dense_host: moe.dense_host,
+        enabled: offload.is_some(),
+        vram_bytes: offload.flatten().map(gib),
     });
-    if let Some(artifact) = &mo.disk_artifact {
+    if let ExpertBacking::Disk {
+        artifact,
+        host_cache_gb,
+        verify_once,
+        ..
+    } = &moe.backing
+    {
         paddock_engine::gpu::set_moe_disk(paddock_engine::gpu::MoeDiskCfg {
             artifact: artifact.clone(),
-            host_cache_bytes: mo
-                .host_cache_gb
-                .map_or(0, |g| (g.max(0.0) * (1u64 << 30) as f64) as u64),
-            verify_once: mo.verify_once,
+            host_cache_bytes: host_cache_gb.map_or(0, gib),
+            verify_once: *verify_once,
         });
         tracing::info!(
             artifact = %artifact.display(),
-            host_cache_gb = mo.host_cache_gb,
+            host_cache_gb = *host_cache_gb,
             "[moe_offload] disk-backed MoE experts armed"
         );
-    } else if mo.host_cache_gb.is_some() {
-        tracing::warn!("[moe_offload] host_cache_gb is set without disk_artifact - ignored");
     }
-    if mo.enabled {
+    if let Some(vram_gb) = offload {
         tracing::info!(
-            vram_gb = mo.vram_gb,
+            vram_gb,
             "[moe_offload] MoE expert offload armed (slot cache auto-sized from the KV plan's leftover unless vram_gb caps it)"
         );
     }
