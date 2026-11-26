@@ -287,7 +287,7 @@ impl GpuQwen35 {
             let mut m = {
                 let bs = self.batch.as_mut().expect("batch");
                 let pr = bs.paged_prefix.as_mut().expect("prefix checked above");
-                pr.begin_seq(slot);
+                pr.begin_seq(slot, tokens);
                 pr.match_full(tokens)
             };
             // TIER (D5 park/wake): the restore is consulted and PARKED at
@@ -644,7 +644,7 @@ impl GpuQwen35 {
             let m = {
                 let bs = self.batch.as_mut().expect("batch");
                 let pr = bs.paged_prefix.as_mut().expect("prefix checked above");
-                pr.begin_seq(slot);
+                pr.begin_seq(slot, keys);
                 pr.match_full(keys)
             };
             if paddock_models::dev_var_os!("PADDOCK_PREFIX_STATS").is_some() {

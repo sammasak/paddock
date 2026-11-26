@@ -40,17 +40,6 @@ fn hash_block(tokens: &[u32]) -> u64 {
     h
 }
 
-/// A chain over the blocks of `tokens` (whole blocks only): what a
-/// checkpoint's writer's prompt was, without the tree that may since have
-/// lost or grown the path.
-fn prompt_key(tokens: &[u32]) -> u64 {
-    tokens
-        .chunks_exact(BLOCK_TOKENS)
-        .fold(0xcbf29ce484222325u64, |h, c| {
-            (h ^ hash_block(c)).wrapping_mul(0x100000001b3)
-        })
-}
-
 struct Node {
     parent: u32,
     /// the `KvPool` block this node caches (retained while the node is alive).
@@ -94,12 +83,12 @@ struct Node {
     /// The sequence that wrote this node's checkpoint ([`PagedRadix::begin_seq`]);
     /// 0 when unknown (a tier restore, a family that never names its slot).
     writer: u64,
-    /// How deep (in blocks) the writer's prompt went on this path: a resume
-    /// matching that far continues the writer's sequence, one diverging
-    /// sooner branches off it ([`PagedRadix::note_resume`]). Kept on the
-    /// checkpoint, so it outlives the writer's deeper cuts being stolen.
+    /// How far (in tokens) a resume must repeat the writer's prompt to
+    /// continue the writer's sequence; one diverging sooner branches off it
+    /// ([`PagedRadix::note_resume`]). Kept on the checkpoint, so it outlives
+    /// the writer's deeper cuts and tail KV going.
     reach: u32,
-    /// [`prompt_key`] of the writer's prompt through `reach`.
+    /// [`hash_block`] of the writer's prompt through `reach`.
     reach_key: u64,
     /// Resumes of this checkpoint by a sequence other than its writer.
     shared_hits: u32,
@@ -201,8 +190,8 @@ pub struct PagedRadix {
     /// Each slot's current sequence id ([`Self::begin_seq`]); 0 = none yet.
     slot_seq: Vec<u64>,
     next_seq: u64,
-    /// Each slot's resume node this admission ([`Self::note_resume`]); 0 = cold.
-    slot_from: Vec<u32>,
+    /// Each slot's admitted prompt ([`Self::begin_seq`]).
+    slot_prompt: Vec<Vec<u32>>,
     /// The last [`Self::insert_for`], consumed by the next attach. A
     /// checkpoint attached where its path ends was written by that sequence;
     /// anywhere else its writer stays unknown.
@@ -215,10 +204,28 @@ struct Stamp {
     seq: u64,
     /// The node the insert's path ends at.
     at: u32,
-    /// The insert's depth in blocks and [`prompt_key`]: the checkpoint's
-    /// first `reach`.
-    depth: u32,
+    /// The checkpoint's `reach` and `reach_key`.
+    reach: u32,
     key: u64,
+}
+
+/// A next turn re-renders the end of the prompt it follows: past the
+/// generation header's first tokens the template drops the reasoning it had
+/// opened, so the next turn repeats its writer's prompt only up to about
+/// this many tokens before the end. Small, so another session whose first
+/// message differs from the writer's within a few tokens still branches.
+const TAIL_SLACK: usize = 8;
+
+/// How much of `prompt` a resume at its cut `cut` (< `prompt.len()`) must
+/// repeat to continue it: all but the re-rendered tail, and always at least
+/// one token past the cut - a resume there matches the cut's own prefix by
+/// construction, which tells nothing.
+fn reach_of(prompt: &[u32], cut: usize) -> usize {
+    prompt
+        .len()
+        .saturating_sub(TAIL_SLACK)
+        .max(cut + 1)
+        .min(prompt.len())
 }
 
 /// At most this many shared checkpoints ([`PagedRadix::note_resume`]) are
@@ -293,7 +300,7 @@ impl PagedRadix {
             slot_low: Vec::new(),
             slot_seq: Vec::new(),
             next_seq: 0,
-            slot_from: Vec::new(),
+            slot_prompt: Vec::new(),
             last_insert: None,
         }
     }
@@ -368,62 +375,40 @@ impl PagedRadix {
         self.insert_as(tokens, blocks, pool, low);
         let full = (tokens.len() / BLOCK_TOKENS).min(blocks.len());
         let seq = self.slot_seq.get(slot).copied().unwrap_or(0);
-        if prompt && seq != 0 {
-            self.extend_reach(slot, seq, &tokens[..full * BLOCK_TOKENS]);
+        if seq == 0 {
+            self.last_insert = None;
+            return;
         }
-        let key = if seq == 0 {
-            0
-        } else {
-            prompt_key(&tokens[..full * BLOCK_TOKENS])
+        let cut = full * BLOCK_TOKENS;
+        let (reach, key) = match self.slot_prompt.get(slot) {
+            Some(p) if prompt && p.len() > cut => {
+                let reach = reach_of(p, cut);
+                (reach, hash_block(&p[..reach]))
+            }
+            // a reply cut, or a prompt the slot never named: only the cut
+            _ => (cut, hash_block(&tokens[..cut])),
         };
-        self.last_insert = self.node_at(tokens, full * BLOCK_TOKENS).map(|at| Stamp {
+        self.last_insert = self.node_at(tokens, cut).map(|at| Stamp {
             seq,
             at,
-            depth: u32::try_from(full).unwrap_or(u32::MAX),
+            reach: u32::try_from(reach).unwrap_or(u32::MAX),
             key,
         });
     }
 
-    /// The prompt `tokens` of sequence `seq` reaches past its own cuts on
-    /// the path: the ones this admission prefilled through, below the node it
-    /// resumed at. The cuts it resumed beyond keep the reach of the turn
-    /// that wrote them, so a next user turn that re-renders the reply away
-    /// still matches them fully.
-    fn extend_reach(&mut self, slot: usize, seq: u64, tokens: &[u32]) {
-        let from = self.slot_from.get(slot).copied().unwrap_or(0);
-        let depth = u32::try_from(tokens.len() / BLOCK_TOKENS).unwrap_or(u32::MAX);
-        let key = prompt_key(tokens);
-        let mut past = from == 0;
-        let mut node = 0u32;
-        for chunk in tokens.chunks_exact(BLOCK_TOKENS) {
-            let Some(&child) = self.nodes[node as usize].children.get(&hash_block(chunk)) else {
-                return;
-            };
-            if self.nodes[child as usize].tokens != chunk {
-                return;
-            }
-            node = child;
-            let n = &mut self.nodes[node as usize];
-            if past && n.state_blk.is_some() && n.writer == seq && depth > n.reach {
-                n.reach = depth;
-                n.reach_key = key;
-            }
-            past |= node == from;
-        }
-    }
-
-    /// Slot `slot` admits a request under a fresh sequence id: the
+    /// Slot `slot` admits `prompt` under a fresh sequence id: the
     /// checkpoints it writes ([`Self::insert_for`] then an attach at the
     /// inserted path's end) carry it, unless its resume continues an older
     /// sequence ([`Self::note_resume`]).
-    pub fn begin_seq(&mut self, slot: usize) {
+    pub fn begin_seq(&mut self, slot: usize, prompt: &[u32]) {
         if self.slot_seq.len() <= slot {
             self.slot_seq.resize(slot + 1, 0);
-            self.slot_from.resize(slot + 1, 0);
+            self.slot_prompt.resize(slot + 1, Vec::new());
         }
         self.next_seq += 1;
         self.slot_seq[slot] = self.next_seq;
-        self.slot_from[slot] = 0;
+        self.slot_prompt[slot].clear();
+        self.slot_prompt[slot].extend_from_slice(prompt);
     }
 
     /// Slot `slot` resumed at the checkpoint on boundary `pos` of `tokens`.
@@ -451,29 +436,25 @@ impl PagedRadix {
         if self.nodes[node as usize].state_blk.is_none() {
             return;
         }
-        if self.slot_seq.len() <= slot {
-            self.slot_seq.resize(slot + 1, 0);
-            self.slot_from.resize(slot + 1, 0);
-        }
-        self.slot_from[slot] = node;
+        let Some(&seq) = self.slot_seq.get(slot) else {
+            return;
+        };
         let n = &self.nodes[node as usize];
         if n.low {
             return;
         }
-        let seq = self.slot_seq[slot];
-        if n.writer == 0 && seq != 0 {
-            // a tier restore or other unstamped cut: the first resumer claims
-            // it, and its prompt sets the reach (the walk starts above it)
-            let parent = n.parent;
+        if n.writer == 0 && seq != 0 && tokens.len() > pos {
+            // a tier restore or other unstamped cut: the first resumer
+            // claims it, as if its own prompt had cut there
+            let reach = reach_of(tokens, pos);
             let n = &mut self.nodes[node as usize];
             n.writer = seq;
-            n.reach = u32::try_from(pos / BLOCK_TOKENS).unwrap_or(u32::MAX);
-            n.reach_key = prompt_key(&tokens[..pos]);
-            self.slot_from[slot] = parent;
+            n.reach = u32::try_from(reach).unwrap_or(u32::MAX);
+            n.reach_key = hash_block(&tokens[..reach]);
             return;
         }
-        let upto = n.reach as usize * BLOCK_TOKENS;
-        if n.writer != 0 && tokens.len() >= upto && prompt_key(&tokens[..upto]) == n.reach_key {
+        let upto = n.reach as usize;
+        if n.writer != 0 && tokens.len() >= upto && hash_block(&tokens[..upto]) == n.reach_key {
             self.slot_seq[slot] = n.writer;
             return;
         }
@@ -990,7 +971,7 @@ impl PagedRadix {
         let n = &mut self.nodes[node as usize];
         n.state_blk = Some(idx);
         n.writer = writer;
-        n.reach = stamp.map_or(0, |s| s.depth);
+        n.reach = stamp.map_or(0, |s| s.reach);
         n.reach_key = stamp.map_or(0, |s| s.key);
         if let Some(p) = self.paged.as_mut() {
             p.attached[idx as usize] = true;
@@ -2177,12 +2158,12 @@ mod tests {
         seeds: &[u32],
         cuts: &[usize],
     ) -> (Vec<u32>, Vec<Option<u32>>) {
-        r.begin_seq(slot);
         let toks: Vec<u32> = seeds
             .iter()
             .flat_map(|&s| block_toks(s))
             .chain([7])
             .collect();
+        r.begin_seq(slot, &toks);
         let mut t = prefill(pool, seeds.len());
         let mut got = Vec::new();
         for &c in cuts {
@@ -2212,7 +2193,7 @@ mod tests {
         let (a, ia) = session(&mut r, &mut pool, 0, &[1, 2, 10, 11], &[2, 4]);
         let x = ia[0].expect("back-off cut");
         // Session B shares the system prompt only: it resumes A's back-off cut.
-        r.begin_seq(1);
+        r.begin_seq(1, &[]);
         let b: Vec<u32> = [1, 2, 20, 21].iter().flat_map(|&s| block_toks(s)).collect();
         assert_eq!(r.match_full(&b).ckpt, Some((2 * BLOCK_TOKENS, x)));
         r.note_resume(1, &b, 2 * BLOCK_TOKENS);
@@ -2252,7 +2233,7 @@ mod tests {
         r.set_state_paged(8, 1);
         let (a, _) = session(&mut r, &mut pool, 0, &[1, 2, 10, 11], &[2, 4]);
         let writer = r.slot_seq[0];
-        r.begin_seq(3);
+        r.begin_seq(3, &[]);
         let turn2: Vec<u32> = [a.clone(), vec![5; BLOCK_TOKENS]].concat();
         assert_eq!(
             r.match_full(&turn2).ckpt.map(|(p, _)| p),
@@ -2263,7 +2244,7 @@ mod tests {
         assert_eq!(r.slot_seq[3], writer, "turn 2 continues A");
         // ...so a later resume of A's back-off cut by that lineage's sibling
         // branch is still shared: A went deeper than it.
-        r.begin_seq(4);
+        r.begin_seq(4, &[]);
         let b: Vec<u32> = [1, 2, 20].iter().flat_map(|&s| block_toks(s)).collect();
         r.note_resume(4, &b, 2 * BLOCK_TOKENS);
         assert_eq!(shared_held(&r), 1);
@@ -2278,12 +2259,12 @@ mod tests {
         r.set_state_paged(8, 1);
         let (a, _) = session(&mut r, &mut pool, 0, &[1, 2, 10], &[2]);
         let writer = r.slot_seq[0];
-        r.begin_seq(1);
+        r.begin_seq(1, &[]);
         let turn2: Vec<u32> = [&a[..3 * BLOCK_TOKENS], &block_toks(60)[..], &[7]].concat();
         r.note_resume(1, &turn2, 2 * BLOCK_TOKENS);
         assert_eq!((shared_held(&r), r.slot_seq[1]), (0, writer));
         r.insert_for(1, &turn2, prefill(&mut pool, 4).blocks(), &mut pool);
-        r.begin_seq(2);
+        r.begin_seq(2, &[]);
         let b: Vec<u32> = [1, 2, 20].iter().flat_map(|&s| block_toks(s)).collect();
         r.note_resume(2, &b, 2 * BLOCK_TOKENS);
         assert_eq!(shared_held(&r), 1);
@@ -2302,7 +2283,7 @@ mod tests {
         let want = pool.free_blocks() + 1;
         assert_eq!(r.evict_dead_leaves(&mut pool, want, 0), 1);
         assert!(r.node_at(&a, 3 * BLOCK_TOKENS).is_none(), "tail trimmed");
-        r.begin_seq(1);
+        r.begin_seq(1, &[]);
         let turn2: Vec<u32> = [&a[..3 * BLOCK_TOKENS], &block_toks(60)[..], &[7]].concat();
         r.note_resume(1, &turn2, 2 * BLOCK_TOKENS);
         assert_eq!((shared_held(&r), r.slot_seq[1]), (0, writer));
@@ -2325,10 +2306,10 @@ mod tests {
             .flat_map(|&s| block_toks(s))
             .chain([7])
             .collect();
-        r.begin_seq(1);
+        r.begin_seq(1, &[]);
         r.note_resume(1, &d, 2 * BLOCK_TOKENS);
         r.insert_for(1, &d, prefill(&mut pool, 6).blocks(), &mut pool);
-        r.begin_seq(2);
+        r.begin_seq(2, &[]);
         let e: Vec<u32> = [&d[..6 * BLOCK_TOKENS], &block_toks(44)[..], &[7]].concat();
         r.note_resume(2, &e, 2 * BLOCK_TOKENS);
         assert_eq!(r.nodes[x as usize].shared_hits, 2);
@@ -2348,17 +2329,53 @@ mod tests {
         let idx = r.take_state(x).expect("demoted");
         assert!(r.attach_state_at(&a, 2 * BLOCK_TOKENS, idx), "restored");
         assert_eq!(r.nodes[x as usize].writer, 0);
-        r.begin_seq(1);
+        r.begin_seq(1, &[]);
         let turn2: Vec<u32> = [&a[..3 * BLOCK_TOKENS], &block_toks(60)[..], &[7]].concat();
         r.note_resume(1, &turn2, 2 * BLOCK_TOKENS);
         assert_eq!(shared_held(&r), 0);
         assert_eq!(r.nodes[x as usize].writer, r.slot_seq[1]);
-        r.insert_for(1, &turn2, prefill(&mut pool, 4).blocks(), &mut pool);
-        assert_eq!(r.nodes[x as usize].reach, 4, "the claimer's prompt sets it");
-        r.begin_seq(2);
+        assert_eq!(
+            r.nodes[x as usize].reach as usize,
+            turn2.len() - TAIL_SLACK,
+            "the claimer's prompt sets it, no insert needed"
+        );
+        r.begin_seq(2, &[]);
         let b: Vec<u32> = [1, 2, 20].iter().flat_map(|&s| block_toks(s)).collect();
         r.note_resume(2, &b, 2 * BLOCK_TOKENS);
         assert_eq!(shared_held(&r), 1);
+    }
+
+    #[test]
+    fn a_cut_at_the_prompts_last_boundary_tells_a_next_turn_from_a_new_session() {
+        // qwen35's placement: the last cut is the last boundary before the
+        // prompt end, here the end of the system prompt. A short first
+        // message follows it: the user-turn template (7, 8, 9), the task,
+        // the generation header.
+        let mut pool = KvPool::with_blocks(64);
+        let mut r = PagedRadix::new();
+        r.set_state_paged(8, 1);
+        let sys: Vec<u32> = [block_toks(1), block_toks(2)].concat();
+        let a: Vec<u32> = [&sys[..], &[7, 8, 9, 30, 31, 32, 33, 34, 35, 36, 5, 6, 4]].concat();
+        let cut = (a.len() - 1) / BLOCK_TOKENS * BLOCK_TOKENS;
+        assert_eq!(cut, 2 * BLOCK_TOKENS);
+        r.begin_seq(0, &a);
+        let mut t = prefill(&mut pool, 3);
+        r.insert_for(0, &a[..cut], t.blocks(), &mut pool);
+        r.attach_state_with_pool(&a, cut, &mut pool).expect("cut");
+        r.insert_for(0, &a, t.blocks(), &mut pool);
+        t.clear(&mut pool);
+        let writer = r.slot_seq[0];
+        // A's next turn re-renders the header's end and goes on
+        let turn2: Vec<u32> = [&a[..a.len() - 2], &[60, 61, 62]].concat();
+        r.begin_seq(1, &turn2);
+        r.note_resume(1, &turn2, cut);
+        assert_eq!((shared_held(&r), r.slot_seq[1]), (0, writer));
+        // B shares the system prompt and the template, not the task
+        let b: Vec<u32> = [&sys[..], &[7, 8, 9, 40, 41, 42, 43, 5, 6, 4]].concat();
+        r.begin_seq(2, &b);
+        r.note_resume(2, &b, cut);
+        assert_eq!(shared_held(&r), 1);
+        assert_ne!(r.slot_seq[2], writer);
     }
 
     #[test]
@@ -2371,7 +2388,7 @@ mod tests {
         let end = r.detach_state_at(&a, 4 * BLOCK_TOKENS).expect("end cut");
         assert_eq!(Some(end), ia[1]);
         r.recycle_state(end);
-        r.begin_seq(1);
+        r.begin_seq(1, &[]);
         let b: Vec<u32> = [1, 2, 20].iter().flat_map(|&s| block_toks(s)).collect();
         r.note_resume(1, &b, 2 * BLOCK_TOKENS);
         assert_eq!(shared_held(&r), 1, "A had gone past it: B branches off");
@@ -2396,8 +2413,8 @@ mod tests {
         r.insert_reply_for(0, &reply, t.blocks(), &mut pool);
         assert!(r.attach_state_at(&reply, 4 * BLOCK_TOKENS, idx));
         let writer = r.slot_seq[0];
-        r.begin_seq(1);
-        let turn2: Vec<u32> = [&p[..2 * BLOCK_TOKENS], &block_toks(50)[..], &[7]].concat();
+        r.begin_seq(1, &[]);
+        let turn2: Vec<u32> = [&p[..2 * BLOCK_TOKENS + 1], &block_toks(50)[..]].concat();
         r.note_resume(1, &turn2, 2 * BLOCK_TOKENS);
         assert_eq!(shared_held(&r), 0);
         assert_eq!(r.slot_seq[1], writer, "turn 2 continues turn 1");
@@ -2413,7 +2430,7 @@ mod tests {
         let (s1, _) = session(&mut r, &mut pool, 0, &[1, 11], &[1, 2]);
         let end = r.detach_state_at(&s1, 2 * BLOCK_TOKENS).expect("end cut");
         r.recycle_state(end);
-        r.begin_seq(1);
+        r.begin_seq(1, &[]);
         r.note_resume(1, &s1[..BLOCK_TOKENS], BLOCK_TOKENS);
         let (n2, _) = session(&mut r, &mut pool, 2, &[2], &[1]);
         assert_eq!(r.mark_anchor(&n2, BLOCK_TOKENS), Some(BLOCK_TOKENS));
@@ -2426,14 +2443,14 @@ mod tests {
             r.recycle_state(idx);
         }
         // a new writer re-cuts the shared node: it starts plain
-        r.begin_seq(4);
+        r.begin_seq(4, &s1);
         let t = prefill(&mut pool, 1);
         r.insert_for(4, &s1[..BLOCK_TOKENS], t.blocks(), &mut pool);
         r.attach_state_with_pool(&s1, BLOCK_TOKENS, &mut pool)
             .expect("room");
         let n = &r.nodes[at(&r, &s1) as usize];
         assert!(!n.shared && n.shared_hits == 0);
-        assert_eq!(n.reach, 1);
+        assert_eq!(n.reach as usize, 2 * BLOCK_TOKENS + 1 - TAIL_SLACK);
         assert_eq!(n.writer, r.slot_seq[4]);
     }
 
@@ -2457,15 +2474,15 @@ mod tests {
         assert!(r.attach_state_at(&conv, 4 * BLOCK_TOKENS, idx));
         let writer = r.slot_seq[0];
         // the tool turn
-        r.begin_seq(1);
+        r.begin_seq(1, &conv);
         r.note_resume(1, &conv, 4 * BLOCK_TOKENS);
         assert_eq!(r.slot_seq[1], writer);
         r.insert_for(1, &conv[..6 * BLOCK_TOKENS], t.blocks(), &mut pool);
         r.attach_state_with_pool(&conv, 6 * BLOCK_TOKENS, &mut pool)
             .expect("tool turn cut");
         // turn 2
-        r.begin_seq(2);
-        let turn2: Vec<u32> = [&p[..2 * BLOCK_TOKENS], &block_toks(50)[..], &[7]].concat();
+        r.begin_seq(2, &[]);
+        let turn2: Vec<u32> = [&p[..2 * BLOCK_TOKENS + 1], &block_toks(50)[..]].concat();
         r.note_resume(2, &turn2, 2 * BLOCK_TOKENS);
         assert_eq!(shared_held(&r), 0);
         assert_eq!(r.slot_seq[2], writer);
@@ -2482,7 +2499,7 @@ mod tests {
 
     fn hit(r: &mut PagedRadix, sys: u32, hits: u32) {
         for _ in 0..hits {
-            r.begin_seq(1);
+            r.begin_seq(1, &[]);
             r.note_resume(1, &block_toks(sys), BLOCK_TOKENS);
         }
     }
@@ -2537,7 +2554,7 @@ mod tests {
             let (_, got) = session(&mut r, &mut pool, 0, &[sys, sys + 10], &[1, 2]);
             assert!(got.iter().all(Option::is_some));
             for k in 0..resumes {
-                r.begin_seq(1);
+                r.begin_seq(1, &[]);
                 let other: Vec<u32> = [sys, 100 + 10 * sys + k]
                     .iter()
                     .flat_map(|&s| block_toks(s))
@@ -2570,7 +2587,7 @@ mod tests {
             let mut held = Vec::new();
             for sys in [1u32, 2] {
                 let (toks, got) = session(&mut r, &mut pool, 0, &[sys, sys + 10], &[1]);
-                r.begin_seq(1);
+                r.begin_seq(1, &[]);
                 r.note_resume(1, &block_toks(sys), BLOCK_TOKENS);
                 held.push((toks, got[0].expect("room")));
             }
