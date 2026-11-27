@@ -3501,7 +3501,7 @@ fn stream_agent(
                     }
                     Some(TokenEvent::Token { id, .. }) => {
                         if t_prefill_done.is_none() { t_prefill_done = Some(std::time::Instant::now()); }
-                        ids.push(id);
+                        crate::messages::agent_token(&meta.scope, &mut ids, id);
                         let raw = sd.push(&meta.tokenizer, id);
                         let parsed = parse(dialect, &raw, thinking_open, hints.as_ref());
                         if let Some(reasoning) = &parsed.reasoning {

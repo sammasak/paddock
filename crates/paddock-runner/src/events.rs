@@ -1237,37 +1237,124 @@ mod tests {
         }
     }
 
-    /// The messages agent loop has no CPU-only stream (each round submits
-    /// to the model's engine), so its rounds' receipts drive
-    /// `messages::agent_token` behind a preamble frame here: rounds cut
-    /// before their Done keep round 0's first token, past the header.
+    /// The endpoints with an agent loop, and the preamble frame each sends
+    /// before its first round.
+    const AGENT_LOOPS: [(Endpoint, &str); 2] = [
+        (Endpoint::Messages, "event: message_start\n\n"),
+        (Endpoint::Responses, "event: response.created\n\n"),
+    ];
+
+    /// An agent loop's recorded stream with its preamble out. The loops have
+    /// no CPU-only stream (each round submits to the model's engine), so a
+    /// test drives the receipts their Token arms make through
+    /// `messages::agent_token`, and their rounds' Done through `phases`.
+    struct AgentLoop {
+        r: RecordingForTest,
+        scope: EventScope,
+        marks: Marks,
+        metrics: Arc<crate::metrics::Metrics>,
+    }
+
+    impl AgentLoop {
+        async fn new(preamble: &'static str) -> Self {
+            let metrics = crate::metrics::Metrics::new("i".into(), Default::default(), None);
+            let mut scope = EventScope::default();
+            let mut r = RecordingForTest::new(metrics.clone(), None, |s| {
+                scope = s;
+                axum::body::Body::from(preamble)
+            });
+            let t0 = r.t0();
+            r.frame().await.expect("the preamble");
+            let marks = Marks {
+                t0,
+                header: Instant::now(),
+            };
+            AgentLoop {
+                r,
+                scope,
+                marks,
+                metrics,
+            }
+        }
+
+        /// One round's token receipts into a fresh `ids`, as the round's
+        /// Token arm makes them.
+        fn round(&self, tokens: &[u32]) {
+            let mut ids = Vec::new();
+            for &t in tokens {
+                crate::messages::agent_token(&self.scope, &mut ids, t);
+            }
+            assert_eq!(ids, tokens);
+        }
+
+        /// A round's Done, its engine first-token stamp `at`.
+        fn done(&self, at: Instant) {
+            self.scope.phases(&paddock_engine::service::RunStats {
+                prefilled_at: Some(at),
+                ..Default::default()
+            });
+        }
+
+        /// Drop the body (a client that left) and return its record, after
+        /// checking the request observed exactly one TTFT sample.
+        fn finish(self, e: Endpoint) -> (Arc<EventRecord>, Marks) {
+            let rec = self.r.finish();
+            let s = self.metrics.render(crate::metrics::Format::Classic, 0);
+            let samples: u64 = s
+                .lines()
+                .filter(|l| l.starts_with("gen_ai_server_time_to_first_token_seconds_count"))
+                .filter_map(|l| l.rsplit(' ').next()?.parse::<u64>().ok())
+                .sum();
+            assert_eq!(samples, 1, "{e:?}: {s}");
+            (rec, self.marks)
+        }
+    }
+
+    /// Rounds cut before their Done: round 0's first token is the TTFT, past
+    /// the header, and neither round 0's later tokens nor a later round's
+    /// receipts or engine stamp (hand-set well after it) move it.
     #[tokio::test]
     async fn an_agent_loop_keeps_its_first_rounds_token() {
-        let metrics = crate::metrics::Metrics::new("i".into(), Default::default(), None);
-        let mut scope = EventScope::default();
-        let mut r = RecordingForTest::new(metrics, None, |s| {
-            scope = s;
-            axum::body::Body::from("event: message_start\n\n")
-        });
-        let t0 = r.t0();
-        r.frame().await.expect("the preamble");
-        let marks = Marks {
-            t0,
-            header: Instant::now(),
-        };
-        tokio::time::sleep(DELAY).await;
-        let sent = Instant::now();
-        let mut round0 = Vec::new();
-        crate::messages::agent_token(&scope, &mut round0, 8);
-        let seen = Instant::now();
-        tokio::time::sleep(DELAY).await;
-        crate::messages::agent_token(&scope, &mut round0, 9);
-        let mut round1 = Vec::new();
-        for t in [4, 5] {
-            crate::messages::agent_token(&scope, &mut round1, t);
+        for (e, preamble) in AGENT_LOOPS {
+            let a = AgentLoop::new(preamble).await;
+            tokio::time::sleep(DELAY).await;
+            let sent = Instant::now();
+            a.round(&[8]);
+            let seen = Instant::now();
+            tokio::time::sleep(DELAY).await;
+            a.round(&[4, 5]);
+            a.done(seen + Duration::from_secs(1));
+            let (rec, marks) = a.finish(e);
+            marks.assert_first_token(e, &rec, (sent, seen));
         }
-        assert_eq!((round0, round1), (vec![8, 9], vec![4, 5]));
-        marks.assert_first_token(Endpoint::Messages, &r.finish(), (sent, seen));
+    }
+
+    /// Round 0 reached its Done: its engine stamp (hand-set) stands, and a
+    /// later round cut before its Done does not displace it.
+    #[tokio::test]
+    async fn an_agent_loop_keeps_round_zeros_engine_stamp() {
+        for (e, preamble) in AGENT_LOOPS {
+            let a = AgentLoop::new(preamble).await;
+            // the handler's receipt trails the engine's stamp
+            tokio::time::sleep(DELAY).await;
+            a.round(&[8, 9]);
+            a.done(a.marks.t0 + Duration::from_millis(1));
+            a.round(&[4, 5]);
+            let (rec, _) = a.finish(e);
+            assert_eq!(rec.ttft_ms, Some(1), "{e:?}");
+        }
+    }
+
+    /// A loop that ends without a token (an engine error, a client that left
+    /// during prefill): the documented first-byte fallback, no panic.
+    #[tokio::test]
+    async fn an_agent_loop_without_a_token_falls_back_to_its_first_byte() {
+        for (e, preamble) in AGENT_LOOPS {
+            let a = AgentLoop::new(preamble).await;
+            a.scope.phases(&Default::default());
+            let (rec, marks) = a.finish(e);
+            marks.assert_first_byte(e, &rec, true);
+        }
     }
 
     /// The handler's receipt never displaces the engine's earlier stamp,
